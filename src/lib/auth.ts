@@ -30,6 +30,17 @@ export function createAuth(env: Env) {
         ? { github: { clientId: env.GITHUB_CLIENT_ID, clientSecret: env.GITHUB_CLIENT_SECRET } }
         : {}),
     },
+    trustedOrigins: [
+      "https://app.coregit.dev",
+      "http://localhost:3000",
+    ],
+    advanced: {
+      crossSubDomainCookies: {
+        enabled: true,
+        domain: ".coregit.dev",
+      },
+      cookiePrefix: "coregit",
+    },
     session: {
       expiresIn: 60 * 60 * 24 * 7, // 7 days
       updateAge: 60 * 60 * 24,      // refresh after 1 day

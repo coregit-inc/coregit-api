@@ -18,7 +18,7 @@ import type { Env, Variables } from "../types";
 
 const commits = new Hono<{ Bindings: Env; Variables: Variables }>();
 
-function parseAuthorString(author: string): { name: string; email: string; timestamp: number } {
+export function parseAuthorString(author: string): { name: string; email: string; timestamp: number } {
   const match = author.match(/^(.+?)\s+<([^>]+)>\s+(\d+)/);
   if (match) {
     return { name: match[1], email: match[2], timestamp: parseInt(match[3], 10) };
@@ -60,6 +60,15 @@ commits.post("/:slug/commits", apiKeyAuth, async (c) => {
   if (!author?.name || !author?.email) return c.json({ error: "author.name and author.email are required" }, 400);
   if (!changes || !Array.isArray(changes) || changes.length === 0) {
     return c.json({ error: "changes array is required and must not be empty" }, 400);
+  }
+  if (changes.length > 1000) {
+    return c.json({ error: "Maximum 1000 file changes per commit" }, 400);
+  }
+  const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10 MB
+  for (const change of changes) {
+    if (change.content && change.content.length > MAX_FILE_SIZE) {
+      return c.json({ error: `File content exceeds 10 MB limit: ${change.path}` }, 400);
+    }
   }
 
   const storage = new GitR2Storage(bucket, orgId, slug);

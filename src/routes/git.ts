@@ -13,7 +13,7 @@
 
 import { Hono } from "hono";
 import { eq, and } from "drizzle-orm";
-import { repo } from "../db/schema";
+import { repo, organization } from "../db/schema";
 import { parseBasicAuthKey, verifyApiKeyForGit } from "../auth/middleware";
 import { GitR2Storage } from "../git/storage";
 import {
@@ -33,18 +33,20 @@ const decoder = new TextDecoder();
 
 const git = new Hono<{ Bindings: Env; Variables: Variables }>();
 
-const UPLOAD_PACK_CAPABILITIES = [
-  "multi_ack",
-  "multi_ack_detailed",
-  "thin-pack",
-  "side-band",
-  "side-band-64k",
-  "ofs-delta",
-  "shallow",
-  "no-progress",
-  "include-tag",
-  "symref=HEAD:refs/heads/main",
-].join(" ");
+function uploadPackCapabilities(defaultBranch: string): string {
+  return [
+    "multi_ack",
+    "multi_ack_detailed",
+    "thin-pack",
+    "side-band",
+    "side-band-64k",
+    "ofs-delta",
+    "shallow",
+    "no-progress",
+    "include-tag",
+    `symref=HEAD:refs/heads/${defaultBranch}`,
+  ].join(" ");
+}
 
 const RECEIVE_PACK_CAPABILITIES = [
   "report-status",
@@ -52,17 +54,25 @@ const RECEIVE_PACK_CAPABILITIES = [
   "ofs-delta",
 ].join(" ");
 
-// ── Auth helper ──
+// ── Auth helpers ──
 
-async function authenticateGit(
-  c: any
-): Promise<{ orgId: string; repoSlug: string; storage: GitR2Storage } | Response> {
+interface GitAuthResult {
+  orgId: string;
+  repoSlug: string;
+  storage: GitR2Storage;
+  defaultBranch: string;
+}
+
+/**
+ * Strict auth — requires valid API key. Used for write operations (receive-pack).
+ */
+async function authenticateGit(c: any): Promise<GitAuthResult | Response> {
   const db = c.get("db");
   const bucket = c.env.REPOS_BUCKET;
 
-  const orgSlug = c.req.param("org");
+  const orgParam = c.req.param("org");
   let repoSlug = c.req.param("repo");
-  if (!orgSlug || !repoSlug) return c.text("Invalid path", 400);
+  if (!orgParam || !repoSlug) return c.text("Invalid path", 400);
   if (repoSlug.endsWith(".git")) repoSlug = repoSlug.slice(0, -4);
 
   // Verify API key
@@ -78,7 +88,6 @@ async function authenticateGit(
 
   const orgId = authResult.orgId;
 
-  // Find repo
   const [found] = await db
     .select()
     .from(repo)
@@ -88,7 +97,60 @@ async function authenticateGit(
   if (!found) return c.text("Repository not found", 404);
 
   const storage = new GitR2Storage(bucket, orgId, repoSlug);
-  return { orgId, repoSlug, storage };
+  return { orgId, repoSlug, storage, defaultBranch: found.defaultBranch };
+}
+
+/**
+ * Read-only auth — allows unauthenticated access to public repos.
+ * Used for clone/fetch (upload-pack).
+ */
+async function authenticateGitReadOnly(c: any): Promise<GitAuthResult | Response> {
+  const db = c.get("db");
+  const bucket = c.env.REPOS_BUCKET;
+
+  const orgParam = c.req.param("org");
+  let repoSlug = c.req.param("repo");
+  if (!orgParam || !repoSlug) return c.text("Invalid path", 400);
+  if (repoSlug.endsWith(".git")) repoSlug = repoSlug.slice(0, -4);
+
+  // Try API key auth first
+  const apiKeyValue = parseBasicAuthKey(c.req.header("Authorization"));
+  if (apiKeyValue) {
+    const authResult = await verifyApiKeyForGit(c.env, apiKeyValue);
+    if (authResult) {
+      const orgId = authResult.orgId;
+      const [found] = await db
+        .select()
+        .from(repo)
+        .where(and(eq(repo.orgId, orgId), eq(repo.slug, repoSlug)))
+        .limit(1);
+      if (!found) return c.text("Repository not found", 404);
+      return { orgId, repoSlug, storage: new GitR2Storage(bucket, orgId, repoSlug), defaultBranch: found.defaultBranch };
+    }
+  }
+
+  // No valid auth — check for public repo via org slug
+  const [org] = await db
+    .select({ id: organization.id })
+    .from(organization)
+    .where(eq(organization.slug, orgParam))
+    .limit(1);
+
+  if (!org) {
+    return c.text("", 401, { "WWW-Authenticate": 'Basic realm="CoreGit"' });
+  }
+
+  const [found] = await db
+    .select()
+    .from(repo)
+    .where(and(eq(repo.orgId, org.id), eq(repo.slug, repoSlug)))
+    .limit(1);
+
+  if (!found || found.visibility !== "public") {
+    return c.text("", 401, { "WWW-Authenticate": 'Basic realm="CoreGit"' });
+  }
+
+  return { orgId: org.id, repoSlug, storage: new GitR2Storage(bucket, org.id, repoSlug), defaultBranch: found.defaultBranch };
 }
 
 // ── Routes ──
@@ -100,15 +162,18 @@ git.get("/:org/:repo/info/refs", async (c) => {
     return c.text("Invalid or missing service parameter", 400);
   }
 
-  const auth = await authenticateGit(c);
+  // Read operations (clone/fetch) allow public access; write (push) requires auth
+  const auth = service === "git-upload-pack"
+    ? await authenticateGitReadOnly(c)
+    : await authenticateGit(c);
   if (auth instanceof Response) return auth;
-  const { storage } = auth;
+  const { storage, defaultBranch } = auth;
 
   const head = await storage.resolveHead();
   const refs = await storage.listRefs();
 
   const capabilities =
-    service === "git-upload-pack" ? UPLOAD_PACK_CAPABILITIES : RECEIVE_PACK_CAPABILITIES;
+    service === "git-upload-pack" ? uploadPackCapabilities(defaultBranch) : RECEIVE_PACK_CAPABILITIES;
 
   let response = encodePktLine(`# service=${service}\n`) + flushPkt();
 
@@ -136,7 +201,8 @@ git.get("/:org/:repo/info/refs", async (c) => {
 
 // POST /:org/:repo.git/git-upload-pack
 git.post("/:org/:repo/git-upload-pack", async (c) => {
-  const auth = await authenticateGit(c);
+  // Clone/fetch — allow public access
+  const auth = await authenticateGitReadOnly(c);
   if (auth instanceof Response) return auth;
   const { orgId, storage } = auth;
 
@@ -252,11 +318,17 @@ git.post("/:org/:repo/git-upload-pack", async (c) => {
 
 // POST /:org/:repo.git/git-receive-pack
 git.post("/:org/:repo/git-receive-pack", async (c) => {
+  // Push — always requires auth
   const auth = await authenticateGit(c);
   if (auth instanceof Response) return auth;
   const { orgId, storage } = auth;
 
   const body = new Uint8Array(await c.req.arrayBuffer());
+
+  // Size limit for pushes
+  if (body.length > 32 * 1024 * 1024) {
+    return c.text("Pack exceeds 32 MB limit", 413);
+  }
 
   // Find boundary between commands and packfile
   let commandsEnd = 0;
@@ -273,14 +345,12 @@ git.post("/:org/:repo/git-receive-pack", async (c) => {
 
   interface RefUpdate { oldSha: string; newSha: string; refName: string; }
   const refUpdates: RefUpdate[] = [];
-  let isFirstLine = true;
 
   for (const pkt of pktLines) {
     if (pkt.type !== "data" || !pkt.data) continue;
     let line = pktLineDataToString(pkt.data);
     const nullIndex = line.indexOf("\0");
     if (nullIndex !== -1) line = line.slice(0, nullIndex);
-    isFirstLine = false;
     const parts = line.split(" ");
     if (parts.length >= 3) {
       refUpdates.push({ oldSha: parts[0], newSha: parts[1], refName: parts[2] });

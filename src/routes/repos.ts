@@ -12,7 +12,7 @@ import { Hono } from "hono";
 import { nanoid } from "nanoid";
 import { eq, and } from "drizzle-orm";
 import { apiKeyAuth } from "../auth/middleware";
-import { repo } from "../db/schema";
+import { repo, organization } from "../db/schema";
 import { GitR2Storage } from "../git/storage";
 import { createTree, createCommit, hashGitObject, parseGitObject, parseCommit } from "../git/objects";
 import { recordUsage } from "../services/usage";
@@ -114,6 +114,14 @@ repos.post("/", apiKeyAuth, async (c) => {
     // Track usage
     recordUsage(c.executionCtx, db, orgId, "repo_created", 1, { repo_id: repoId });
 
+    // Look up org slug for git_url
+    const [org] = await db
+      .select({ slug: organization.slug })
+      .from(organization)
+      .where(eq(organization.id, orgId))
+      .limit(1);
+    const orgSlug = org?.slug || orgId;
+
     return c.json(
       {
         id: newRepo.id,
@@ -121,7 +129,7 @@ repos.post("/", apiKeyAuth, async (c) => {
         description: newRepo.description,
         default_branch: newRepo.defaultBranch,
         visibility: newRepo.visibility,
-        git_url: `https://api.coregit.dev/${orgId}/${slug}.git`,
+        git_url: `https://api.coregit.dev/${orgSlug}/${slug}.git`,
         api_url: `https://api.coregit.dev/v1/repos/${slug}`,
         created_at: newRepo.createdAt,
       },
@@ -137,13 +145,17 @@ repos.post("/", apiKeyAuth, async (c) => {
 repos.get("/", apiKeyAuth, async (c) => {
   const orgId = c.get("orgId");
   const db = c.get("db");
+  const limit = Math.min(parseInt(c.req.query("limit") || "50", 10), 100);
+  const offset = Math.max(parseInt(c.req.query("offset") || "0", 10), 0);
 
   try {
     const repoList = await db
       .select()
       .from(repo)
       .where(eq(repo.orgId, orgId))
-      .orderBy(repo.updatedAt);
+      .orderBy(repo.updatedAt)
+      .limit(limit)
+      .offset(offset);
 
     return c.json({
       repos: repoList.map((r) => ({
@@ -155,6 +167,8 @@ repos.get("/", apiKeyAuth, async (c) => {
         created_at: r.createdAt,
         updated_at: r.updatedAt,
       })),
+      limit,
+      offset,
     });
   } catch (error) {
     console.error("Failed to list repos:", error);
@@ -200,6 +214,14 @@ repos.get("/:slug", apiKeyAuth, async (c) => {
       }
     }
 
+    // Look up org slug for git_url
+    const [org] = await db
+      .select({ slug: organization.slug })
+      .from(organization)
+      .where(eq(organization.id, orgId))
+      .limit(1);
+    const orgSlug = org?.slug || orgId;
+
     return c.json({
       id: found.id,
       slug: found.slug,
@@ -207,7 +229,7 @@ repos.get("/:slug", apiKeyAuth, async (c) => {
       default_branch: found.defaultBranch,
       visibility: found.visibility,
       is_empty: isEmpty,
-      git_url: `https://api.coregit.dev/${orgId}/${slug}.git`,
+      git_url: `https://api.coregit.dev/${orgSlug}/${slug}.git`,
       api_url: `https://api.coregit.dev/v1/repos/${slug}`,
       created_at: found.createdAt,
       updated_at: found.updatedAt,
@@ -251,9 +273,13 @@ repos.patch("/:slug", apiKeyAuth, async (c) => {
       updates.visibility = body.visibility;
     }
     if (body.default_branch !== undefined) {
-      updates.defaultBranch = body.default_branch;
-      // Also update HEAD in R2
+      // Verify the branch actually exists before setting it as default
       const storage = new GitR2Storage(c.env.REPOS_BUCKET, orgId, slug);
+      const branchSha = await storage.getRef(`refs/heads/${body.default_branch}`);
+      if (!branchSha) {
+        return c.json({ error: `Branch '${body.default_branch}' does not exist` }, 400);
+      }
+      updates.defaultBranch = body.default_branch;
       await storage.setHead(`refs/heads/${body.default_branch}`);
     }
 

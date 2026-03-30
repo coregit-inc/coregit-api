@@ -18,7 +18,7 @@ const files = new Hono<{ Bindings: Env; Variables: Variables }>();
 
 // ── Helpers ──
 
-async function resolveRef(storage: GitR2Storage, ref: string): Promise<string | null> {
+export async function resolveRef(storage: GitR2Storage, ref: string): Promise<string | null> {
   if (ref === "HEAD") return storage.resolveHead();
   const branchSha = await storage.getRef(`refs/heads/${ref}`);
   if (branchSha) return branchSha;
@@ -31,7 +31,7 @@ async function resolveRef(storage: GitR2Storage, ref: string): Promise<string | 
   return null;
 }
 
-async function getTreeFromCommit(storage: GitR2Storage, commitSha: string): Promise<string | null> {
+export async function getTreeFromCommit(storage: GitR2Storage, commitSha: string): Promise<string | null> {
   const raw = await storage.getObject(commitSha);
   if (!raw) return null;
   const obj = parseGitObject(raw);
@@ -39,7 +39,7 @@ async function getTreeFromCommit(storage: GitR2Storage, commitSha: string): Prom
   return parseCommit(obj.content).tree;
 }
 
-async function navigateToPath(
+export async function navigateToPath(
   storage: GitR2Storage,
   treeSha: string,
   pathParts: string[]
@@ -63,7 +63,7 @@ async function navigateToPath(
   return { entries: parseTree(obj.content), sha: currentSha };
 }
 
-function isBinaryContent(content: Uint8Array): boolean {
+export function isBinaryContent(content: Uint8Array): boolean {
   const len = Math.min(content.length, 8192);
   for (let i = 0; i < len; i++) {
     if (content[i] === 0) return true;
@@ -216,7 +216,14 @@ files.get("/:slug/blob/*", apiKeyAuth, async (c) => {
     let encoding: "utf-8" | "base64";
 
     if (binary) {
-      content = btoa(String.fromCharCode(...parsed.content));
+      // Chunk-based base64 to avoid stack overflow on large binary files
+      const chunkSize = 8192;
+      let binaryStr = '';
+      for (let i = 0; i < parsed.content.length; i += chunkSize) {
+        const chunk = parsed.content.subarray(i, Math.min(i + chunkSize, parsed.content.length));
+        binaryStr += String.fromCharCode.apply(null, chunk as unknown as number[]);
+      }
+      content = btoa(binaryStr);
       encoding = "base64";
     } else {
       content = new TextDecoder().decode(parsed.content);

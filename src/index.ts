@@ -25,12 +25,35 @@ import { files } from "./routes/files";
 import { diff } from "./routes/diff";
 import { snapshots } from "./routes/snapshots";
 import { usage } from "./routes/usage";
+import { publicRoutes } from "./routes/public";
 import { git } from "./routes/git";
 import type { Env, Variables } from "./types";
 
 const app = new Hono<{ Bindings: Env; Variables: Variables }>();
 
-// ── CORS ──
+// ── CORS for /api/auth/* (credentials: true for cross-subdomain cookies) ──
+
+app.use(
+  "/api/auth/*",
+  cors({
+    origin: (origin) => {
+      if (
+        origin === "https://app.coregit.dev" ||
+        origin?.startsWith("http://localhost:") ||
+        origin?.startsWith("http://127.0.0.1:")
+      ) {
+        return origin;
+      }
+      return null;
+    },
+    allowHeaders: ["Content-Type", "Authorization"],
+    allowMethods: ["GET", "POST", "OPTIONS"],
+    credentials: true,
+    maxAge: 600,
+  })
+);
+
+// ── CORS for API routes ──
 
 app.use(
   "*",
@@ -39,12 +62,13 @@ app.use(
       const allowed = c.env.CORS_ORIGIN || "https://coregit.dev";
       if (
         origin === allowed ||
+        origin === "https://app.coregit.dev" ||
         origin?.startsWith("http://localhost:") ||
         origin?.startsWith("http://127.0.0.1:")
       ) {
         return origin;
       }
-      return allowed;
+      return null;
     },
     allowHeaders: ["Content-Type", "Authorization", "x-api-key"],
     allowMethods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
@@ -101,6 +125,10 @@ app.route("/v1/repos", files);
 app.route("/v1/repos", diff);
 app.route("/v1/repos", snapshots);
 app.route("/v1/usage", usage);
+
+// ── Public read-only routes (no auth required) ──
+
+app.route("/v1", publicRoutes);
 
 // ── Git Smart HTTP ──
 

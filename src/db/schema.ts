@@ -1,9 +1,20 @@
 import { pgTable, text, timestamp, index, uniqueIndex, jsonb, bigint, boolean } from "drizzle-orm/pg-core";
 
 // ============================================================
+// Better Auth managed table (read-only reference for queries)
+// ============================================================
+
+export const organization = pgTable("organization", {
+  id: text("id").primaryKey(),
+  name: text("name").notNull(),
+  slug: text("slug").notNull(),
+  logo: text("logo"),
+  metadata: text("metadata"),
+  createdAt: timestamp("created_at").defaultNow().notNull(),
+});
+
+// ============================================================
 // CoreGit application tables
-// Better Auth manages: user, session, account, verification,
-//   organization, member, invitation, apikey
 // ============================================================
 
 // Repositories
