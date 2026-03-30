@@ -53,11 +53,13 @@ app.use(
   })
 );
 
-// ── CORS for API routes ──
+// ── CORS for all other routes (skip /api/auth/* — handled above) ──
 
-app.use(
-  "*",
-  cors({
+app.use("*", async (c, next) => {
+  if (c.req.path.startsWith("/api/auth")) {
+    return next();
+  }
+  return cors({
     origin: (origin, c) => {
       const allowed = c.env.CORS_ORIGIN || "https://coregit.dev";
       if (
@@ -74,8 +76,8 @@ app.use(
     allowMethods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     credentials: true,
     maxAge: 86400,
-  })
-);
+  })(c, next);
+});
 
 // ── Health ──
 
