@@ -14,7 +14,7 @@ import type { Env } from "../types";
 export function createAuth(env: Env) {
   return betterAuth({
     database: new Pool({ connectionString: env.DATABASE_URL }),
-    baseURL: "https://app.coregit.dev",
+    baseURL: "https://api.coregit.dev",
     secret: env.BETTER_AUTH_SECRET,
     emailAndPassword: { enabled: true },
     socialProviders: {
