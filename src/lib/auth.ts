@@ -35,6 +35,10 @@ export function createAuth(env: Env) {
         domain: ".coregit.dev",
       },
       cookiePrefix: "coregit",
+      defaultCookieAttributes: {
+        sameSite: "none",
+        secure: true,
+      },
     },
     session: {
       expiresIn: 60 * 60 * 24 * 7, // 7 days

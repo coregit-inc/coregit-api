@@ -46,9 +46,10 @@ app.use(
       }
       return null;
     },
-    allowHeaders: ["Content-Type", "Authorization"],
+    allowHeaders: ["Content-Type", "Authorization", "User-Agent"],
     allowMethods: ["GET", "POST", "OPTIONS"],
     credentials: true,
+    exposeHeaders: ["Set-Cookie"],
     maxAge: 600,
   })
 );
