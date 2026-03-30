@@ -1,0 +1,33 @@
+name = "coregit-api"
+main = "src/index.ts"
+compatibility_date = "2025-10-13"
+compatibility_flags = ["nodejs_compat"]
+
+[[routes]]
+pattern = "api.coregit.dev/*"
+zone_name = "coregit.dev"
+
+[[r2_buckets]]
+binding = "REPOS_BUCKET"
+bucket_name = "coregit-repos"
+
+[vars]
+CORS_ORIGIN = "https://coregit.dev"
+
+[limits]
+cpu_ms = 30_000
+
+[observability]
+enabled = true
+
+[observability.logs]
+enabled = true
+invocation_logs = true
+
+# Secrets (set via wrangler secret put):
+# DATABASE_URL           — Neon PostgreSQL (separate project from Strayl)
+# BETTER_AUTH_SECRET     — Better Auth signing secret (min 32 chars)
+# GOOGLE_CLIENT_ID       — Google OAuth (for dashboard login)
+# GOOGLE_CLIENT_SECRET
+# GITHUB_CLIENT_ID       — GitHub OAuth (for dashboard login)
+# GITHUB_CLIENT_SECRET

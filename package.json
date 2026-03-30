@@ -1,0 +1,29 @@
+{
+  "name": "coregit-api",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "db:generate": "drizzle-kit generate",
+    "db:push": "drizzle-kit push"
+  },
+  "dependencies": {
+    "@better-auth/api-key": "^1.2.0",
+    "@neondatabase/serverless": "^1.0.2",
+    "better-auth": "^1.2.0",
+    "drizzle-orm": "^0.45.1",
+    "fflate": "^0.8.2",
+    "hono": "^4.7.6",
+    "nanoid": "^5.1.6",
+    "node-diff3": "^3.2.0",
+    "pako": "^2.1.0"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20250519.0",
+    "@types/pako": "^2.0.4",
+    "drizzle-kit": "^0.31.8",
+    "typescript": "^5.8.3",
+    "wrangler": "^4.14.4"
+  }
+}
