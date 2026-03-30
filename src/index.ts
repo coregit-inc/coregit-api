@@ -118,7 +118,7 @@ app.use("/:org/:repo/*", async (c, next) => {
 
 // ── Better Auth handler ──
 
-app.on(["GET", "POST"], "/api/auth/*", (c) => {
+app.all("/api/auth/*", (c) => {
   return createAuth(c.env).handler(c.req.raw);
 });
 
