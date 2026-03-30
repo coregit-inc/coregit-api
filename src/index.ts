@@ -101,8 +101,12 @@ app.use("/api/auth/*", async (c, next) => {
   await next();
 });
 
-// DB middleware for git routes
+// DB middleware for git routes (skip /api/* and /v1/*)
 app.use("/:org/:repo/*", async (c, next) => {
+  const orgParam = c.req.param("org");
+  if (orgParam === "api" || orgParam === "v1") {
+    return next();
+  }
   const repoParam = c.req.param("repo");
   if (!repoParam?.endsWith(".git") && !repoParam?.includes(".git/")) {
     return next();
