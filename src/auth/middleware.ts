@@ -1,14 +1,22 @@
 /**
  * API Key authentication middleware.
  *
- * Two modes:
- * 1. x-api-key header — for REST API calls
- * 2. HTTP Basic Auth — for Git Smart HTTP (username=orgSlug, password=apiKey)
+ * Simple SHA-256 hash lookup against api_key table in Neon.
+ * No Better Auth — just raw SQL.
  */
 
 import { createMiddleware } from "hono/factory";
-import { createAuth } from "../lib/auth";
+import { sql } from "drizzle-orm";
 import type { Env, Variables } from "../types";
+
+const encoder = new TextEncoder();
+
+async function sha256(data: string): Promise<string> {
+  const hashBuffer = await crypto.subtle.digest("SHA-256", encoder.encode(data));
+  return Array.from(new Uint8Array(hashBuffer))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
 
 /**
  * Middleware for REST API routes.
@@ -23,26 +31,26 @@ export const apiKeyAuth = createMiddleware<{
     return c.json({ error: "Missing API key. Set x-api-key header." }, 401);
   }
 
-  const auth = createAuth(c.env);
-  const result = await auth.api.verifyApiKey({
-    body: { key },
-  });
+  const db = c.get("db");
+  const keyHash = await sha256(key);
 
-  if (!result.valid) {
-    const code = (result.error as any)?.code;
-    return c.json(
-      {
-        error: (result.error as any)?.message || "Invalid API key",
-        code,
-      },
-      code === "RATE_LIMITED" ? 429 : 401
-    );
+  const result = await db.execute(
+    sql`SELECT org_id FROM api_key WHERE key_hash = ${keyHash} LIMIT 1`
+  );
+
+  const row = result.rows[0] as { org_id: string } | undefined;
+  if (!row) {
+    return c.json({ error: "Invalid API key" }, 401);
   }
 
-  const apiKeyData = result.key as any;
-  c.set("orgId", apiKeyData.referenceId);
-  c.set("apiKeyPermissions", apiKeyData.permissions || null);
-  c.set("apiKeyId", apiKeyData.id);
+  // Touch last_used (fire-and-forget)
+  c.executionCtx.waitUntil(
+    db.execute(sql`UPDATE api_key SET last_used = NOW() WHERE key_hash = ${keyHash}`).catch(() => {})
+  );
+
+  c.set("orgId", row.org_id);
+  c.set("apiKeyPermissions", null);
+  c.set("apiKeyId", "");
 
   await next();
 });
@@ -67,16 +75,17 @@ export function parseBasicAuthKey(header: string | undefined): string | null {
  * Verify an API key and return the org ID, or null if invalid.
  */
 export async function verifyApiKeyForGit(
-  env: Env,
+  db: any,
   apiKeyValue: string
 ): Promise<{ orgId: string } | null> {
-  const auth = createAuth(env);
-  const result = await auth.api.verifyApiKey({
-    body: { key: apiKeyValue },
-  });
+  const keyHash = await sha256(apiKeyValue);
 
-  if (!result.valid) return null;
+  const result = await db.execute(
+    sql`SELECT org_id FROM api_key WHERE key_hash = ${keyHash} LIMIT 1`
+  );
 
-  const apiKeyData = result.key as any;
-  return { orgId: apiKeyData.referenceId };
+  const row = result.rows[0] as { org_id: string } | undefined;
+  if (!row) return null;
+
+  return { orgId: row.org_id };
 }

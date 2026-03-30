@@ -81,7 +81,7 @@ async function authenticateGit(c: any): Promise<GitAuthResult | Response> {
     return c.text("", 401, { "WWW-Authenticate": 'Basic realm="CoreGit"' });
   }
 
-  const authResult = await verifyApiKeyForGit(c.env, apiKeyValue);
+  const authResult = await verifyApiKeyForGit(db, apiKeyValue);
   if (!authResult) {
     return c.text("", 401, { "WWW-Authenticate": 'Basic realm="CoreGit"' });
   }
@@ -116,7 +116,7 @@ async function authenticateGitReadOnly(c: any): Promise<GitAuthResult | Response
   // Try API key auth first
   const apiKeyValue = parseBasicAuthKey(c.req.header("Authorization"));
   if (apiKeyValue) {
-    const authResult = await verifyApiKeyForGit(c.env, apiKeyValue);
+    const authResult = await verifyApiKeyForGit(db, apiKeyValue);
     if (authResult) {
       const orgId = authResult.orgId;
       const [found] = await db

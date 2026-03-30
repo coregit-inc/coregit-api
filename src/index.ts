@@ -3,7 +3,6 @@
  *
  * Cloudflare Worker entry point.
  * Routes:
- *   /api/auth/*                  — Better Auth (signup, login, orgs, API keys)
  *   /v1/repos                    — Repository CRUD
  *   /v1/repos/:slug/branches     — Branch operations
  *   /v1/repos/:slug/commits      — Commit operations (including API commit creation)
@@ -12,12 +11,14 @@
  *   /v1/repos/:slug/snapshots    — Named restore points
  *   /v1/usage                    — Usage tracking
  *   /:org/:repo.git/*            — Git Smart HTTP (clone/push/pull)
+ *
+ * Auth: API key only (hash lookup in Neon DB).
+ * Better Auth lives in coregit-app (Next.js), not here.
  */
 
 import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { createDb } from "./db";
-import { createAuth } from "./lib/auth";
 import { repos } from "./routes/repos";
 import { branches } from "./routes/branches";
 import { commits } from "./routes/commits";
@@ -31,36 +32,11 @@ import type { Env, Variables } from "./types";
 
 const app = new Hono<{ Bindings: Env; Variables: Variables }>();
 
-// ── CORS for /api/auth/* (credentials: true for cross-subdomain cookies) ──
+// ── CORS ──
 
 app.use(
-  "/api/auth/*",
+  "*",
   cors({
-    origin: (origin) => {
-      if (
-        origin === "https://app.coregit.dev" ||
-        origin?.startsWith("http://localhost:") ||
-        origin?.startsWith("http://127.0.0.1:")
-      ) {
-        return origin;
-      }
-      return null;
-    },
-    allowHeaders: ["Content-Type", "Authorization", "User-Agent"],
-    allowMethods: ["GET", "POST", "OPTIONS"],
-    credentials: true,
-    exposeHeaders: ["Set-Cookie"],
-    maxAge: 600,
-  })
-);
-
-// ── CORS for all other routes (skip /api/auth/* — handled above) ──
-
-app.use("*", async (c, next) => {
-  if (c.req.path.startsWith("/api/auth")) {
-    return next();
-  }
-  return cors({
     origin: (origin, c) => {
       const allowed = c.env.CORS_ORIGIN || "https://coregit.dev";
       if (
@@ -75,10 +51,9 @@ app.use("*", async (c, next) => {
     },
     allowHeaders: ["Content-Type", "Authorization", "x-api-key"],
     allowMethods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    credentials: true,
     maxAge: 86400,
-  })(c, next);
-});
+  })
+);
 
 // ── Health ──
 
@@ -96,16 +71,10 @@ app.use("/v1/*", async (c, next) => {
   await next();
 });
 
-app.use("/api/auth/*", async (c, next) => {
-  if (!c.env.DATABASE_URL) return c.json({ error: "Database not configured" }, 500);
-  c.set("db", createDb(c.env.DATABASE_URL));
-  await next();
-});
-
-// DB middleware for git routes (skip /api/* and /v1/*)
+// DB middleware for git routes (skip /v1/*)
 app.use("/:org/:repo/*", async (c, next) => {
   const orgParam = c.req.param("org");
-  if (orgParam === "api" || orgParam === "v1") {
+  if (orgParam === "v1") {
     return next();
   }
   const repoParam = c.req.param("repo");
@@ -115,12 +84,6 @@ app.use("/:org/:repo/*", async (c, next) => {
   if (!c.env.DATABASE_URL) return c.text("Database not configured", 500);
   c.set("db", createDb(c.env.DATABASE_URL));
   await next();
-});
-
-// ── Better Auth handler ──
-
-app.all("/api/auth/*", (c) => {
-  return createAuth(c.env).handler(c.req.raw);
 });
 
 // ── API routes ──
