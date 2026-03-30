@@ -8,17 +8,12 @@
 import { betterAuth } from "better-auth";
 import { organization } from "better-auth/plugins";
 import { apiKey } from "@better-auth/api-key";
-import { drizzleAdapter } from "better-auth/adapters/drizzle";
-import { neon } from "@neondatabase/serverless";
-import { drizzle } from "drizzle-orm/neon-http";
+import { Pool } from "@neondatabase/serverless";
 import type { Env } from "../types";
 
 export function createAuth(env: Env) {
-  const sql = neon(env.DATABASE_URL);
-  const db = drizzle(sql);
-
   return betterAuth({
-    database: drizzleAdapter(db, { provider: "pg" }),
+    database: new Pool({ connectionString: env.DATABASE_URL }),
     baseURL: "https://api.coregit.dev",
     secret: env.BETTER_AUTH_SECRET,
     emailAndPassword: { enabled: true },
