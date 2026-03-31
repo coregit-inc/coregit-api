@@ -134,8 +134,20 @@ async function buildTreeFromFlat(
 
 const encoder = new TextEncoder();
 
-function base64ToBytes(base64: string): Uint8Array {
-  const binary = atob(base64);
+export class InvalidBase64Error extends Error {
+  constructor(path: string) {
+    super(`Invalid base64 content for file: ${path}`);
+    this.name = "InvalidBase64Error";
+  }
+}
+
+function base64ToBytes(base64: string, path: string): Uint8Array {
+  let binary: string;
+  try {
+    binary = atob(base64);
+  } catch {
+    throw new InvalidBase64Error(path);
+  }
   const bytes = new Uint8Array(binary.length);
   for (let i = 0; i < binary.length; i++) {
     bytes[i] = binary.charCodeAt(i);
@@ -186,7 +198,7 @@ export async function createApiCommit(
       }
       const content =
         change.encoding === "base64"
-          ? base64ToBytes(change.content)
+          ? base64ToBytes(change.content, change.path)
           : encoder.encode(change.content);
       const blobSha = await hashGitObject("blob", content);
       await storage.putObject(blobSha, "blob", content);

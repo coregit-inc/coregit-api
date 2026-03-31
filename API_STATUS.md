@@ -107,11 +107,11 @@ API is live at `api.coregit.dev`. 21/21 end-to-end tests passing in production.
 
 ### P0 — Security (before any external users)
 
-- [ ] Validate file paths in API commits
-- [ ] Validate branch/ref names
-- [ ] Validate commit message length
-- [ ] Validate base64 content (catch errors, return 400)
-- [ ] Cap blob read size (reject >50MB)
+- [x] Validate file paths in API commits
+- [x] Validate branch/ref names
+- [x] Validate commit message length
+- [x] Validate base64 content (catch errors, return 400)
+- [x] Cap blob read size (reject >50MB)
 - [ ] Fix CORS origin matching
 - [ ] Implement rate limiting per API key
 - [ ] Add API key scopes

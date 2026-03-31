@@ -12,12 +12,36 @@ import { apiKeyAuth } from "../auth/middleware";
 import { repo } from "../db/schema";
 import { GitR2Storage } from "../git/storage";
 import { parseGitObject, parseCommit } from "../git/objects";
-import { createApiCommit, ConflictError, type FileChange, type CommitAuthor } from "../services/commit-builder";
+import { createApiCommit, ConflictError, InvalidBase64Error, type FileChange, type CommitAuthor } from "../services/commit-builder";
 import { recordUsage } from "../services/usage";
 import { checkFreeLimits } from "../services/limits";
 import type { Env, Variables } from "../types";
 
 const commits = new Hono<{ Bindings: Env; Variables: Variables }>();
+
+/** Validate a file path — returns error string or null if valid. */
+function validateFilePath(path: string): string | null {
+  if (!path || typeof path !== "string") return "File path is required";
+  if (path.includes("\0")) return `File path contains null byte: ${path}`;
+  if (path.startsWith("/")) return `File path must be relative: ${path}`;
+  const segments = path.split("/");
+  for (const seg of segments) {
+    if (seg === "") return `File path has empty segment: ${path}`;
+    if (seg === "." || seg === "..") return `File path contains traversal: ${path}`;
+  }
+  if (path.length > 4096) return `File path exceeds 4096 char limit: ${path.slice(0, 100)}...`;
+  return null;
+}
+
+/** Validate a git ref name per git-check-ref-format rules. */
+function isValidRefName(name: string): boolean {
+  if (!name || name.length > 256) return false;
+  if (name.startsWith(".") || name.endsWith(".") || name.endsWith(".lock")) return false;
+  if (name.includes("..") || name.includes("//") || name.includes("@{")) return false;
+  if (name.includes("\\") || name.includes(" ") || name.includes("~") || name.includes("^") || name.includes(":") || name.includes("?") || name.includes("*") || name.includes("[")) return false;
+  if (/[\x00-\x1f\x7f]/.test(name)) return false;
+  return true;
+}
 
 export function parseAuthorString(author: string): { name: string; email: string; timestamp: number } {
   const match = author.match(/^(.+?)\s+<([^>]+)>\s+(\d+)/);
@@ -68,7 +92,9 @@ commits.post("/:slug/commits", apiKeyAuth, async (c) => {
   const { branch, message, author, changes, parent_sha } = body;
 
   if (!branch) return c.json({ error: "branch is required" }, 400);
+  if (!isValidRefName(branch)) return c.json({ error: "Invalid branch name" }, 400);
   if (!message) return c.json({ error: "message is required" }, 400);
+  if (message.length > 51200) return c.json({ error: "Commit message exceeds 50 KB limit" }, 400);
   if (!author?.name || !author?.email) return c.json({ error: "author.name and author.email are required" }, 400);
   if (!changes || !Array.isArray(changes) || changes.length === 0) {
     return c.json({ error: "changes array is required and must not be empty" }, 400);
@@ -80,6 +106,17 @@ commits.post("/:slug/commits", apiKeyAuth, async (c) => {
   for (const change of changes) {
     if (change.content && change.content.length > MAX_FILE_SIZE) {
       return c.json({ error: `File content exceeds 10 MB limit: ${change.path}` }, 400);
+    }
+    // Validate file paths: no traversal, null bytes, or empty segments
+    const pathError = validateFilePath(change.path);
+    if (pathError) {
+      return c.json({ error: pathError }, 400);
+    }
+    // Validate base64 content
+    if (change.encoding === "base64" && change.content) {
+      if (!/^[A-Za-z0-9+/]*={0,2}$/.test(change.content)) {
+        return c.json({ error: `Invalid base64 content for file: ${change.path}` }, 400);
+      }
     }
   }
 
@@ -105,6 +142,9 @@ commits.post("/:slug/commits", apiKeyAuth, async (c) => {
   } catch (error) {
     if (error instanceof ConflictError) {
       return c.json({ error: error.message }, 409);
+    }
+    if (error instanceof InvalidBase64Error) {
+      return c.json({ error: error.message }, 400);
     }
     console.error("Failed to create commit:", error);
     return c.json({ error: "Failed to create commit" }, 500);

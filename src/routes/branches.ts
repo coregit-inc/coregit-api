@@ -18,6 +18,16 @@ import type { Env, Variables } from "../types";
 
 const branches = new Hono<{ Bindings: Env; Variables: Variables }>();
 
+/** Validate a git ref name per git-check-ref-format rules. */
+function isValidRefName(name: string): boolean {
+  if (!name || name.length > 256) return false;
+  if (name.startsWith(".") || name.endsWith(".") || name.endsWith(".lock")) return false;
+  if (name.includes("..") || name.includes("//") || name.includes("@{")) return false;
+  if (name.includes("\\") || name.includes(" ") || name.includes("~") || name.includes("^") || name.includes(":") || name.includes("?") || name.includes("*") || name.includes("[")) return false;
+  if (/[\x00-\x1f\x7f]/.test(name)) return false;
+  return true;
+}
+
 // POST /v1/repos/:slug/branches
 branches.post("/:slug/branches", apiKeyAuth, async (c) => {
   const orgId = c.get("orgId");
@@ -42,6 +52,9 @@ branches.post("/:slug/branches", apiKeyAuth, async (c) => {
   const { name, from, from_sha } = body;
   if (!name || typeof name !== "string") {
     return c.json({ error: "Branch name is required" }, 400);
+  }
+  if (!isValidRefName(name)) {
+    return c.json({ error: "Invalid branch name" }, 400);
   }
 
   const storage = new GitR2Storage(bucket, orgId, slug);

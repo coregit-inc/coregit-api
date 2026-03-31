@@ -205,8 +205,12 @@ files.get("/:slug/blob/*", apiKeyAuth, async (c) => {
     if (!fileEntry) return c.json({ error: "File not found" }, 404);
     if (fileEntry.mode === "40000") return c.json({ error: "Path is a directory" }, 400);
 
+    const MAX_BLOB_SIZE = 50 * 1024 * 1024; // 50 MB
     const blobData = await storage.getObject(fileEntry.sha);
     if (!blobData) return c.json({ error: "Blob not found" }, 500);
+    if (blobData.byteLength > MAX_BLOB_SIZE) {
+      return c.json({ error: "File exceeds 50 MB size limit", size: blobData.byteLength }, 400);
+    }
 
     const parsed = parseGitObject(blobData);
     if (parsed.type !== "blob") return c.json({ error: "Invalid blob" }, 500);
