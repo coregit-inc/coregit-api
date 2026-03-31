@@ -10,7 +10,7 @@ export const organization = pgTable("organization", {
   slug: text("slug").notNull(),
   logo: text("logo"),
   metadata: text("metadata"),
-  createdAt: timestamp("created_at").defaultNow().notNull(),
+  createdAt: timestamp("createdAt").defaultNow().notNull(),
 });
 
 // ============================================================
