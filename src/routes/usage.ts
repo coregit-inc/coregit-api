@@ -24,6 +24,11 @@ usage.get("/", apiKeyAuth, async (c) => {
     c.req.query("period") ||
     `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}`;
 
+  // Validate period format
+  if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(period)) {
+    return c.json({ error: "Invalid period format. Use YYYY-MM (e.g. 2026-03)" }, 400);
+  }
+
   try {
     const summary = await getUsageSummary(db, orgId, period);
 

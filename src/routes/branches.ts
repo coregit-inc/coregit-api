@@ -14,19 +14,10 @@ import { apiKeyAuth } from "../auth/middleware";
 import { repo } from "../db/schema";
 import { GitR2Storage } from "../git/storage";
 import { findMergeBase } from "../git/cherry-pick";
+import { isValidRefName } from "../git/validation";
 import type { Env, Variables } from "../types";
 
 const branches = new Hono<{ Bindings: Env; Variables: Variables }>();
-
-/** Validate a git ref name per git-check-ref-format rules. */
-function isValidRefName(name: string): boolean {
-  if (!name || name.length > 256) return false;
-  if (name.startsWith(".") || name.endsWith(".") || name.endsWith(".lock")) return false;
-  if (name.includes("..") || name.includes("//") || name.includes("@{")) return false;
-  if (name.includes("\\") || name.includes(" ") || name.includes("~") || name.includes("^") || name.includes(":") || name.includes("?") || name.includes("*") || name.includes("[")) return false;
-  if (/[\x00-\x1f\x7f]/.test(name)) return false;
-  return true;
-}
 
 // POST /v1/repos/:slug/branches
 branches.post("/:slug/branches", apiKeyAuth, async (c) => {
@@ -200,8 +191,9 @@ branches.post("/:slug/branches/:name/merge", apiKeyAuth, async (c) => {
   const sourceSha = await storage.getRef(`refs/heads/${name}`);
   if (!sourceSha) return c.json({ error: `Source branch '${name}' not found` }, 404);
 
-  const targetSha = await storage.getRef(`refs/heads/${target}`);
-  if (!targetSha) return c.json({ error: `Target branch '${target}' not found` }, 404);
+  const targetRef = await storage.getRefWithEtag(`refs/heads/${target}`);
+  if (!targetRef) return c.json({ error: `Target branch '${target}' not found` }, 404);
+  const targetSha = targetRef.sha;
 
   if (sourceSha === targetSha) {
     return c.json({ merged: true, sha: targetSha, strategy: "already_up_to_date" });
@@ -217,7 +209,10 @@ branches.post("/:slug/branches/:name/merge", apiKeyAuth, async (c) => {
       );
     }
 
-    await storage.setRef(`refs/heads/${target}`, sourceSha);
+    const ok = await storage.setRefConditional(`refs/heads/${target}`, sourceSha, targetRef.etag);
+    if (!ok) {
+      return c.json({ error: "Branch was updated concurrently, retry merge" }, 409);
+    }
     return c.json({ merged: true, sha: sourceSha, strategy: "fast-forward" });
   } catch (error) {
     console.error("Failed to merge:", error);

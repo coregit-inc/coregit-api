@@ -27,6 +27,7 @@ import { generatePackfile, parsePackfile, findShallowCommits } from "../git/pack
 import { parseCommit, parseGitObject } from "../git/objects";
 import { recordUsage } from "../services/usage";
 import { getDodoCustomerId } from "../services/dodo";
+import { isValidSha, isValidRefPath } from "../git/validation";
 import type { Env, Variables } from "../types";
 
 const encoder = new TextEncoder();
@@ -392,18 +393,41 @@ git.post("/:org/:repo/git-receive-pack", async (c) => {
   } else {
     for (const update of refUpdates) {
       try {
+        // Validate ref path (prevent traversal like refs/heads/../../HEAD)
+        if (!isValidRefPath(update.refName)) {
+          refResults.push({ refName: update.refName, success: false, error: "invalid ref name" });
+          continue;
+        }
+        // Validate SHA format
+        if (update.newSha !== zeroSha && !isValidSha(update.newSha)) {
+          refResults.push({ refName: update.refName, success: false, error: "invalid SHA" });
+          continue;
+        }
+        if (update.oldSha !== zeroSha && !isValidSha(update.oldSha)) {
+          refResults.push({ refName: update.refName, success: false, error: "invalid SHA" });
+          continue;
+        }
+
         if (update.newSha === zeroSha) {
           await storage.deleteRef(update.refName);
           refResults.push({ refName: update.refName, success: true });
         } else {
           if (update.oldSha !== zeroSha) {
-            const currentSha = await storage.getRef(update.refName);
-            if (currentSha !== update.oldSha) {
+            // CAS: read current ref with etag, then conditional write
+            const current = await storage.getRefWithEtag(update.refName);
+            if (!current || current.sha !== update.oldSha) {
               refResults.push({ refName: update.refName, success: false, error: "non-fast-forward" });
               continue;
             }
+            const ok = await storage.setRefConditional(update.refName, update.newSha, current.etag);
+            if (!ok) {
+              refResults.push({ refName: update.refName, success: false, error: "concurrent update, retry push" });
+              continue;
+            }
+          } else {
+            // New ref — plain setRef is fine (no race on creation)
+            await storage.setRef(update.refName, update.newSha);
           }
-          await storage.setRef(update.refName, update.newSha);
           refResults.push({ refName: update.refName, success: true });
         }
       } catch (err) {

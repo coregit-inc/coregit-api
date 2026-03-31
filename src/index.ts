@@ -18,6 +18,7 @@
 
 import { Hono } from "hono";
 import { cors } from "hono/cors";
+import { bodyLimit } from "hono/body-limit";
 import { createDb } from "./db";
 import { repos } from "./routes/repos";
 import { branches } from "./routes/branches";
@@ -32,6 +33,17 @@ import type { Env, Variables } from "./types";
 
 const app = new Hono<{ Bindings: Env; Variables: Variables }>();
 
+// ── Security headers ──
+
+app.use("*", async (c, next) => {
+  await next();
+  c.header("X-Content-Type-Options", "nosniff");
+  c.header("X-Frame-Options", "DENY");
+  c.header("Referrer-Policy", "strict-origin-when-cross-origin");
+  c.header("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'");
+  c.header("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
+});
+
 // ── CORS ──
 
 app.use(
@@ -41,9 +53,15 @@ app.use(
       const allowed = c.env.CORS_ORIGIN || "https://coregit.dev";
       if (
         origin === allowed ||
-        origin === "https://app.coregit.dev" ||
-        origin?.startsWith("http://localhost:") ||
-        origin?.startsWith("http://127.0.0.1:")
+        origin === "https://app.coregit.dev"
+      ) {
+        return origin;
+      }
+      // Only allow localhost in non-production
+      if (
+        c.env.ENVIRONMENT === "development" &&
+        (origin?.startsWith("http://localhost:") ||
+          origin?.startsWith("http://127.0.0.1:"))
       ) {
         return origin;
       }
@@ -51,9 +69,14 @@ app.use(
     },
     allowHeaders: ["Content-Type", "Authorization", "x-api-key"],
     allowMethods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    exposeHeaders: ["X-Request-Id"],
     maxAge: 86400,
   })
 );
+
+// ── Body size limit for REST API routes (5 MB) ──
+
+app.use("/v1/*", bodyLimit({ maxSize: 5 * 1024 * 1024 }));
 
 // ── Health ──
 
@@ -111,8 +134,10 @@ app.notFound((c) => c.json({ error: "Not found" }, 404));
 // ── Error handler ──
 
 app.onError((err, c) => {
-  console.error("Unhandled error:", err);
-  return c.json({ error: "Internal server error" }, 500);
+  const requestId = crypto.randomUUID().slice(0, 8);
+  console.error(`[${requestId}] ${c.req.method} ${c.req.path}:`, err);
+  c.header("X-Request-Id", requestId);
+  return c.json({ error: "Internal server error", request_id: requestId }, 500);
 });
 
 export default app;

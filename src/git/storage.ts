@@ -16,6 +16,7 @@
 
 import { createGitObjectRaw, type GitObjectType } from "./objects";
 import { zlibSync } from "fflate";
+import { isValidSha } from "./validation";
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
@@ -370,7 +371,9 @@ export class GitR2Storage {
   // ============ Private Helpers ============
 
   private objectKey(sha: string): string {
-    // Objects stored as objects/ab/cdef1234...
+    if (!isValidSha(sha)) {
+      throw new Error(`Invalid SHA: ${sha}`);
+    }
     return `${this.basePath}/objects/${sha.slice(0, 2)}/${sha.slice(2)}`;
   }
 }

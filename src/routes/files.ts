@@ -205,6 +205,12 @@ files.get("/:slug/blob/*", apiKeyAuth, async (c) => {
     if (!fileEntry) return c.json({ error: "File not found" }, 404);
     if (fileEntry.mode === "40000") return c.json({ error: "Path is a directory" }, 400);
 
+    // ETag: git objects are immutable by SHA — cache forever
+    const ifNoneMatch = c.req.header("If-None-Match");
+    if (ifNoneMatch === `"${fileEntry.sha}"`) {
+      return new Response(null, { status: 304 });
+    }
+
     const MAX_BLOB_SIZE = 50 * 1024 * 1024; // 50 MB
     const blobData = await storage.getObject(fileEntry.sha);
     if (!blobData) return c.json({ error: "Blob not found" }, 500);
@@ -240,6 +246,9 @@ files.get("/:slug/blob/*", apiKeyAuth, async (c) => {
       path: pathStr,
       sha: fileEntry.sha,
       size: parsed.content.length,
+    }, 200, {
+      "ETag": `"${fileEntry.sha}"`,
+      "Cache-Control": "public, max-age=31536000, immutable",
     });
   } catch (error) {
     console.error("Failed to fetch blob:", error);

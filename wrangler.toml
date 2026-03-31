@@ -14,6 +14,9 @@ bucket_name = "coregit-repos"
 [vars]
 CORS_ORIGIN = "https://coregit.dev"
 
+[placement]
+mode = "smart"
+
 [limits]
 cpu_ms = 30_000
 

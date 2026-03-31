@@ -15,33 +15,10 @@ import { parseGitObject, parseCommit } from "../git/objects";
 import { createApiCommit, ConflictError, InvalidBase64Error, type FileChange, type CommitAuthor } from "../services/commit-builder";
 import { recordUsage } from "../services/usage";
 import { checkFreeLimits } from "../services/limits";
+import { isValidRefName, validateFilePath } from "../git/validation";
 import type { Env, Variables } from "../types";
 
 const commits = new Hono<{ Bindings: Env; Variables: Variables }>();
-
-/** Validate a file path — returns error string or null if valid. */
-function validateFilePath(path: string): string | null {
-  if (!path || typeof path !== "string") return "File path is required";
-  if (path.includes("\0")) return `File path contains null byte: ${path}`;
-  if (path.startsWith("/")) return `File path must be relative: ${path}`;
-  const segments = path.split("/");
-  for (const seg of segments) {
-    if (seg === "") return `File path has empty segment: ${path}`;
-    if (seg === "." || seg === "..") return `File path contains traversal: ${path}`;
-  }
-  if (path.length > 4096) return `File path exceeds 4096 char limit: ${path.slice(0, 100)}...`;
-  return null;
-}
-
-/** Validate a git ref name per git-check-ref-format rules. */
-function isValidRefName(name: string): boolean {
-  if (!name || name.length > 256) return false;
-  if (name.startsWith(".") || name.endsWith(".") || name.endsWith(".lock")) return false;
-  if (name.includes("..") || name.includes("//") || name.includes("@{")) return false;
-  if (name.includes("\\") || name.includes(" ") || name.includes("~") || name.includes("^") || name.includes(":") || name.includes("?") || name.includes("*") || name.includes("[")) return false;
-  if (/[\x00-\x1f\x7f]/.test(name)) return false;
-  return true;
-}
 
 export function parseAuthorString(author: string): { name: string; email: string; timestamp: number } {
   const match = author.match(/^(.+?)\s+<([^>]+)>\s+(\d+)/);

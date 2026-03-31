@@ -3,6 +3,7 @@ import type { Database } from "../db";
 export interface Env {
   DATABASE_URL: string;
   CORS_ORIGIN: string;
+  ENVIRONMENT?: string;
   REPOS_BUCKET: R2Bucket;
   DODO_PAYMENTS_API_KEY: string;
 }

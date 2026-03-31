@@ -209,7 +209,16 @@ snapshots.post("/:slug/snapshots/:name/restore", apiKeyAuth, async (c) => {
     return c.json({ error: "Snapshot commit no longer exists in storage" }, 410);
   }
 
-  await storage.setRef(`refs/heads/${targetBranch}`, snap.commitSha);
+  // CAS: if branch exists, use conditional update to prevent race
+  const currentRef = await storage.getRefWithEtag(`refs/heads/${targetBranch}`);
+  if (currentRef) {
+    const ok = await storage.setRefConditional(`refs/heads/${targetBranch}`, snap.commitSha, currentRef.etag);
+    if (!ok) {
+      return c.json({ error: "Branch was updated concurrently, retry restore" }, 409);
+    }
+  } else {
+    await storage.setRef(`refs/heads/${targetBranch}`, snap.commitSha);
+  }
 
   return c.json({
     restored: true,
