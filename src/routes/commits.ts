@@ -14,6 +14,7 @@ import { GitR2Storage } from "../git/storage";
 import { parseGitObject, parseCommit } from "../git/objects";
 import { createApiCommit, ConflictError, type FileChange, type CommitAuthor } from "../services/commit-builder";
 import { recordUsage } from "../services/usage";
+import { checkFreeLimits } from "../services/limits";
 import type { Env, Variables } from "../types";
 
 const commits = new Hono<{ Bindings: Env; Variables: Variables }>();
@@ -32,6 +33,17 @@ commits.post("/:slug/commits", apiKeyAuth, async (c) => {
   const db = c.get("db");
   const bucket = c.env.REPOS_BUCKET;
   const { slug } = c.req.param();
+
+  // Free tier: check API call limit
+  const apiLimit = await checkFreeLimits(db, orgId, c.get("orgTier"), "api_call");
+  if (!apiLimit.allowed) {
+    return c.json({
+      error: "Free tier limit exceeded: API calls",
+      used: apiLimit.used,
+      limit: apiLimit.limit,
+      upgrade_url: "https://app.coregit.dev/dashboard/billing",
+    }, 429);
+  }
 
   const [found] = await db
     .select()
@@ -79,7 +91,7 @@ commits.post("/:slug/commits", apiKeyAuth, async (c) => {
     recordUsage(c.executionCtx, db, orgId, "api_call", 1, {
       operation: "commit",
       repo_slug: slug,
-    });
+    }, c.env.DODO_PAYMENTS_API_KEY, c.get("dodoCustomerId"));
 
     return c.json(
       {

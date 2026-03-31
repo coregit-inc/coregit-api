@@ -16,6 +16,7 @@ import { repo, organization } from "../db/schema";
 import { GitR2Storage } from "../git/storage";
 import { createTree, createCommit, hashGitObject, parseGitObject, parseCommit } from "../git/objects";
 import { recordUsage } from "../services/usage";
+import { checkFreeLimits } from "../services/limits";
 import type { Env, Variables } from "../types";
 
 const repos = new Hono<{ Bindings: Env; Variables: Variables }>();
@@ -61,6 +62,17 @@ repos.post("/", apiKeyAuth, async (c) => {
   }
 
   try {
+    // Free tier: check repo limit
+    const repoLimit = await checkFreeLimits(db, orgId, c.get("orgTier"), "repo_created");
+    if (!repoLimit.allowed) {
+      return c.json({
+        error: "Free tier limit exceeded: repositories",
+        used: repoLimit.used,
+        limit: repoLimit.limit,
+        upgrade_url: "https://app.coregit.dev/dashboard/billing",
+      }, 429);
+    }
+
     // Check uniqueness
     const existing = await db
       .select({ id: repo.id })
@@ -112,7 +124,7 @@ repos.post("/", apiKeyAuth, async (c) => {
     }
 
     // Track usage
-    recordUsage(c.executionCtx, db, orgId, "repo_created", 1, { repo_id: repoId });
+    recordUsage(c.executionCtx, db, orgId, "repo_created", 1, { repo_id: repoId }, c.env.DODO_PAYMENTS_API_KEY, c.get("dodoCustomerId"));
 
     // Look up org slug for git_url
     const [org] = await db
@@ -345,7 +357,7 @@ repos.delete("/:slug", apiKeyAuth, async (c) => {
     // Delete DB record (cascades to snapshots)
     await db.delete(repo).where(eq(repo.id, found.id));
 
-    recordUsage(c.executionCtx, db, orgId, "repo_deleted", 1, { repo_id: found.id });
+    recordUsage(c.executionCtx, db, orgId, "repo_deleted", 1, { repo_id: found.id }, c.env.DODO_PAYMENTS_API_KEY, c.get("dodoCustomerId"));
 
     return c.json({ deleted: true });
   } catch (error) {

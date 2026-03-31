@@ -8,6 +8,7 @@
 import { createMiddleware } from "hono/factory";
 import { sql } from "drizzle-orm";
 import type { Env, Variables } from "../types";
+import { getOrgPlan } from "../services/limits";
 
 const encoder = new TextEncoder();
 
@@ -51,6 +52,11 @@ export const apiKeyAuth = createMiddleware<{
   c.set("orgId", row.org_id);
   c.set("apiKeyPermissions", null);
   c.set("apiKeyId", "");
+
+  // Look up org plan for billing context
+  const orgPlan = await getOrgPlan(db, row.org_id);
+  c.set("orgTier", orgPlan.tier);
+  c.set("dodoCustomerId", orgPlan.dodoCustomerId);
 
   await next();
 });

@@ -31,3 +31,4 @@ invocation_logs = true
 # GOOGLE_CLIENT_SECRET
 # GITHUB_CLIENT_ID       — GitHub OAuth (for dashboard login)
 # GITHUB_CLIENT_SECRET
+# DODO_PAYMENTS_API_KEY  — Dodo Payments API key for usage event ingestion

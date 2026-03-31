@@ -26,6 +26,7 @@ import {
 import { generatePackfile, parsePackfile, findShallowCommits } from "../git/packfile";
 import { parseCommit, parseGitObject } from "../git/objects";
 import { recordUsage } from "../services/usage";
+import { getDodoCustomerId } from "../services/dodo";
 import type { Env, Variables } from "../types";
 
 const encoder = new TextEncoder();
@@ -307,9 +308,10 @@ git.post("/:org/:repo/git-upload-pack", async (c) => {
 
   // Track git transfer
   const db = c.get("db");
+  const dodoCustomerId = await getDodoCustomerId(db, orgId);
   recordUsage(c.executionCtx, db, orgId, "git_transfer_bytes", totalLength, {
     operation: "upload-pack",
-  });
+  }, c.env.DODO_PAYMENTS_API_KEY, dodoCustomerId);
 
   return new Response(finalResponse, {
     headers: { "Content-Type": "application/x-git-upload-pack-result" },
@@ -439,9 +441,10 @@ git.post("/:org/:repo/git-receive-pack", async (c) => {
 
   // Track git transfer
   const db = c.get("db");
+  const dodoCustomerIdPush = await getDodoCustomerId(db, orgId);
   recordUsage(c.executionCtx, db, orgId, "git_transfer_bytes", body.length, {
     operation: "receive-pack",
-  });
+  }, c.env.DODO_PAYMENTS_API_KEY, dodoCustomerIdPush);
 
   return new Response(responseBytes, {
     headers: { "Content-Type": "application/x-git-receive-pack-result" },
