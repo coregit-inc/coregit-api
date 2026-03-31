@@ -11,7 +11,7 @@
 import { sql } from "drizzle-orm";
 import type { Database } from "../db";
 
-const DODO_INGEST_URL = "https://api.dodopayments.com/events/ingest";
+const DODO_INGEST_URL = "https://live.dodopayments.com/events/ingest";
 
 // Dodo event names — must match meters in Dodo dashboard
 export const DODO_EVENTS = {
