@@ -5,6 +5,8 @@
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
+    "test": "vitest run",
+    "test:bench": "vitest bench",
     "db:generate": "drizzle-kit generate",
     "db:push": "drizzle-kit push"
   },
@@ -24,6 +26,7 @@
     "@types/pako": "^2.0.4",
     "drizzle-kit": "^0.31.8",
     "typescript": "^5.8.3",
+    "vitest": "^4.1.2",
     "wrangler": "^4.14.4"
   }
 }

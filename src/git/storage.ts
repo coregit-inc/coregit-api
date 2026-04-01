@@ -53,7 +53,7 @@ export class GitR2Storage {
 
     const compressed = new Uint8Array(await obj.arrayBuffer());
 
-    // Decompress using sync unzlibSync (matches putObject's sync zlibSync)
+    // Decompress using sync unzlibSync — matches zlibSync format, no async overhead
     let result: Uint8Array;
     try {
       result = unzlibSync(compressed);
