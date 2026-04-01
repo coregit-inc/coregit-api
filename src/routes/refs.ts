@@ -16,7 +16,7 @@ import { apiKeyAuth } from "../auth/middleware";
 import { repo } from "../db/schema";
 import { GitR2Storage } from "../git/storage";
 import { isValidRefPath, isValidSha } from "../git/validation";
-import { recordUsage } from "../services/usage";
+
 import { checkFreeLimits } from "../services/limits";
 import type { Env, Variables } from "../types";
 
@@ -170,12 +170,6 @@ refs.put("/:slug/refs/*", apiKeyAuth, async (c) => {
     previousSha = current;
     await storage.setRef(refPath, sha);
   }
-
-  recordUsage(c.executionCtx, db, orgId, "api_call", 1, {
-    operation: "ref_update",
-    repo_slug: slug,
-    ref: refPath,
-  }, c.env.DODO_PAYMENTS_API_KEY, c.get("dodoCustomerId"));
 
   return c.json({
     ref: refPath,

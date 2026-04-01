@@ -17,7 +17,7 @@ import {
   cherryPickCommits,
   isBaseCommitNotAncestorError,
 } from "../git/cherry-pick";
-import { recordUsage } from "../services/usage";
+
 import { checkFreeLimits } from "../services/limits";
 import { isValidSha } from "../git/validation";
 import type { Env, Variables } from "../types";
@@ -148,12 +148,6 @@ cherryPick.post("/:slug/cherry-pick", apiKeyAuth, async (c) => {
         branchUpdated = true;
       }
     }
-
-    recordUsage(c.executionCtx, db, orgId, "api_call", 1, {
-      operation: "cherry_pick",
-      repo_slug: slug,
-      commits_count: commits.length,
-    }, c.env.DODO_PAYMENTS_API_KEY, c.get("dodoCustomerId"));
 
     return c.json({
       success: true,

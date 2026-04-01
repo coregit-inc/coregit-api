@@ -22,7 +22,7 @@ import {
   cherryPickCommits,
   type FlatTree,
 } from "../git/cherry-pick";
-import { recordUsage } from "../services/usage";
+
 import { checkFreeLimits } from "../services/limits";
 import type { Env, Variables } from "../types";
 
@@ -174,11 +174,6 @@ compare.get("/:slug/compare", apiKeyAuth, async (c) => {
       mergeable = dryRun.success;
       conflicts = dryRun.conflicts || [];
     }
-
-    recordUsage(c.executionCtx, db, orgId, "api_call", 1, {
-      operation: "compare",
-      repo_slug: slug,
-    }, c.env.DODO_PAYMENTS_API_KEY, c.get("dodoCustomerId"));
 
     return c.json({
       base: baseSha,

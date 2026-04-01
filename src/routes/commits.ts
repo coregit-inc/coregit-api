@@ -13,7 +13,7 @@ import { repo } from "../db/schema";
 import { GitR2Storage } from "../git/storage";
 import { parseGitObject, parseCommit } from "../git/objects";
 import { createApiCommit, ConflictError, InvalidBase64Error, type FileChange, type CommitAuthor } from "../services/commit-builder";
-import { recordUsage } from "../services/usage";
+
 import { checkFreeLimits } from "../services/limits";
 import { isValidRefName, validateFilePath } from "../git/validation";
 import type { Env, Variables } from "../types";
@@ -101,11 +101,6 @@ commits.post("/:slug/commits", apiKeyAuth, async (c) => {
 
   try {
     const result = await createApiCommit(storage, branch, message, author, changes, parent_sha);
-
-    recordUsage(c.executionCtx, db, orgId, "api_call", 1, {
-      operation: "commit",
-      repo_slug: slug,
-    }, c.env.DODO_PAYMENTS_API_KEY, c.get("dodoCustomerId"));
 
     return c.json(
       {

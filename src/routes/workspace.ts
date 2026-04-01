@@ -10,7 +10,7 @@ import { apiKeyAuth } from "../auth/middleware";
 import { repo } from "../db/schema";
 import { GitR2Storage } from "../git/storage";
 import { execInWorkspace } from "../workspace/exec";
-import { recordUsage } from "../services/usage";
+
 import { checkFreeLimits } from "../services/limits";
 import type { Env, Variables } from "../types";
 
@@ -89,18 +89,6 @@ workspace.post("/:slug/exec", apiKeyAuth, async (c) => {
       commitMessage: body.commit_message,
       author: body.author,
     });
-
-    // Track usage (fire-and-forget)
-    recordUsage(
-      c.executionCtx,
-      db,
-      orgId,
-      "api_call",
-      1,
-      { endpoint: "workspace_exec", repo: slug },
-      c.env.DODO_PAYMENTS_API_KEY,
-      c.get("dodoCustomerId")
-    );
 
     return c.json({
       stdout: result.stdout,

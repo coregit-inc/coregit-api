@@ -9,6 +9,7 @@ import { createMiddleware } from "hono/factory";
 import { sql } from "drizzle-orm";
 import type { Env, Variables } from "../types";
 import { getOrgPlan } from "../services/limits";
+import { recordUsage } from "../services/usage";
 
 const encoder = new TextEncoder();
 
@@ -40,7 +41,12 @@ export const apiKeyAuth = createMiddleware<{
     const orgPlan = await getOrgPlan(db, orgId);
     c.set("orgTier", orgPlan.tier);
     c.set("dodoCustomerId", orgPlan.dodoCustomerId);
-    return next();
+    await next();
+    recordUsage(c.executionCtx, db, orgId, "api_call", 1, {
+      method: c.req.method,
+      path: c.req.path,
+    }, c.env.DODO_PAYMENTS_API_KEY, orgPlan.dodoCustomerId);
+    return;
   }
 
   const key = c.req.header("x-api-key");
@@ -74,6 +80,12 @@ export const apiKeyAuth = createMiddleware<{
   c.set("dodoCustomerId", orgPlan.dodoCustomerId);
 
   await next();
+
+  // Record api_call usage for every authenticated request
+  recordUsage(c.executionCtx, db, row.org_id, "api_call", 1, {
+    method: c.req.method,
+    path: c.req.path,
+  }, c.env.DODO_PAYMENTS_API_KEY, orgPlan.dodoCustomerId);
 });
 
 /**
