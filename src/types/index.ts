@@ -6,6 +6,8 @@ export interface Env {
   ENVIRONMENT?: string;
   REPOS_BUCKET: R2Bucket;
   DODO_PAYMENTS_API_KEY: string;
+  CF_ZONE_ID?: string;
+  CF_API_TOKEN?: string;
 }
 
 export interface Variables {
@@ -15,4 +17,5 @@ export interface Variables {
   apiKeyId: string;
   orgTier: "free" | "usage";
   dodoCustomerId: string | null;
+  customDomain: string | null;
 }

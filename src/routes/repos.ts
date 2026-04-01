@@ -141,7 +141,9 @@ repos.post("/", apiKeyAuth, async (c) => {
         description: newRepo.description,
         default_branch: newRepo.defaultBranch,
         visibility: newRepo.visibility,
-        git_url: `https://api.coregit.dev/${orgSlug}/${slug}.git`,
+        git_url: c.get("customDomain")
+          ? `https://${c.get("customDomain")}/${slug}.git`
+          : `https://api.coregit.dev/${orgSlug}/${slug}.git`,
         api_url: `https://api.coregit.dev/v1/repos/${slug}`,
         created_at: newRepo.createdAt,
       },
@@ -241,7 +243,9 @@ repos.get("/:slug", apiKeyAuth, async (c) => {
       default_branch: found.defaultBranch,
       visibility: found.visibility,
       is_empty: isEmpty,
-      git_url: `https://api.coregit.dev/${orgSlug}/${slug}.git`,
+      git_url: c.get("customDomain")
+          ? `https://${c.get("customDomain")}/${slug}.git`
+          : `https://api.coregit.dev/${orgSlug}/${slug}.git`,
       api_url: `https://api.coregit.dev/v1/repos/${slug}`,
       created_at: found.createdAt,
       updated_at: found.updatedAt,

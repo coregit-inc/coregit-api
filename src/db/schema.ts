@@ -103,3 +103,22 @@ export const webhook = pgTable(
 
 export type Webhook = typeof webhook.$inferSelect;
 export type NewWebhook = typeof webhook.$inferInsert;
+
+// ── Custom Domain ──
+
+export const customDomain = pgTable(
+  "custom_domain",
+  {
+    id: text("id").primaryKey(),
+    orgId: text("org_id").notNull(),
+    domain: text("domain").notNull().unique(),
+    cfHostnameId: text("cf_hostname_id"),
+    status: text("status").notNull().default("pending"),
+    sslStatus: text("ssl_status").default("pending"),
+    createdAt: timestamp("created_at").defaultNow().notNull(),
+    updatedAt: timestamp("updated_at").defaultNow().notNull(),
+  },
+  (table) => [
+    index("custom_domain_org_idx").on(table.orgId),
+  ]
+);

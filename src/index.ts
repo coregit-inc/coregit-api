@@ -11,6 +11,7 @@
  *   /v1/repos/:slug/snapshots    — Named restore points
  *   /v1/usage                    — Usage tracking
  *   /:org/:repo.git/*            — Git Smart HTTP (clone/push/pull)
+ *   /:repo.git/*                 — Git Smart HTTP via custom domain
  *
  * Auth: API key only (hash lookup in Neon DB).
  * Better Auth lives in coregit-app (Next.js), not here.
@@ -19,7 +20,9 @@
 import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { bodyLimit } from "hono/body-limit";
+import { sql } from "drizzle-orm";
 import { createDb } from "./db";
+import { getOrgPlan } from "./services/limits";
 import { repos } from "./routes/repos";
 import { branches } from "./routes/branches";
 import { commits } from "./routes/commits";
@@ -29,6 +32,7 @@ import { snapshots } from "./routes/snapshots";
 import { usage } from "./routes/usage";
 import { publicRoutes } from "./routes/public";
 import { git } from "./routes/git";
+import { customDomainGit } from "./routes/custom-domain-git";
 import type { Env, Variables } from "./types";
 
 const app = new Hono<{ Bindings: Env; Variables: Variables }>();
@@ -44,6 +48,65 @@ app.use("*", async (c, next) => {
   c.header("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
 });
 
+// ── Custom domain resolution (must run before CORS and routes) ──
+
+const DOMAIN_CACHE = new Map<string, { orgId: string; ts: number }>();
+const DOMAIN_CACHE_TTL = 60_000;
+
+app.use("*", async (c, next) => {
+  const host = (c.req.header("host") || "").split(":")[0];
+
+  if (
+    host === "api.coregit.dev" ||
+    host === "custom.coregit.dev" ||
+    host.startsWith("localhost") ||
+    host.startsWith("127.0.0.1")
+  ) {
+    c.set("customDomain", null);
+    return next();
+  }
+
+  // Custom domain request — resolve org
+  const cached = DOMAIN_CACHE.get(host);
+  if (cached && Date.now() - cached.ts < DOMAIN_CACHE_TTL) {
+    if (!c.env.DATABASE_URL) return c.text("Database not configured", 500);
+    const db = createDb(c.env.DATABASE_URL);
+    c.set("db", db);
+    c.set("orgId", cached.orgId);
+    c.set("customDomain", host);
+    const plan = await getOrgPlan(db, cached.orgId);
+    c.set("orgTier", plan.tier);
+    c.set("dodoCustomerId", plan.dodoCustomerId);
+    return next();
+  }
+
+  if (!c.env.DATABASE_URL) return c.text("Database not configured", 500);
+  const db = createDb(c.env.DATABASE_URL);
+  c.set("db", db);
+
+  const result = await db.execute(
+    sql`SELECT org_id, status FROM custom_domain WHERE domain = ${host} LIMIT 1`
+  );
+  const row = result.rows[0] as { org_id: string; status: string } | undefined;
+
+  if (!row || (row.status !== "active" && row.status !== "suspended")) {
+    return c.text("Unknown domain", 421);
+  }
+
+  DOMAIN_CACHE.set(host, { orgId: row.org_id, ts: Date.now() });
+  if (DOMAIN_CACHE.size > 200) {
+    const oldest = DOMAIN_CACHE.keys().next().value;
+    if (oldest) DOMAIN_CACHE.delete(oldest);
+  }
+
+  c.set("orgId", row.org_id);
+  c.set("customDomain", host);
+  const plan = await getOrgPlan(db, row.org_id);
+  c.set("orgTier", plan.tier);
+  c.set("dodoCustomerId", plan.dodoCustomerId);
+  await next();
+});
+
 // ── CORS ──
 
 app.use(
@@ -55,6 +118,11 @@ app.use(
         origin === allowed ||
         origin === "https://app.coregit.dev"
       ) {
+        return origin;
+      }
+      // Allow custom domain self-origin
+      const host = (c.req.header("host") || "").split(":")[0];
+      if (origin === `https://${host}` && host !== "api.coregit.dev") {
         return origin;
       }
       // Only allow localhost in non-production
@@ -80,17 +148,24 @@ app.use("/v1/*", bodyLimit({ maxSize: 5 * 1024 * 1024 }));
 
 // ── Health ──
 
-app.get("/", (c) =>
-  c.json({ name: "coregit-api", version: "0.1.0", status: "ok" })
-);
+app.get("/", (c) => {
+  if (c.get("customDomain")) {
+    // On custom domain, / is not health — fall through to git routes
+    return c.notFound();
+  }
+  return c.json({ name: "coregit-api", version: "0.1.0", status: "ok" });
+});
 
 app.get("/health", (c) => c.json({ status: "ok" }));
 
 // ── DB middleware for API routes ──
 
 app.use("/v1/*", async (c, next) => {
-  if (!c.env.DATABASE_URL) return c.json({ error: "Database not configured" }, 500);
-  c.set("db", createDb(c.env.DATABASE_URL));
+  // DB may already be set by custom domain middleware
+  if (!c.get("db")) {
+    if (!c.env.DATABASE_URL) return c.json({ error: "Database not configured" }, 500);
+    c.set("db", createDb(c.env.DATABASE_URL));
+  }
   await next();
 });
 
@@ -104,10 +179,16 @@ app.use("/:org/:repo/*", async (c, next) => {
   if (!repoParam?.endsWith(".git") && !repoParam?.includes(".git/")) {
     return next();
   }
-  if (!c.env.DATABASE_URL) return c.text("Database not configured", 500);
-  c.set("db", createDb(c.env.DATABASE_URL));
+  if (!c.get("db")) {
+    if (!c.env.DATABASE_URL) return c.text("Database not configured", 500);
+    c.set("db", createDb(c.env.DATABASE_URL));
+  }
   await next();
 });
+
+// ── Custom domain git routes (/:repo.git/* — no org prefix) ──
+
+app.route("/", customDomainGit);
 
 // ── API routes ──
 
@@ -123,7 +204,7 @@ app.route("/v1/usage", usage);
 
 app.route("/v1", publicRoutes);
 
-// ── Git Smart HTTP ──
+// ── Git Smart HTTP (standard: /:org/:repo.git/*) ──
 
 app.route("/", git);
 
