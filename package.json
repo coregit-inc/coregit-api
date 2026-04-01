@@ -17,6 +17,7 @@
     "drizzle-orm": "^0.45.1",
     "fflate": "^0.8.2",
     "hono": "^4.7.6",
+    "just-bash": "^2.14.0",
     "nanoid": "^5.1.6",
     "node-diff3": "^3.2.0",
     "pako": "^2.1.0"

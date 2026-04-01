@@ -12,6 +12,7 @@
  *   /v1/repos/:slug/cherry-pick  — Cherry-pick commits onto a new base
  *   /v1/repos/:slug/refs         — Low-level ref CRUD with CAS
  *   /v1/repos/:slug/snapshots    — Named restore points
+ *   /v1/repos/:slug/exec         — Workspace: execute shell commands against repo
  *   /v1/usage                    — Usage tracking
  *   /:org/:repo.git/*            — Git Smart HTTP (clone/push/pull)
  *   /:repo.git/*                 — Git Smart HTTP via custom domain
@@ -39,6 +40,7 @@ import { usage } from "./routes/usage";
 import { publicRoutes } from "./routes/public";
 import { git } from "./routes/git";
 import { customDomainGit } from "./routes/custom-domain-git";
+import { workspace } from "./routes/workspace";
 import type { Env, Variables } from "./types";
 
 const app = new Hono<{ Bindings: Env; Variables: Variables }>();
@@ -207,6 +209,7 @@ app.route("/v1/repos", compare);
 app.route("/v1/repos", cherryPick);
 app.route("/v1/repos", refs);
 app.route("/v1/repos", snapshots);
+app.route("/v1/repos", workspace);
 app.route("/v1/usage", usage);
 
 // ── Public read-only routes (no auth required) ──
