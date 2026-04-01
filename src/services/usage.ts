@@ -71,7 +71,7 @@ function mapToDodoEvent(eventType: UsageEventType): string | null {
       return DODO_EVENTS.gitTransfer;
     case "repo_created":
     case "repo_deleted":
-      return DODO_EVENTS.repoCount;
+      return null; // repos are free — no Dodo billing
     default:
       return null;
   }

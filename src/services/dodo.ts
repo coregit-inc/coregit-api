@@ -17,7 +17,6 @@ const DODO_INGEST_URL = "https://live.dodopayments.com/events/ingest";
 export const DODO_EVENTS = {
   apiCall: "coregit.api_call",
   gitTransfer: "coregit.git_transfer",
-  repoCount: "coregit.repo_count",
   storage: "coregit.storage",
 } as const;
 
