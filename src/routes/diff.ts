@@ -10,15 +10,18 @@ import { apiKeyAuth } from "../auth/middleware";
 import { repo } from "../db/schema";
 import { GitR2Storage } from "../git/storage";
 import { parseGitObject, parseCommit } from "../git/objects";
-import { flattenTree, diffFlattenedTrees, computeDiffStats } from "../git/cherry-pick";
+import { flattenTree, diffFlattenedTrees, computeDiffStatsFromDiffs } from "../git/cherry-pick";
 import type { Env, Variables } from "../types";
 
 const diff = new Hono<{ Bindings: Env; Variables: Variables }>();
 
 async function resolveRef(storage: GitR2Storage, ref: string): Promise<string | null> {
-  const branchSha = await storage.getRef(`refs/heads/${ref}`);
+  // Parallel branch + tag lookup
+  const [branchSha, tagSha] = await Promise.all([
+    storage.getRef(`refs/heads/${ref}`),
+    storage.getRef(`refs/tags/${ref}`),
+  ]);
   if (branchSha) return branchSha;
-  const tagSha = await storage.getRef(`refs/tags/${ref}`);
   if (tagSha) return tagSha;
   if (/^[0-9a-f]{40}$/i.test(ref)) return ref;
   return null;
@@ -75,7 +78,7 @@ diff.get("/:slug/diff", apiKeyAuth, async (c) => {
     ]);
 
     const diffs = diffFlattenedTrees(baseFlat, headFlat);
-    const stats = await computeDiffStats(storage, baseTreeSha, headTreeSha);
+    const stats = await computeDiffStatsFromDiffs(storage, diffs);
 
     const fileList = diffs.map((d) => ({
       path: d.path,

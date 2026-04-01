@@ -114,6 +114,8 @@ async function buildTreeFromFlat(
     node.entries.set(filename, { mode: entry.mode, name: filename, sha: entry.sha });
   }
 
+  const pendingTrees: { sha: string; type: "tree"; data: Uint8Array }[] = [];
+
   async function buildNode(node: DirNode): Promise<string> {
     const subdirEntries = await Promise.all(
       [...node.subdirs.entries()].map(async ([name, subdir]) => {
@@ -125,11 +127,13 @@ async function buildTreeFromFlat(
     const treeEntries: TreeEntry[] = [...subdirEntries, ...[...node.entries.values()]];
     const treeContent = createTree(treeEntries);
     const treeSha = await hashGitObject("tree", treeContent);
-    await storage.putObject(treeSha, "tree", treeContent);
+    pendingTrees.push({ sha: treeSha, type: "tree", data: treeContent });
     return treeSha;
   }
 
-  return buildNode(root);
+  const rootSha = await buildNode(root);
+  await storage.putObjectBatch(pendingTrees);
+  return rootSha;
 }
 
 const encoder = new TextEncoder();
@@ -188,7 +192,9 @@ export async function createApiCommit(
     currentTree = await flattenTreeFromCommit(storage, effectiveParent);
   }
 
-  // 3. Apply changes
+  // 3. Apply changes — collect blobs first, then batch-write to R2
+  const pendingBlobs: { sha: string; type: "blob"; data: Uint8Array }[] = [];
+
   for (const change of changes) {
     if (change.action === "delete") {
       currentTree.delete(change.path);
@@ -201,9 +207,14 @@ export async function createApiCommit(
           ? base64ToBytes(change.content, change.path)
           : encoder.encode(change.content);
       const blobSha = await hashGitObject("blob", content);
-      await storage.putObject(blobSha, "blob", content);
+      pendingBlobs.push({ sha: blobSha, type: "blob", data: content });
       currentTree.set(change.path, { sha: blobSha, mode: "100644" });
     }
+  }
+
+  // Batch-write all blobs in parallel
+  if (pendingBlobs.length > 0) {
+    await storage.putObjectBatch(pendingBlobs);
   }
 
   // 4. Build nested tree objects

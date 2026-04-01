@@ -19,7 +19,7 @@ import { eq, and } from "drizzle-orm";
 import { repo, organization } from "../db/schema";
 import { GitR2Storage } from "../git/storage";
 import { parseGitObject, parseCommit, parseTree } from "../git/objects";
-import { flattenTree, diffFlattenedTrees, computeDiffStats } from "../git/cherry-pick";
+import { flattenTree, diffFlattenedTrees, computeDiffStatsFromDiffs } from "../git/cherry-pick";
 import { resolveRef, getTreeFromCommit, navigateToPath, isBinaryContent } from "./files";
 import { parseAuthorString } from "./commits";
 import type { Env, Variables } from "../types";
@@ -431,7 +431,7 @@ publicRoutes.get("/orgs/:orgSlug/repos/:slug/diff", async (c) => {
     ]);
 
     const diffs = diffFlattenedTrees(baseFlat, headFlat);
-    const stats = await computeDiffStats(storage, baseTreeSha, headTreeSha);
+    const stats = await computeDiffStatsFromDiffs(storage, diffs);
 
     const fileList = diffs.map((d) => ({
       path: d.path,

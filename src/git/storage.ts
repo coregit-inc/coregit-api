@@ -15,7 +15,7 @@
  */
 
 import { createGitObjectRaw, type GitObjectType } from "./objects";
-import { zlibSync } from "fflate";
+import { zlibSync, unzlibSync } from "fflate";
 import { isValidSha } from "./validation";
 
 const encoder = new TextEncoder();
@@ -53,30 +53,10 @@ export class GitR2Storage {
 
     const compressed = new Uint8Array(await obj.arrayBuffer());
 
-    // Decompress using DecompressionStream (zlib/deflate)
+    // Decompress using sync unzlibSync (matches putObject's sync zlibSync)
     let result: Uint8Array;
     try {
-      const ds = new DecompressionStream("deflate");
-      const writer = ds.writable.getWriter();
-      const reader = ds.readable.getReader();
-
-      writer.write(compressed);
-      writer.close();
-
-      const chunks: Uint8Array[] = [];
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        chunks.push(value);
-      }
-
-      const totalLength = chunks.reduce((acc, c) => acc + c.length, 0);
-      result = new Uint8Array(totalLength);
-      let offset = 0;
-      for (const chunk of chunks) {
-        result.set(chunk, offset);
-        offset += chunk.length;
-      }
+      result = unzlibSync(compressed);
     } catch {
       // If decompression fails, return raw (might be uncompressed)
       result = compressed;
@@ -104,6 +84,9 @@ export class GitR2Storage {
    * Compresses the object data before storing
    */
   async putObject(sha: string, type: GitObjectType, content: Uint8Array): Promise<void> {
+    // Skip R2 write if already in memory cache (content-addressed = idempotent)
+    if (this._objectCache.has(sha)) return;
+
     const key = this.objectKey(sha);
 
     // Create full git object (header + content)
@@ -153,6 +136,29 @@ export class GitR2Storage {
         batch.map((obj) => this.putObject(obj.sha, obj.type, obj.data))
       );
     }
+  }
+
+  /**
+   * Fetch multiple objects in parallel batches
+   */
+  async getObjectBatch(
+    shas: string[],
+    batchSize = 20
+  ): Promise<Map<string, Uint8Array>> {
+    const results = new Map<string, Uint8Array>();
+    for (let i = 0; i < shas.length; i += batchSize) {
+      const batch = shas.slice(i, i + batchSize);
+      const entries = await Promise.all(
+        batch.map(async (sha) => {
+          const data = await this.getObject(sha);
+          return [sha, data] as const;
+        })
+      );
+      for (const [sha, data] of entries) {
+        if (data) results.set(sha, data);
+      }
+    }
+    return results;
   }
 
   /**

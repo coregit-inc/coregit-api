@@ -170,8 +170,16 @@ export async function walkFirstParentChain(
 export async function flattenTree(
   storage: GitR2Storage,
   treeSha: string,
-  prefix: string = ""
+  prefix: string = "",
+  treeCache?: Map<string, FlatTree>
 ): Promise<FlatTree> {
+  // Check cross-call cache for this exact subtree
+  const cacheKey = `${treeSha}:${prefix}`;
+  if (treeCache) {
+    const cached = treeCache.get(cacheKey);
+    if (cached) return cached;
+  }
+
   const entries = await getTreeEntries(storage, treeSha);
   const result: FlatTree = new Map();
 
@@ -189,7 +197,7 @@ export async function flattenTree(
     const subtrees = await Promise.all(
       dirEntries.map(entry => {
         const fullPath = prefix ? `${prefix}/${entry.name}` : entry.name;
-        return flattenTree(storage, entry.sha, fullPath);
+        return flattenTree(storage, entry.sha, fullPath, treeCache);
       })
     );
     for (const subtree of subtrees) {
@@ -197,6 +205,11 @@ export async function flattenTree(
         result.set(path, val);
       }
     }
+  }
+
+  // Store in cache for reuse
+  if (treeCache) {
+    treeCache.set(cacheKey, result);
   }
 
   return result;
@@ -252,12 +265,13 @@ export async function applyDiffsToTree(
   storage: GitR2Storage,
   baseTreeSha: string,
   diffs: FileDiff[],
-  originalBaseTreeSha: string
+  originalBaseTreeSha: string,
+  treeCache?: Map<string, FlatTree>
 ): Promise<{ treeSha: string | null; conflicts: string[] }> {
-  // Fetch both trees in parallel
+  // Fetch both trees in parallel (with shared cache)
   const [baseFlat, originalBaseFlat] = await Promise.all([
-    flattenTree(storage, baseTreeSha),
-    flattenTree(storage, originalBaseTreeSha),
+    flattenTree(storage, baseTreeSha, "", treeCache),
+    flattenTree(storage, originalBaseTreeSha, "", treeCache),
   ]);
   const conflicts: string[] = [];
 
@@ -388,8 +402,9 @@ export async function buildTreeFromFlat(
     node.entries.set(filename, { mode: entry.mode, name: filename, sha: entry.sha });
   }
 
-  // Track SHAs written this call to avoid redundant puts (idempotent but wasteful)
-  const writtenShas = new Set<string>();
+  // Collect all tree objects, then batch-write at the end
+  const pendingTrees: { sha: string; type: "tree"; data: Uint8Array }[] = [];
+  const seenShas = new Set<string>();
 
   // Build trees bottom-up, all siblings in parallel
   async function buildNode(node: DirNode): Promise<string> {
@@ -409,16 +424,17 @@ export async function buildTreeFromFlat(
     const treeContent = createTree(treeEntries);
     const treeSha = await hashGitObject("tree", treeContent);
 
-    // Write only if not already written this operation (avoids hasObject round-trip)
-    if (!writtenShas.has(treeSha)) {
-      writtenShas.add(treeSha);
-      await storage.putObject(treeSha, "tree", treeContent);
+    if (!seenShas.has(treeSha)) {
+      seenShas.add(treeSha);
+      pendingTrees.push({ sha: treeSha, type: "tree", data: treeContent });
     }
 
     return treeSha;
   }
 
-  return buildNode(root);
+  const rootSha = await buildNode(root);
+  await storage.putObjectBatch(pendingTrees);
+  return rootSha;
 }
 
 /**
@@ -437,6 +453,9 @@ export async function cherryPickCommits(
   let currentBaseSha = ontoBaseSha;
   let currentBaseCommit = await getCommitObj(storage, ontoBaseSha);
   let lastCleanSha = ontoBaseSha;
+
+  // Shared tree cache across all iterations — overlapping subtrees are fetched once
+  const treeCache = new Map<string, FlatTree>();
 
   // Track parent tree from previous iteration to avoid redundant getCommitObj calls.
   // commits[] is in chronological order (oldest first), so commits[i].commit.parents[0]
@@ -465,10 +484,10 @@ export async function cherryPickCommits(
     prevOriginalTree = originalCommit.tree;
 
     // Compute diff of this commit — both trees fetched in parallel by flattenTree
-    // (and both benefit from object cache on shared subtrees)
+    // (shared treeCache avoids re-flattening overlapping subtrees across iterations)
     const [originalParentFlat, originalFlat] = await Promise.all([
-      flattenTree(storage, originalParentTreeSha),
-      flattenTree(storage, originalCommit.tree),
+      flattenTree(storage, originalParentTreeSha, "", treeCache),
+      flattenTree(storage, originalCommit.tree, "", treeCache),
     ]);
     const diffs = diffFlattenedTrees(originalParentFlat, originalFlat);
 
@@ -482,7 +501,8 @@ export async function cherryPickCommits(
       storage,
       currentBaseCommit.tree,
       diffs,
-      originalParentTreeSha
+      originalParentTreeSha,
+      treeCache
     );
 
     if (conflicts.length > 0) {
@@ -602,6 +622,60 @@ export async function computeDiffStats(
   const diffs = diffFlattenedTrees(baseFlat, headFlat);
 
   // Read all blobs in parallel
+  const results = await Promise.all(
+    diffs.map(async (diff) => {
+      let add = 0;
+      let del = 0;
+      switch (diff.type) {
+        case "add": {
+          const content = await getBlobContent(storage, diff.newSha!);
+          if (content) add = countLines(content);
+          break;
+        }
+        case "delete": {
+          const content = await getBlobContent(storage, diff.oldSha!);
+          if (content) del = countLines(content);
+          break;
+        }
+        case "modify": {
+          const [oldContent, newContent] = await Promise.all([
+            getBlobContent(storage, diff.oldSha!),
+            getBlobContent(storage, diff.newSha!),
+          ]);
+          if (oldContent && newContent) {
+            const oldLines = oldContent.split("\n");
+            const newLines = newContent.split("\n");
+            const maxLen = Math.max(oldLines.length, newLines.length);
+            for (let i = 0; i < maxLen; i++) {
+              const ol = oldLines[i];
+              const nl = newLines[i];
+              if (ol !== nl) {
+                if (ol !== undefined) del++;
+                if (nl !== undefined) add++;
+              }
+            }
+          }
+          break;
+        }
+      }
+      return { add, del };
+    })
+  );
+
+  const additions = results.reduce((s, r) => s + r.add, 0);
+  const deletions = results.reduce((s, r) => s + r.del, 0);
+
+  return { filesChanged: diffs.length, additions, deletions };
+}
+
+/**
+ * Compute diff stats from pre-computed diffs — avoids redundant tree flattening.
+ * Use this when you already have FileDiff[] from diffFlattenedTrees().
+ */
+export async function computeDiffStatsFromDiffs(
+  storage: GitR2Storage,
+  diffs: FileDiff[]
+): Promise<DiffStats> {
   const results = await Promise.all(
     diffs.map(async (diff) => {
       let add = 0;

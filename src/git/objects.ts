@@ -33,15 +33,23 @@ export interface Commit {
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 
+/** Pre-computed hex lookup table — avoids per-byte toString(16) + padStart */
+const HEX: string[] = Array.from({ length: 256 }, (_, i) =>
+  i.toString(16).padStart(2, "0")
+);
+
+export function bytesToHex(bytes: Uint8Array): string {
+  let hex = "";
+  for (let i = 0; i < bytes.length; i++) hex += HEX[bytes[i]];
+  return hex;
+}
+
 /**
  * Compute SHA-1 hash of data
  */
 export async function sha1(data: Uint8Array): Promise<string> {
   const hashBuffer = await crypto.subtle.digest("SHA-1", data);
-  const hashArray = new Uint8Array(hashBuffer);
-  return Array.from(hashArray)
-    .map((b) => b.toString(16).padStart(2, "0"))
-    .join("");
+  return bytesToHex(new Uint8Array(hashBuffer));
 }
 
 /**
@@ -102,7 +110,7 @@ export function parseGitObject(raw: Uint8Array): GitObject & { rawContent: Uint8
     throw new Error("Invalid git object: no null byte found");
   }
 
-  const header = decoder.decode(raw.slice(0, nullIndex));
+  const header = decoder.decode(raw.subarray(0, nullIndex));
   const [type, sizeStr] = header.split(" ");
 
   if (!type || !sizeStr) {
@@ -110,7 +118,7 @@ export function parseGitObject(raw: Uint8Array): GitObject & { rawContent: Uint8
   }
 
   const size = parseInt(sizeStr, 10);
-  const content = raw.slice(nullIndex + 1);
+  const content = raw.subarray(nullIndex + 1);
 
   if (content.length !== size) {
     throw new Error(`Git object size mismatch: expected ${size}, got ${content.length}`);
@@ -139,7 +147,7 @@ export function parseTree(content: Uint8Array): TreeEntry[] {
       spaceIndex++;
     }
 
-    const mode = decoder.decode(content.slice(offset, spaceIndex));
+    const mode = decoder.decode(content.subarray(offset, spaceIndex));
 
     // Find null byte separating name from SHA
     let nullIndex = spaceIndex + 1;
@@ -147,13 +155,10 @@ export function parseTree(content: Uint8Array): TreeEntry[] {
       nullIndex++;
     }
 
-    const name = decoder.decode(content.slice(spaceIndex + 1, nullIndex));
+    const name = decoder.decode(content.subarray(spaceIndex + 1, nullIndex));
 
     // SHA is 20 bytes after the null
-    const shaBytes = content.slice(nullIndex + 1, nullIndex + 21);
-    const sha = Array.from(shaBytes)
-      .map((b) => b.toString(16).padStart(2, "0"))
-      .join("");
+    const sha = bytesToHex(content.subarray(nullIndex + 1, nullIndex + 21));
 
     entries.push({ mode, name, sha });
     offset = nullIndex + 21;
@@ -271,7 +276,5 @@ export function shaToBytes(sha: string): Uint8Array {
  * Convert 20-byte binary to SHA string
  */
 export function bytesToSha(bytes: Uint8Array): string {
-  return Array.from(bytes)
-    .map((b) => b.toString(16).padStart(2, "0"))
-    .join("");
+  return bytesToHex(bytes);
 }

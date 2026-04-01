@@ -20,9 +20,12 @@ const files = new Hono<{ Bindings: Env; Variables: Variables }>();
 
 export async function resolveRef(storage: GitR2Storage, ref: string): Promise<string | null> {
   if (ref === "HEAD") return storage.resolveHead();
-  const branchSha = await storage.getRef(`refs/heads/${ref}`);
+  // Parallel branch + tag lookup (2 R2 reads → 1 round-trip)
+  const [branchSha, tagSha] = await Promise.all([
+    storage.getRef(`refs/heads/${ref}`),
+    storage.getRef(`refs/tags/${ref}`),
+  ]);
   if (branchSha) return branchSha;
-  const tagSha = await storage.getRef(`refs/tags/${ref}`);
   if (tagSha) return tagSha;
   if (/^[0-9a-f]{40}$/i.test(ref)) {
     const exists = await storage.hasObject(ref);
