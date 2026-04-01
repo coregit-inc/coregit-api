@@ -258,3 +258,12 @@ export async function createApiCommit(
     parentSha: effectiveParent || "",
   };
 }
+
+export async function snapshotBranchTree(
+  storage: GitR2Storage,
+  branch: string
+): Promise<Map<string, { sha: string; mode: string }>> {
+  const head = await storage.getRef(`refs/heads/${branch}`);
+  if (!head) return new Map();
+  return flattenTreeFromCommit(storage, head);
+}

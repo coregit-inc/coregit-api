@@ -27,12 +27,27 @@ export const apiKeyAuth = createMiddleware<{
   Bindings: Env;
   Variables: Variables;
 }>(async (c, next) => {
+  const db = c.get("db");
+  const internalToken = c.req.header("x-internal-token");
+  if (internalToken && c.env.INTERNAL_SYNC_TOKEN && internalToken === c.env.INTERNAL_SYNC_TOKEN) {
+    const orgId = c.req.header("x-org-id");
+    if (!orgId) {
+      return c.json({ error: "Missing x-org-id header" }, 400);
+    }
+    c.set("orgId", orgId);
+    c.set("apiKeyPermissions", null);
+    c.set("apiKeyId", "internal");
+    const orgPlan = await getOrgPlan(db, orgId);
+    c.set("orgTier", orgPlan.tier);
+    c.set("dodoCustomerId", orgPlan.dodoCustomerId);
+    return next();
+  }
+
   const key = c.req.header("x-api-key");
   if (!key) {
     return c.json({ error: "Missing API key. Set x-api-key header." }, 401);
   }
 
-  const db = c.get("db");
   const keyHash = await sha256(key);
 
   const result = await db.execute(
@@ -95,3 +110,5 @@ export async function verifyApiKeyForGit(
 
   return { orgId: row.org_id };
 }
+
+

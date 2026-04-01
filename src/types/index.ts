@@ -8,6 +8,8 @@ export interface Env {
   DODO_PAYMENTS_API_KEY: string;
   CF_ZONE_ID?: string;
   CF_API_TOKEN?: string;
+  SYNC_ENCRYPTION_KEY: string;
+  INTERNAL_SYNC_TOKEN?: string;
 }
 
 export interface Variables {
@@ -19,3 +21,4 @@ export interface Variables {
   dodoCustomerId: string | null;
   customDomain: string | null;
 }
+

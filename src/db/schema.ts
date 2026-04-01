@@ -122,3 +122,89 @@ export const customDomain = pgTable(
     index("custom_domain_org_idx").on(table.orgId),
   ]
 );
+
+// External provider connections (GitHub/GitLab)
+export const externalConnection = pgTable(
+  "external_connection",
+  {
+    id: text("id").primaryKey(),
+    orgId: text("org_id").notNull(),
+    provider: text("provider").notNull(),
+    label: text("label").notNull(),
+    externalUsername: text("external_username"),
+    encryptedAccessToken: text("encrypted_access_token").notNull(),
+    encryptedRefreshToken: text("encrypted_refresh_token"),
+    metadata: jsonb("metadata"),
+    lastSyncedAt: timestamp("last_synced_at"),
+    createdAt: timestamp("created_at").defaultNow().notNull(),
+    updatedAt: timestamp("updated_at")
+      .defaultNow()
+      .$onUpdate(() => new Date())
+      .notNull(),
+  },
+  (table) => [
+    index("external_connection_org_idx").on(table.orgId),
+    index("external_connection_provider_idx").on(table.provider, table.orgId),
+  ]
+);
+
+export type ExternalConnection = typeof externalConnection.$inferSelect;
+export type NewExternalConnection = typeof externalConnection.$inferInsert;
+
+// Repository sync configuration
+export const repoSync = pgTable(
+  "repo_sync",
+  {
+    id: text("id").primaryKey(),
+    orgId: text("org_id").notNull(),
+    repoId: text("repo_id")
+      .notNull()
+      .references(() => repo.id, { onDelete: "cascade" }),
+    connectionId: text("connection_id")
+      .notNull()
+      .references(() => externalConnection.id, { onDelete: "cascade" }),
+    provider: text("provider").notNull(),
+    remote: text("remote").notNull(),
+    defaultBranch: text("default_branch").notNull().default("main"),
+    direction: text("direction").notNull().default("import"),
+    autoSync: boolean("auto_sync").default(false),
+    lastSyncedSha: text("last_synced_sha"),
+    lastSyncedAt: timestamp("last_synced_at"),
+    lastError: text("last_error"),
+    createdAt: timestamp("created_at").defaultNow().notNull(),
+    updatedAt: timestamp("updated_at")
+      .defaultNow()
+      .$onUpdate(() => new Date())
+      .notNull(),
+  },
+  (table) => [
+    index("repo_sync_org_idx").on(table.orgId),
+    uniqueIndex("repo_sync_repo_idx").on(table.repoId),
+  ]
+);
+
+export type RepoSync = typeof repoSync.$inferSelect;
+export type NewRepoSync = typeof repoSync.$inferInsert;
+
+// Sync run history
+export const repoSyncRun = pgTable(
+  "repo_sync_run",
+  {
+    id: text("id").primaryKey(),
+    syncId: text("sync_id")
+      .notNull()
+      .references(() => repoSync.id, { onDelete: "cascade" }),
+    status: text("status").notNull(),
+    message: text("message"),
+    remoteSha: text("remote_sha"),
+    commitSha: text("commit_sha"),
+    startedAt: timestamp("started_at").defaultNow().notNull(),
+    completedAt: timestamp("completed_at"),
+  },
+  (table) => [
+    index("repo_sync_run_sync_idx").on(table.syncId),
+  ]
+);
+
+export type RepoSyncRun = typeof repoSyncRun.$inferSelect;
+export type NewRepoSyncRun = typeof repoSyncRun.$inferInsert;
