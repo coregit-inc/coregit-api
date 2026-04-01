@@ -4,10 +4,13 @@
  * Cloudflare Worker entry point.
  * Routes:
  *   /v1/repos                    — Repository CRUD
- *   /v1/repos/:slug/branches     — Branch operations
+ *   /v1/repos/:slug/branches     — Branch operations (incl. merge strategies)
  *   /v1/repos/:slug/commits      — Commit operations (including API commit creation)
  *   /v1/repos/:slug/tree|blob    — File browsing
  *   /v1/repos/:slug/diff         — Diff between refs
+ *   /v1/repos/:slug/compare      — Compare two refs (merge-base, ahead/behind, mergeable)
+ *   /v1/repos/:slug/cherry-pick  — Cherry-pick commits onto a new base
+ *   /v1/repos/:slug/refs         — Low-level ref CRUD with CAS
  *   /v1/repos/:slug/snapshots    — Named restore points
  *   /v1/usage                    — Usage tracking
  *   /:org/:repo.git/*            — Git Smart HTTP (clone/push/pull)
@@ -28,6 +31,9 @@ import { branches } from "./routes/branches";
 import { commits } from "./routes/commits";
 import { files } from "./routes/files";
 import { diff } from "./routes/diff";
+import { compare } from "./routes/compare";
+import { cherryPick } from "./routes/cherry-pick";
+import { refs } from "./routes/refs";
 import { snapshots } from "./routes/snapshots";
 import { usage } from "./routes/usage";
 import { publicRoutes } from "./routes/public";
@@ -197,6 +203,9 @@ app.route("/v1/repos", branches);
 app.route("/v1/repos", commits);
 app.route("/v1/repos", files);
 app.route("/v1/repos", diff);
+app.route("/v1/repos", compare);
+app.route("/v1/repos", cherryPick);
+app.route("/v1/repos", refs);
 app.route("/v1/repos", snapshots);
 app.route("/v1/usage", usage);
 

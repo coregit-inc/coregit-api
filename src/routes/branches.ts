@@ -13,7 +13,22 @@ import { eq, and } from "drizzle-orm";
 import { apiKeyAuth } from "../auth/middleware";
 import { repo } from "../db/schema";
 import { GitR2Storage } from "../git/storage";
-import { findMergeBase } from "../git/cherry-pick";
+import {
+  findMergeBase,
+  getCommitRange,
+  cherryPickCommits,
+  flattenTree,
+  diffFlattenedTrees,
+  applyDiffsToTree,
+  buildTreeFromFlat,
+  type FlatTree,
+} from "../git/cherry-pick";
+import {
+  parseGitObject,
+  parseCommit,
+  createCommit,
+  hashGitObject,
+} from "../git/objects";
 import { isValidRefName } from "../git/validation";
 import type { Env, Variables } from "../types";
 
@@ -164,6 +179,14 @@ branches.delete("/:slug/branches/:name", apiKeyAuth, async (c) => {
   return c.json({ deleted: true, name });
 });
 
+async function getTreeSha(storage: GitR2Storage, commitSha: string): Promise<string | null> {
+  const raw = await storage.getObject(commitSha);
+  if (!raw) return null;
+  const obj = parseGitObject(raw);
+  if (obj.type !== "commit") return null;
+  return parseCommit(obj.content).tree;
+}
+
 // POST /v1/repos/:slug/branches/:name/merge
 branches.post("/:slug/branches/:name/merge", apiKeyAuth, async (c) => {
   const orgId = c.get("orgId");
@@ -178,7 +201,13 @@ branches.post("/:slug/branches/:name/merge", apiKeyAuth, async (c) => {
     .limit(1);
   if (!found) return c.json({ error: "Repository not found" }, 404);
 
-  let body: { target?: string; strategy?: string };
+  let body: {
+    target?: string;
+    strategy?: "fast-forward" | "merge-commit" | "squash";
+    message?: string;
+    author?: { name: string; email: string };
+    expected_sha?: string;
+  };
   try {
     body = await c.req.json();
   } catch {
@@ -186,6 +215,11 @@ branches.post("/:slug/branches/:name/merge", apiKeyAuth, async (c) => {
   }
 
   const target = body.target || found.defaultBranch;
+  const strategy = body.strategy || "fast-forward";
+
+  if (!["fast-forward", "merge-commit", "squash"].includes(strategy)) {
+    return c.json({ error: "Invalid strategy. Must be: fast-forward, merge-commit, or squash" }, 400);
+  }
 
   const storage = new GitR2Storage(bucket, orgId, slug);
   const sourceSha = await storage.getRef(`refs/heads/${name}`);
@@ -195,25 +229,155 @@ branches.post("/:slug/branches/:name/merge", apiKeyAuth, async (c) => {
   if (!targetRef) return c.json({ error: `Target branch '${target}' not found` }, 404);
   const targetSha = targetRef.sha;
 
+  // Optional CAS: verify target hasn't moved
+  if (body.expected_sha && targetSha !== body.expected_sha) {
+    return c.json({
+      error: "Target branch was updated concurrently (expected_sha mismatch)",
+      current_sha: targetSha,
+    }, 409);
+  }
+
   if (sourceSha === targetSha) {
     return c.json({ merged: true, sha: targetSha, strategy: "already_up_to_date" });
   }
 
   try {
-    // Verify fast-forward: target must be ancestor of source
     const mergeBase = await findMergeBase(storage, sourceSha, targetSha);
-    if (mergeBase !== targetSha) {
-      return c.json(
-        { error: "Cannot fast-forward. Target has diverged from source." },
-        409
-      );
+
+    // ── Fast-forward ──
+    if (strategy === "fast-forward") {
+      if (mergeBase !== targetSha) {
+        return c.json(
+          { error: "Cannot fast-forward. Target has diverged from source." },
+          409
+        );
+      }
+
+      const ok = await storage.setRefConditional(`refs/heads/${target}`, sourceSha, targetRef.etag);
+      if (!ok) {
+        return c.json({ error: "Branch was updated concurrently, retry merge" }, 409);
+      }
+      return c.json({ merged: true, sha: sourceSha, strategy: "fast-forward" });
     }
 
-    const ok = await storage.setRefConditional(`refs/heads/${target}`, sourceSha, targetRef.etag);
-    if (!ok) {
-      return c.json({ error: "Branch was updated concurrently, retry merge" }, 409);
+    if (!mergeBase) {
+      return c.json({ error: "No common ancestor found between branches" }, 422);
     }
-    return c.json({ merged: true, sha: sourceSha, strategy: "fast-forward" });
+
+    const now = Math.floor(Date.now() / 1000);
+    const authorLine = body.author
+      ? `${body.author.name} <${body.author.email}> ${now} +0000`
+      : `Coregit <noreply@coregit.dev> ${now} +0000`;
+
+    // ── Merge-commit ──
+    if (strategy === "merge-commit") {
+      // Cherry-pick source commits onto target to produce the merged tree
+      const sourceCommits = await getCommitRange(storage, mergeBase, sourceSha);
+      const result = await cherryPickCommits(storage, sourceCommits, targetSha);
+
+      if (!result.success) {
+        return c.json({
+          merged: false,
+          strategy: "merge-commit",
+          conflicts: result.conflicts || [],
+        }, 409);
+      }
+
+      // Get the merged tree SHA from the cherry-picked head
+      const mergedTreeSha = await getTreeSha(storage, result.headSha!);
+      if (!mergedTreeSha) {
+        return c.json({ error: "Failed to resolve merged tree" }, 500);
+      }
+
+      // Create merge commit with two parents
+      const mergeMessage = body.message || `Merge branch '${name}' into ${target}`;
+      const mergeCommitContent = createCommit({
+        tree: mergedTreeSha,
+        parents: [targetSha, sourceSha],
+        author: authorLine,
+        committer: authorLine,
+        message: mergeMessage,
+      });
+      const mergeCommitSha = await hashGitObject("commit", mergeCommitContent);
+      await storage.putObject(mergeCommitSha, "commit", mergeCommitContent);
+
+      // Update target ref with CAS
+      const ok = await storage.setRefConditional(`refs/heads/${target}`, mergeCommitSha, targetRef.etag);
+      if (!ok) {
+        return c.json({ error: "Branch was updated concurrently, retry merge" }, 409);
+      }
+
+      return c.json({
+        merged: true,
+        sha: mergeCommitSha,
+        strategy: "merge-commit",
+        merge_sha: mergeCommitSha,
+      });
+    }
+
+    // ── Squash ──
+    if (strategy === "squash") {
+      const treeCache = new Map<string, FlatTree>();
+
+      // Get merge-base tree, source tree, and target tree
+      const [mergeBaseTreeSha, sourceTreeSha, targetTreeSha] = await Promise.all([
+        getTreeSha(storage, mergeBase),
+        getTreeSha(storage, sourceSha),
+        getTreeSha(storage, targetSha),
+      ]);
+
+      if (!mergeBaseTreeSha || !sourceTreeSha || !targetTreeSha) {
+        return c.json({ error: "Failed to resolve commit trees" }, 500);
+      }
+
+      // Diff: what changed in source since merge-base
+      const [mergeBaseFlat, sourceFlat] = await Promise.all([
+        flattenTree(storage, mergeBaseTreeSha, "", treeCache),
+        flattenTree(storage, sourceTreeSha, "", treeCache),
+      ]);
+      const diffs = diffFlattenedTrees(mergeBaseFlat, sourceFlat);
+
+      if (diffs.length === 0) {
+        return c.json({ merged: true, sha: targetSha, strategy: "already_up_to_date" });
+      }
+
+      // Apply those diffs onto the target tree (with 3-way conflict detection)
+      const { treeSha, conflicts } = await applyDiffsToTree(
+        storage, targetTreeSha, diffs, mergeBaseTreeSha, treeCache
+      );
+
+      if (conflicts.length > 0) {
+        return c.json({
+          merged: false,
+          strategy: "squash",
+          conflicts,
+        }, 409);
+      }
+
+      // Create squash commit (single parent = target)
+      const squashMessage = body.message || `Squash merge branch '${name}' into ${target}`;
+      const squashCommitContent = createCommit({
+        tree: treeSha!,
+        parents: [targetSha],
+        author: authorLine,
+        committer: authorLine,
+        message: squashMessage,
+      });
+      const squashCommitSha = await hashGitObject("commit", squashCommitContent);
+      await storage.putObject(squashCommitSha, "commit", squashCommitContent);
+
+      // Update target ref with CAS
+      const ok = await storage.setRefConditional(`refs/heads/${target}`, squashCommitSha, targetRef.etag);
+      if (!ok) {
+        return c.json({ error: "Branch was updated concurrently, retry merge" }, 409);
+      }
+
+      return c.json({
+        merged: true,
+        sha: squashCommitSha,
+        strategy: "squash",
+      });
+    }
   } catch (error) {
     console.error("Failed to merge:", error);
     return c.json({ error: "Failed to merge branch" }, 500);
