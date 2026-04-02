@@ -11,6 +11,7 @@ import { nanoid } from "nanoid";
 import { sql } from "drizzle-orm";
 import { apiKeyAuth } from "../auth/middleware";
 import { isMasterKey, validateScopes, normalizeScopes } from "../auth/scopes";
+import { recordUsage } from "../services/usage";
 import type { Env, Variables } from "../types";
 
 const tokens = new Hono<{ Bindings: Env; Variables: Variables }>();
@@ -93,6 +94,14 @@ tokens.post("/tokens", apiKeyAuth, async (c) => {
         VALUES (${tokenId}, ${orgId}, ${apiKeyId}, ${name}, ${keyPrefix}, ${keyHash}, ${JSON.stringify(scopes)}::jsonb, ${expiresAt.toISOString()}::timestamptz)`
   );
 
+  // Audit log
+  recordUsage(c.executionCtx, db, orgId, "api_call", 1, {
+    action: "token_created",
+    token_id: tokenId,
+    token_name: name,
+    created_by: apiKeyId,
+  }, c.env.DODO_PAYMENTS_API_KEY, c.get("dodoCustomerId"));
+
   return c.json({
     id: tokenId,
     token: tokenValue,  // shown ONCE
@@ -160,6 +169,13 @@ tokens.delete("/tokens/:id", apiKeyAuth, async (c) => {
   if (result.rows.length === 0) {
     return c.json({ error: "Token not found or already revoked" }, 404);
   }
+
+  // Audit log
+  recordUsage(c.executionCtx, db, orgId, "api_call", 1, {
+    action: "token_revoked",
+    token_id: tokenId,
+    revoked_by: c.get("apiKeyId"),
+  }, c.env.DODO_PAYMENTS_API_KEY, c.get("dodoCustomerId"));
 
   return c.json({ id: tokenId, revoked: true });
 });

@@ -126,7 +126,7 @@ export const scopedToken = pgTable(
   },
   (table) => [
     index("scoped_token_org_idx").on(table.orgId),
-    index("scoped_token_hash_idx").on(table.keyHash),
+    // key_hash already has a unique index from the .unique() constraint
   ]
 );
 

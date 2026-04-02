@@ -25,6 +25,17 @@ async function sha256(data: string): Promise<string> {
     .join("");
 }
 
+function timingSafeEqual(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  const aa = encoder.encode(a);
+  const bb = encoder.encode(b);
+  let result = 0;
+  for (let i = 0; i < aa.length; i++) {
+    result |= aa[i] ^ bb[i];
+  }
+  return result === 0;
+}
+
 /**
  * Verify a scoped token (cgt_*).
  * Returns org_id + scopes if valid, null otherwise.
@@ -56,18 +67,17 @@ async function verifyScopedToken(
 async function verifyMasterKey(
   db: any,
   keyValue: string
-): Promise<{ orgId: string; scopes: null; tokenId: string } | null> {
+): Promise<{ orgId: string; scopes: null; tokenId: string; keyHash: string } | null> {
   const keyHash = await sha256(keyValue);
 
   const result = await db.execute(
-    sql`SELECT org_id FROM api_key WHERE key_hash = ${keyHash} LIMIT 1`
+    sql`SELECT id, org_id FROM api_key WHERE key_hash = ${keyHash} LIMIT 1`
   );
 
-  const row = result.rows[0] as { org_id: string } | undefined;
+  const row = result.rows[0] as { id: string; org_id: string } | undefined;
   if (!row) return null;
 
-  // Touch last_used (fire-and-forget, no await needed here — caller handles waitUntil)
-  return { orgId: row.org_id, scopes: null, tokenId: "" };
+  return { orgId: row.org_id, scopes: null, tokenId: row.id, keyHash };
 }
 
 /**
@@ -82,7 +92,7 @@ export const apiKeyAuth = createMiddleware<{
 
   // ── Internal sync token ──
   const internalToken = c.req.header("x-internal-token");
-  if (internalToken && c.env.INTERNAL_SYNC_TOKEN && internalToken === c.env.INTERNAL_SYNC_TOKEN) {
+  if (internalToken && c.env.INTERNAL_SYNC_TOKEN && timingSafeEqual(internalToken, c.env.INTERNAL_SYNC_TOKEN)) {
     const orgId = c.req.header("x-org-id");
     if (!orgId) {
       return c.json({ error: "Missing x-org-id header" }, 400);
@@ -125,9 +135,10 @@ export const apiKeyAuth = createMiddleware<{
       db.execute(sql`UPDATE scoped_token SET last_used = NOW() WHERE id = ${authResult.tokenId}`).catch(() => {})
     );
   } else {
-    const keyHash = await sha256(key);
+    // Use cached keyHash from verifyMasterKey (avoids double SHA-256)
+    const cachedHash = (authResult as any).keyHash;
     c.executionCtx.waitUntil(
-      db.execute(sql`UPDATE api_key SET last_used = NOW() WHERE key_hash = ${keyHash}`).catch(() => {})
+      db.execute(sql`UPDATE api_key SET last_used = NOW() WHERE key_hash = ${cachedHash}`).catch(() => {})
     );
   }
 

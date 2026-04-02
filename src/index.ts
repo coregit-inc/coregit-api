@@ -215,8 +215,9 @@ app.use("/:org/:namespace/:repo/*", async (c, next) => {
 app.route("/", customDomainGit);
 
 // ── API routes ──
+// IMPORTANT: repos must be registered LAST among /v1/repos sub-routes.
+// Its /:namespace/:slug pattern would shadow /:slug/branches etc. if registered first.
 
-app.route("/v1/repos", repos);
 app.route("/v1/repos", branches);
 app.route("/v1/repos", commits);
 app.route("/v1/repos", files);
@@ -227,6 +228,7 @@ app.route("/v1/repos", refs);
 app.route("/v1/repos", snapshots);
 app.route("/v1/repos", workspace);
 app.route("/v1/repos", sync);
+app.route("/v1/repos", repos);
 app.route("/v1", tokens);
 app.route("/v1/usage", usage);
 

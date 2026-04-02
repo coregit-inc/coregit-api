@@ -10,7 +10,7 @@
 
 import { Hono } from "hono";
 import { nanoid } from "nanoid";
-import { eq, and } from "drizzle-orm";
+import { eq, and, or, isNull } from "drizzle-orm";
 import { apiKeyAuth } from "../auth/middleware";
 import { repo, organization } from "../db/schema";
 import { GitR2Storage } from "../git/storage";
@@ -173,27 +173,39 @@ repos.get("/", apiKeyAuth, async (c) => {
   const nsFilter = c.req.query("namespace");
 
   try {
-    let conditions = eq(repo.orgId, orgId);
+    let conditions: any = eq(repo.orgId, orgId);
     if (nsFilter) {
-      conditions = and(conditions, eq(repo.namespace, nsFilter))!;
+      conditions = and(conditions, eq(repo.namespace, nsFilter));
     }
 
-    let repoList = await db
+    // Scoped tokens: push scope filter to SQL for correct pagination
+    const accessibleKeys = getAccessibleRepoKeys(c.get("apiKeyPermissions"));
+    if (accessibleKeys !== null && accessibleKeys.length > 0) {
+      // Build SQL OR conditions for each accessible repo
+      const scopeConditions = accessibleKeys.map((key) => {
+        const slashIdx = key.indexOf("/");
+        if (slashIdx !== -1) {
+          // namespaced: "alice/my-app"
+          const ns = key.slice(0, slashIdx);
+          const slug = key.slice(slashIdx + 1);
+          return and(eq(repo.namespace, ns), eq(repo.slug, slug));
+        }
+        // non-namespaced: "my-app"
+        return and(isNull(repo.namespace), eq(repo.slug, key));
+      });
+      conditions = and(conditions, or(...scopeConditions));
+    } else if (accessibleKeys !== null) {
+      // Token has no repo access at all
+      return c.json({ repos: [], limit, offset });
+    }
+
+    const repoList = await db
       .select()
       .from(repo)
       .where(conditions)
       .orderBy(repo.updatedAt)
       .limit(limit)
       .offset(offset);
-
-    // Scoped tokens: filter to only accessible repos
-    const accessibleKeys = getAccessibleRepoKeys(c.get("apiKeyPermissions"));
-    if (accessibleKeys !== null) {
-      repoList = repoList.filter((r: any) => {
-        const scopeKey = r.namespace ? `${r.namespace}/${r.slug}` : r.slug;
-        return accessibleKeys.includes(scopeKey);
-      });
-    }
 
     return c.json({
       repos: repoList.map((r) => ({
