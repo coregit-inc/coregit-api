@@ -7,8 +7,10 @@
  */
 
 import { Hono } from "hono";
-import { eq, and } from "drizzle-orm";
 import { apiKeyAuth } from "../auth/middleware";
+import { hasRepoAccess } from "../auth/scopes";
+import { resolveRepo } from "../services/repo-resolver";
+import { extractRepoParams } from "./helpers";
 import { repo } from "../db/schema";
 import { GitR2Storage } from "../git/storage";
 import { parseGitObject, parseTree, parseCommit, type TreeEntry } from "../git/objects";
@@ -74,25 +76,22 @@ export function isBinaryContent(content: Uint8Array): boolean {
   return false;
 }
 
-async function getRepoAndStorage(c: any): Promise<{ found: any; storage: GitR2Storage } | Response> {
+// GET /v1/repos/:slug/refs
+const listRefsHandler = async (c: any) => {
   const orgId = c.get("orgId");
   const db = c.get("db");
-  const slug = c.req.param("slug");
-  const [found] = await db
-    .select()
-    .from(repo)
-    .where(and(eq(repo.orgId, orgId), eq(repo.slug, slug)))
-    .limit(1);
-  if (!found) return c.json({ error: "Repository not found" }, 404);
-  const storage = new GitR2Storage(c.env.REPOS_BUCKET, orgId, slug);
-  return { found, storage };
-}
+  const bucket = c.env.REPOS_BUCKET;
+  const { slug, namespace } = extractRepoParams(c);
 
-// GET /v1/repos/:slug/refs
-files.get("/:slug/refs", apiKeyAuth, async (c) => {
-  const result = await getRepoAndStorage(c);
-  if (result instanceof Response) return result;
-  const { found, storage } = result;
+  const resolved = await resolveRepo(db, bucket, { orgId, slug, namespace });
+  if (!resolved) return c.json({ error: "Repository not found" }, 404);
+
+  if (!hasRepoAccess(c.get("apiKeyPermissions"), resolved.scopeKey, "read")) {
+    return c.json({ error: "Insufficient permissions" }, 403);
+  }
+
+  const found = resolved.repo;
+  const storage = resolved.storage;
 
   try {
     const refs = await storage.listRefs();
@@ -115,17 +114,31 @@ files.get("/:slug/refs", apiKeyAuth, async (c) => {
     console.error("Failed to list refs:", error);
     return c.json({ error: "Failed to list refs" }, 500);
   }
-});
+};
+files.get("/:slug/refs", apiKeyAuth, listRefsHandler);
+files.get("/:namespace/:slug/refs", apiKeyAuth, listRefsHandler);
 
 // GET /v1/repos/:slug/tree/*
-files.get("/:slug/tree/*", apiKeyAuth, async (c) => {
-  const result = await getRepoAndStorage(c);
-  if (result instanceof Response) return result;
-  const { found, storage } = result;
-  const slug = c.req.param("slug");
+const treeHandler = async (c: any) => {
+  const orgId = c.get("orgId");
+  const db = c.get("db");
+  const bucket = c.env.REPOS_BUCKET;
+  const { slug, namespace } = extractRepoParams(c);
+
+  const resolved = await resolveRepo(db, bucket, { orgId, slug, namespace });
+  if (!resolved) return c.json({ error: "Repository not found" }, 404);
+
+  if (!hasRepoAccess(c.get("apiKeyPermissions"), resolved.scopeKey, "read")) {
+    return c.json({ error: "Insufficient permissions" }, 403);
+  }
+
+  const found = resolved.repo;
+  const storage = resolved.storage;
 
   const url = new URL(c.req.url);
-  const treePrefix = `/v1/repos/${slug}/tree/`;
+  // Build the prefix dynamically based on namespace
+  const repoPath = namespace ? `${namespace}/${slug}` : slug;
+  const treePrefix = `/v1/repos/${repoPath}/tree/`;
   const refAndPath = decodeURIComponent(url.pathname.slice(url.pathname.indexOf(treePrefix) + treePrefix.length));
 
   const parts = refAndPath.split("/");
@@ -161,17 +174,31 @@ files.get("/:slug/tree/*", apiKeyAuth, async (c) => {
     console.error("Failed to fetch tree:", error);
     return c.json({ error: "Failed to fetch tree" }, 500);
   }
-});
+};
+files.get("/:slug/tree/*", apiKeyAuth, treeHandler);
+files.get("/:namespace/:slug/tree/*", apiKeyAuth, treeHandler);
 
 // GET /v1/repos/:slug/blob/*
-files.get("/:slug/blob/*", apiKeyAuth, async (c) => {
-  const result = await getRepoAndStorage(c);
-  if (result instanceof Response) return result;
-  const { found, storage } = result;
-  const slug = c.req.param("slug");
+const blobHandler = async (c: any) => {
+  const orgId = c.get("orgId");
+  const db = c.get("db");
+  const bucket = c.env.REPOS_BUCKET;
+  const { slug, namespace } = extractRepoParams(c);
+
+  const resolved = await resolveRepo(db, bucket, { orgId, slug, namespace });
+  if (!resolved) return c.json({ error: "Repository not found" }, 404);
+
+  if (!hasRepoAccess(c.get("apiKeyPermissions"), resolved.scopeKey, "read")) {
+    return c.json({ error: "Insufficient permissions" }, 403);
+  }
+
+  const found = resolved.repo;
+  const storage = resolved.storage;
 
   const url = new URL(c.req.url);
-  const blobPrefix = `/v1/repos/${slug}/blob/`;
+  // Build the prefix dynamically based on namespace
+  const repoPath = namespace ? `${namespace}/${slug}` : slug;
+  const blobPrefix = `/v1/repos/${repoPath}/blob/`;
   const refAndPath = decodeURIComponent(url.pathname.slice(url.pathname.indexOf(blobPrefix) + blobPrefix.length));
 
   const parts = refAndPath.split("/");
@@ -257,6 +284,8 @@ files.get("/:slug/blob/*", apiKeyAuth, async (c) => {
     console.error("Failed to fetch blob:", error);
     return c.json({ error: "Failed to fetch blob" }, 500);
   }
-});
+};
+files.get("/:slug/blob/*", apiKeyAuth, blobHandler);
+files.get("/:namespace/:slug/blob/*", apiKeyAuth, blobHandler);
 
 export { files };

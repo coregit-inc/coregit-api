@@ -1,8 +1,11 @@
 /**
- * API Key authentication middleware.
+ * Authentication middleware.
  *
- * Simple SHA-256 hash lookup against api_key table in Neon.
- * No Better Auth — just raw SQL.
+ * Supports two credential types:
+ *   1. Master API keys (cgk_live_*) — full org access, stored in api_key table
+ *   2. Scoped tokens (cgt_*) — repo-scoped, time-limited, stored in scoped_token table
+ *
+ * Both use SHA-256 hash lookup. Prefix-based routing avoids double queries.
  */
 
 import { createMiddleware } from "hono/factory";
@@ -10,8 +13,10 @@ import { sql } from "drizzle-orm";
 import type { Env, Variables } from "../types";
 import { getOrgPlan } from "../services/limits";
 import { recordUsage } from "../services/usage";
+import type { Scopes } from "./scopes";
 
 const encoder = new TextEncoder();
+const SCOPED_TOKEN_PREFIX = "cgt_";
 
 async function sha256(data: string): Promise<string> {
   const hashBuffer = await crypto.subtle.digest("SHA-256", encoder.encode(data));
@@ -21,14 +26,61 @@ async function sha256(data: string): Promise<string> {
 }
 
 /**
+ * Verify a scoped token (cgt_*).
+ * Returns org_id + scopes if valid, null otherwise.
+ */
+async function verifyScopedToken(
+  db: any,
+  tokenValue: string
+): Promise<{ orgId: string; scopes: Scopes; tokenId: string } | null> {
+  const keyHash = await sha256(tokenValue);
+
+  const result = await db.execute(
+    sql`SELECT id, org_id, scopes FROM scoped_token
+        WHERE key_hash = ${keyHash}
+          AND expires_at > NOW()
+          AND revoked_at IS NULL
+        LIMIT 1`
+  );
+
+  const row = result.rows[0] as { id: string; org_id: string; scopes: Record<string, string[]> } | undefined;
+  if (!row) return null;
+
+  return { orgId: row.org_id, scopes: row.scopes, tokenId: row.id };
+}
+
+/**
+ * Verify a master API key (non cgt_* prefix).
+ * Returns org_id with null scopes (full access).
+ */
+async function verifyMasterKey(
+  db: any,
+  keyValue: string
+): Promise<{ orgId: string; scopes: null; tokenId: string } | null> {
+  const keyHash = await sha256(keyValue);
+
+  const result = await db.execute(
+    sql`SELECT org_id FROM api_key WHERE key_hash = ${keyHash} LIMIT 1`
+  );
+
+  const row = result.rows[0] as { org_id: string } | undefined;
+  if (!row) return null;
+
+  // Touch last_used (fire-and-forget, no await needed here — caller handles waitUntil)
+  return { orgId: row.org_id, scopes: null, tokenId: "" };
+}
+
+/**
  * Middleware for REST API routes.
- * Validates API key from x-api-key header.
+ * Validates API key or scoped token from x-api-key header.
  */
 export const apiKeyAuth = createMiddleware<{
   Bindings: Env;
   Variables: Variables;
 }>(async (c, next) => {
   const db = c.get("db");
+
+  // ── Internal sync token ──
   const internalToken = c.req.header("x-internal-token");
   if (internalToken && c.env.INTERNAL_SYNC_TOKEN && internalToken === c.env.INTERNAL_SYNC_TOKEN) {
     const orgId = c.req.header("x-org-id");
@@ -49,40 +101,48 @@ export const apiKeyAuth = createMiddleware<{
     return;
   }
 
+  // ── API key or scoped token ──
   const key = c.req.header("x-api-key");
   if (!key) {
     return c.json({ error: "Missing API key. Set x-api-key header." }, 401);
   }
 
-  const keyHash = await sha256(key);
+  const isScopedToken = key.startsWith(SCOPED_TOKEN_PREFIX);
+  const authResult = isScopedToken
+    ? await verifyScopedToken(db, key)
+    : await verifyMasterKey(db, key);
 
-  const result = await db.execute(
-    sql`SELECT org_id FROM api_key WHERE key_hash = ${keyHash} LIMIT 1`
-  );
-
-  const row = result.rows[0] as { org_id: string } | undefined;
-  if (!row) {
+  if (!authResult) {
+    if (isScopedToken) {
+      return c.json({ error: "Invalid or expired token" }, 401);
+    }
     return c.json({ error: "Invalid API key" }, 401);
   }
 
   // Touch last_used (fire-and-forget)
-  c.executionCtx.waitUntil(
-    db.execute(sql`UPDATE api_key SET last_used = NOW() WHERE key_hash = ${keyHash}`).catch(() => {})
-  );
+  if (isScopedToken) {
+    c.executionCtx.waitUntil(
+      db.execute(sql`UPDATE scoped_token SET last_used = NOW() WHERE id = ${authResult.tokenId}`).catch(() => {})
+    );
+  } else {
+    const keyHash = await sha256(key);
+    c.executionCtx.waitUntil(
+      db.execute(sql`UPDATE api_key SET last_used = NOW() WHERE key_hash = ${keyHash}`).catch(() => {})
+    );
+  }
 
-  c.set("orgId", row.org_id);
-  c.set("apiKeyPermissions", null);
-  c.set("apiKeyId", "");
+  c.set("orgId", authResult.orgId);
+  c.set("apiKeyPermissions", authResult.scopes);
+  c.set("apiKeyId", authResult.tokenId);
 
-  // Look up org plan for billing context
-  const orgPlan = await getOrgPlan(db, row.org_id);
+  const orgPlan = await getOrgPlan(db, authResult.orgId);
   c.set("orgTier", orgPlan.tier);
   c.set("dodoCustomerId", orgPlan.dodoCustomerId);
 
   await next();
 
   // Record api_call usage for every authenticated request
-  recordUsage(c.executionCtx, db, row.org_id, "api_call", 1, {
+  recordUsage(c.executionCtx, db, authResult.orgId, "api_call", 1, {
     method: c.req.method,
     path: c.req.path,
   }, c.env.DODO_PAYMENTS_API_KEY, orgPlan.dodoCustomerId);
@@ -90,7 +150,7 @@ export const apiKeyAuth = createMiddleware<{
 
 /**
  * Parse HTTP Basic Auth for Git Smart HTTP.
- * Returns the API key (password field) or null.
+ * Returns the credential (password field) or null.
  */
 export function parseBasicAuthKey(header: string | undefined): string | null {
   if (!header?.startsWith("Basic ")) return null;
@@ -105,22 +165,15 @@ export function parseBasicAuthKey(header: string | undefined): string | null {
 }
 
 /**
- * Verify an API key and return the org ID, or null if invalid.
+ * Verify a credential (API key or scoped token) for Git operations.
+ * Returns org ID + scopes, or null if invalid.
  */
-export async function verifyApiKeyForGit(
+export async function verifyCredentialForGit(
   db: any,
-  apiKeyValue: string
-): Promise<{ orgId: string } | null> {
-  const keyHash = await sha256(apiKeyValue);
-
-  const result = await db.execute(
-    sql`SELECT org_id FROM api_key WHERE key_hash = ${keyHash} LIMIT 1`
-  );
-
-  const row = result.rows[0] as { org_id: string } | undefined;
-  if (!row) return null;
-
-  return { orgId: row.org_id };
+  credentialValue: string
+): Promise<{ orgId: string; scopes: Scopes; tokenId: string } | null> {
+  if (credentialValue.startsWith(SCOPED_TOKEN_PREFIX)) {
+    return verifyScopedToken(db, credentialValue);
+  }
+  return verifyMasterKey(db, credentialValue);
 }
-
-

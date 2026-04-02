@@ -5,8 +5,10 @@
  */
 
 import { Hono } from "hono";
-import { eq, and } from "drizzle-orm";
 import { apiKeyAuth } from "../auth/middleware";
+import { hasRepoAccess } from "../auth/scopes";
+import { resolveRepo } from "../services/repo-resolver";
+import { extractRepoParams } from "./helpers";
 import { repo } from "../db/schema";
 import { GitR2Storage } from "../git/storage";
 import { execInWorkspace } from "../workspace/exec";
@@ -23,10 +25,11 @@ const workspace = new Hono<{ Bindings: Env; Variables: Variables }>();
  * Filesystem backed by git objects in R2 — lazy reads, in-memory writes.
  * Optionally commits changes back to git.
  */
-workspace.post("/:slug/exec", apiKeyAuth, async (c) => {
+const execHandler = async (c: any) => {
   const orgId = c.get("orgId");
   const db = c.get("db");
-  const { slug } = c.req.param();
+  const bucket = c.env.REPOS_BUCKET;
+  const { slug, namespace } = extractRepoParams(c);
 
   // Free tier: check API call limit
   const apiLimit = await checkFreeLimits(db, orgId, c.get("orgTier"), "api_call");
@@ -40,15 +43,15 @@ workspace.post("/:slug/exec", apiKeyAuth, async (c) => {
   }
 
   // Find repo
-  const [found] = await db
-    .select()
-    .from(repo)
-    .where(and(eq(repo.orgId, orgId), eq(repo.slug, slug)))
-    .limit(1);
+  const resolved = await resolveRepo(db, bucket, { orgId, slug, namespace });
+  if (!resolved) return c.json({ error: "Repository not found" }, 404);
 
-  if (!found) {
-    return c.json({ error: "Repository not found" }, 404);
+  if (!hasRepoAccess(c.get("apiKeyPermissions"), resolved.scopeKey, "write")) {
+    return c.json({ error: "Insufficient permissions" }, 403);
   }
+
+  const found = resolved.repo;
+  const storage = resolved.storage;
 
   // Parse body
   let body: {
@@ -77,9 +80,6 @@ workspace.post("/:slug/exec", apiKeyAuth, async (c) => {
     return c.json({ error: "commit_message is required when commit=true" }, 400);
   }
 
-  // Create storage
-  const storage = new GitR2Storage(c.env.REPOS_BUCKET, found.orgId, found.slug);
-
   try {
     const result = await execInWorkspace(storage, body.command, {
       branch: body.branch,
@@ -102,6 +102,8 @@ workspace.post("/:slug/exec", apiKeyAuth, async (c) => {
     console.error("[workspace/exec] error:", error);
     return c.json({ error: "Internal server error" }, 500);
   }
-});
+};
+workspace.post("/:slug/exec", apiKeyAuth, execHandler);
+workspace.post("/:namespace/:slug/exec", apiKeyAuth, execHandler);
 
 export { workspace };

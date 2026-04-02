@@ -4,19 +4,25 @@
  * All endpoints are unauthenticated — only returns repos with visibility="public".
  * Scoped by organization slug (B2B: "show public repos of this developer/project").
  *
- * GET /v1/orgs/:orgSlug/repos                      — List public repos of org
- * GET /v1/orgs/:orgSlug/repos/:slug                — Get public repo details
- * GET /v1/orgs/:orgSlug/repos/:slug/refs           — List branches and tags
- * GET /v1/orgs/:orgSlug/repos/:slug/tree/:ref/*path — Browse directory
- * GET /v1/orgs/:orgSlug/repos/:slug/blob/:ref/*path — Read file content
- * GET /v1/orgs/:orgSlug/repos/:slug/commits        — List commits
- * GET /v1/orgs/:orgSlug/repos/:slug/commits/:sha   — Get single commit
- * GET /v1/orgs/:orgSlug/repos/:slug/diff            — Diff between refs
+ * Each detail route is registered twice (without and with namespace):
+ *   /v1/orgs/:orgSlug/repos/:slug/...
+ *   /v1/orgs/:orgSlug/repos/:namespace/:slug/...
+ *
+ * GET /v1/orgs/:orgSlug/repos                              — List public repos of org
+ * GET /v1/orgs/:orgSlug/repos/[:namespace/]:slug            — Get public repo details
+ * GET /v1/orgs/:orgSlug/repos/[:namespace/]:slug/refs       — List branches and tags
+ * GET /v1/orgs/:orgSlug/repos/[:namespace/]:slug/tree/*     — Browse directory
+ * GET /v1/orgs/:orgSlug/repos/[:namespace/]:slug/blob/*     — Read file content
+ * GET /v1/orgs/:orgSlug/repos/[:namespace/]:slug/commits    — List commits
+ * GET /v1/orgs/:orgSlug/repos/[:namespace/]:slug/commits/:sha — Get single commit
+ * GET /v1/orgs/:orgSlug/repos/[:namespace/]:slug/diff       — Diff between refs
  */
 
 import { Hono } from "hono";
 import { eq, and } from "drizzle-orm";
 import { repo, organization } from "../db/schema";
+import { resolveRepo, buildGitUrl } from "../services/repo-resolver";
+import { extractRepoParams } from "./helpers";
 import { GitR2Storage } from "../git/storage";
 import { parseGitObject, parseCommit, parseTree } from "../git/objects";
 import { flattenTree, diffFlattenedTrees, computeDiffStatsFromDiffs } from "../git/cherry-pick";
@@ -44,27 +50,23 @@ async function resolveOrg(c: any): Promise<{ orgId: string } | Response> {
 
 async function resolvePublicRepo(
   c: any
-): Promise<{ orgId: string; found: typeof repo.$inferSelect; storage: GitR2Storage } | Response> {
+): Promise<{ orgId: string; found: typeof repo.$inferSelect; storage: GitR2Storage; namespace: string | null } | Response> {
   const orgResult = await resolveOrg(c);
   if (orgResult instanceof Response) return orgResult;
   const { orgId } = orgResult;
 
   const db = c.get("db");
-  const slug = c.req.param("slug");
+  const bucket = c.env.REPOS_BUCKET;
+  const { slug, namespace } = extractRepoParams(c);
 
-  const [found] = await db
-    .select()
-    .from(repo)
-    .where(and(eq(repo.orgId, orgId), eq(repo.slug, slug)))
-    .limit(1);
+  const resolved = await resolveRepo(db, bucket, { orgId, slug, namespace });
 
   // Don't leak existence of private repos
-  if (!found || found.visibility !== "public") {
+  if (!resolved || resolved.repo.visibility !== "public") {
     return c.json({ error: "Repository not found" }, 404);
   }
 
-  const storage = new GitR2Storage(c.env.REPOS_BUCKET, orgId, slug);
-  return { orgId, found, storage };
+  return { orgId, found: resolved.repo, storage: resolved.storage, namespace };
 }
 
 // ── List public repos of an org ──
@@ -77,12 +79,18 @@ publicRoutes.get("/orgs/:orgSlug/repos", async (c) => {
   const db = c.get("db");
   const limit = Math.min(parseInt(c.req.query("limit") || "50", 10), 100);
   const offset = Math.max(parseInt(c.req.query("offset") || "0", 10), 0);
+  const nsFilter = c.req.query("namespace");
 
   try {
+    let conditions = and(eq(repo.orgId, orgId), eq(repo.visibility, "public"));
+    if (nsFilter) {
+      conditions = and(conditions!, eq(repo.namespace, nsFilter));
+    }
+
     const repoList = await db
       .select()
       .from(repo)
-      .where(and(eq(repo.orgId, orgId), eq(repo.visibility, "public")))
+      .where(conditions)
       .orderBy(repo.updatedAt)
       .limit(limit)
       .offset(offset);
@@ -90,6 +98,7 @@ publicRoutes.get("/orgs/:orgSlug/repos", async (c) => {
     return c.json({
       repos: repoList.map((r) => ({
         id: r.id,
+        namespace: r.namespace,
         slug: r.slug,
         description: r.description,
         default_branch: r.defaultBranch,
@@ -107,10 +116,10 @@ publicRoutes.get("/orgs/:orgSlug/repos", async (c) => {
 
 // ── Get public repo details ──
 
-publicRoutes.get("/orgs/:orgSlug/repos/:slug", async (c) => {
+const getRepoHandler = async (c: any) => {
   const result = await resolvePublicRepo(c);
   if (result instanceof Response) return result;
-  const { found, storage } = result;
+  const { found, storage, namespace } = result;
 
   try {
     const headSha = await storage.resolveHead();
@@ -134,11 +143,12 @@ publicRoutes.get("/orgs/:orgSlug/repos/:slug", async (c) => {
     const orgSlug = c.req.param("orgSlug");
     return c.json({
       id: found.id,
+      namespace: found.namespace,
       slug: found.slug,
       description: found.description,
       default_branch: found.defaultBranch,
       is_empty: isEmpty,
-      git_url: `https://api.coregit.dev/${orgSlug}/${found.slug}.git`,
+      git_url: buildGitUrl(orgSlug, found.slug, found.namespace, null),
       created_at: found.createdAt,
       updated_at: found.updatedAt,
     });
@@ -146,11 +156,13 @@ publicRoutes.get("/orgs/:orgSlug/repos/:slug", async (c) => {
     console.error("Failed to get public repo:", error);
     return c.json({ error: "Failed to get repository" }, 500);
   }
-});
+};
+publicRoutes.get("/orgs/:orgSlug/repos/:slug", getRepoHandler);
+publicRoutes.get("/orgs/:orgSlug/repos/:namespace/:slug", getRepoHandler);
 
 // ── List refs ──
 
-publicRoutes.get("/orgs/:orgSlug/repos/:slug/refs", async (c) => {
+const listRefsHandler = async (c: any) => {
   const result = await resolvePublicRepo(c);
   if (result instanceof Response) return result;
   const { found, storage } = result;
@@ -176,19 +188,23 @@ publicRoutes.get("/orgs/:orgSlug/repos/:slug/refs", async (c) => {
     console.error("Failed to list refs:", error);
     return c.json({ error: "Failed to list refs" }, 500);
   }
-});
+};
+publicRoutes.get("/orgs/:orgSlug/repos/:slug/refs", listRefsHandler);
+publicRoutes.get("/orgs/:orgSlug/repos/:namespace/:slug/refs", listRefsHandler);
 
 // ── Browse directory ──
 
-publicRoutes.get("/orgs/:orgSlug/repos/:slug/tree/*", async (c) => {
+const treeHandler = async (c: any) => {
   const result = await resolvePublicRepo(c);
   if (result instanceof Response) return result;
-  const { found, storage } = result;
+  const { found, storage, namespace } = result;
 
   const slug = c.req.param("slug");
   const orgSlug = c.req.param("orgSlug");
   const url = new URL(c.req.url);
-  const treePrefix = `/v1/orgs/${orgSlug}/repos/${slug}/tree/`;
+  // Build the prefix dynamically based on namespace
+  const repoPath = namespace ? `${namespace}/${slug}` : slug;
+  const treePrefix = `/v1/orgs/${orgSlug}/repos/${repoPath}/tree/`;
   const refAndPath = decodeURIComponent(url.pathname.slice(url.pathname.indexOf(treePrefix) + treePrefix.length));
 
   const parts = refAndPath.split("/");
@@ -224,19 +240,23 @@ publicRoutes.get("/orgs/:orgSlug/repos/:slug/tree/*", async (c) => {
     console.error("Failed to fetch tree:", error);
     return c.json({ error: "Failed to fetch tree" }, 500);
   }
-});
+};
+publicRoutes.get("/orgs/:orgSlug/repos/:slug/tree/*", treeHandler);
+publicRoutes.get("/orgs/:orgSlug/repos/:namespace/:slug/tree/*", treeHandler);
 
 // ── Read file content ──
 
-publicRoutes.get("/orgs/:orgSlug/repos/:slug/blob/*", async (c) => {
+const blobHandler = async (c: any) => {
   const result = await resolvePublicRepo(c);
   if (result instanceof Response) return result;
-  const { found, storage } = result;
+  const { found, storage, namespace } = result;
 
   const slug = c.req.param("slug");
   const orgSlug = c.req.param("orgSlug");
   const url = new URL(c.req.url);
-  const blobPrefix = `/v1/orgs/${orgSlug}/repos/${slug}/blob/`;
+  // Build the prefix dynamically based on namespace
+  const repoPath = namespace ? `${namespace}/${slug}` : slug;
+  const blobPrefix = `/v1/orgs/${orgSlug}/repos/${repoPath}/blob/`;
   const refAndPath = decodeURIComponent(url.pathname.slice(url.pathname.indexOf(blobPrefix) + blobPrefix.length));
 
   const parts = refAndPath.split("/");
@@ -308,11 +328,13 @@ publicRoutes.get("/orgs/:orgSlug/repos/:slug/blob/*", async (c) => {
     console.error("Failed to fetch blob:", error);
     return c.json({ error: "Failed to fetch blob" }, 500);
   }
-});
+};
+publicRoutes.get("/orgs/:orgSlug/repos/:slug/blob/*", blobHandler);
+publicRoutes.get("/orgs/:orgSlug/repos/:namespace/:slug/blob/*", blobHandler);
 
 // ── List commits ──
 
-publicRoutes.get("/orgs/:orgSlug/repos/:slug/commits", async (c) => {
+const listCommitsHandler = async (c: any) => {
   const result = await resolvePublicRepo(c);
   if (result instanceof Response) return result;
   const { found, storage } = result;
@@ -367,11 +389,13 @@ publicRoutes.get("/orgs/:orgSlug/repos/:slug/commits", async (c) => {
     console.error("Failed to list commits:", error);
     return c.json({ error: "Failed to list commits" }, 500);
   }
-});
+};
+publicRoutes.get("/orgs/:orgSlug/repos/:slug/commits", listCommitsHandler);
+publicRoutes.get("/orgs/:orgSlug/repos/:namespace/:slug/commits", listCommitsHandler);
 
 // ── Get single commit ──
 
-publicRoutes.get("/orgs/:orgSlug/repos/:slug/commits/:sha", async (c) => {
+const getCommitHandler = async (c: any) => {
   const result = await resolvePublicRepo(c);
   if (result instanceof Response) return result;
   const { storage } = result;
@@ -395,11 +419,13 @@ publicRoutes.get("/orgs/:orgSlug/repos/:slug/commits/:sha", async (c) => {
     timestamp: authorInfo.timestamp,
     parents: commit.parents,
   });
-});
+};
+publicRoutes.get("/orgs/:orgSlug/repos/:slug/commits/:sha", getCommitHandler);
+publicRoutes.get("/orgs/:orgSlug/repos/:namespace/:slug/commits/:sha", getCommitHandler);
 
 // ── Diff between refs ──
 
-publicRoutes.get("/orgs/:orgSlug/repos/:slug/diff", async (c) => {
+const diffHandler = async (c: any) => {
   const result = await resolvePublicRepo(c);
   if (result instanceof Response) return result;
   const { storage } = result;
@@ -452,6 +478,8 @@ publicRoutes.get("/orgs/:orgSlug/repos/:slug/diff", async (c) => {
     console.error("Failed to compute diff:", error);
     return c.json({ error: "Failed to compute diff" }, 500);
   }
-});
+};
+publicRoutes.get("/orgs/:orgSlug/repos/:slug/diff", diffHandler);
+publicRoutes.get("/orgs/:orgSlug/repos/:namespace/:slug/diff", diffHandler);
 
 export { publicRoutes };

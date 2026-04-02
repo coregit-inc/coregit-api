@@ -11,8 +11,10 @@
  */
 
 import { Hono } from "hono";
-import { eq, and } from "drizzle-orm";
 import { apiKeyAuth } from "../auth/middleware";
+import { hasRepoAccess } from "../auth/scopes";
+import { resolveRepo } from "../services/repo-resolver";
+import { extractRepoParams } from "./helpers";
 import { repo } from "../db/schema";
 import { GitR2Storage } from "../git/storage";
 import { isValidRefPath, isValidSha } from "../git/validation";
@@ -24,32 +26,34 @@ const refs = new Hono<{ Bindings: Env; Variables: Variables }>();
 
 /**
  * Extract the ref path from the URL wildcard.
+ * Handles both /:slug/refs/* and /:namespace/:slug/refs/* patterns.
  * e.g. /v1/repos/my-repo/refs/heads/main → "refs/heads/main"
+ * e.g. /v1/repos/my-ns/my-repo/refs/heads/main → "refs/heads/main"
  */
-function extractRefPath(c: { req: { path: string; param: (name: string) => string } }): string {
-  const slug = c.req.param("slug");
+function extractRefPath(c: any, slug: string, namespace: string | null): string {
   const fullPath = c.req.path;
-  const marker = `/repos/${slug}/refs/`;
+  const repoPath = namespace ? `${namespace}/${slug}` : slug;
+  const marker = `/repos/${repoPath}/refs/`;
   const idx = fullPath.indexOf(marker);
   if (idx === -1) return "";
   return "refs/" + fullPath.slice(idx + marker.length);
 }
 
 // GET /v1/repos/:slug/refs — list all refs
-refs.get("/:slug/refs", apiKeyAuth, async (c) => {
+const listRefsHandler = async (c: any) => {
   const orgId = c.get("orgId");
   const db = c.get("db");
   const bucket = c.env.REPOS_BUCKET;
-  const { slug } = c.req.param();
+  const { slug, namespace } = extractRepoParams(c);
 
-  const [found] = await db
-    .select()
-    .from(repo)
-    .where(and(eq(repo.orgId, orgId), eq(repo.slug, slug)))
-    .limit(1);
-  if (!found) return c.json({ error: "Repository not found" }, 404);
+  const resolved = await resolveRepo(db, bucket, { orgId, slug, namespace });
+  if (!resolved) return c.json({ error: "Repository not found" }, 404);
 
-  const storage = new GitR2Storage(bucket, orgId, slug);
+  if (!hasRepoAccess(c.get("apiKeyPermissions"), resolved.scopeKey, "read")) {
+    return c.json({ error: "Insufficient permissions" }, 403);
+  }
+
+  const storage = resolved.storage;
   const allRefs = await storage.listRefs();
 
   const result: { ref: string; sha: string }[] = [];
@@ -58,41 +62,47 @@ refs.get("/:slug/refs", apiKeyAuth, async (c) => {
   }
 
   return c.json({ refs: result });
-});
+};
+refs.get("/:slug/refs", apiKeyAuth, listRefsHandler);
+refs.get("/:namespace/:slug/refs", apiKeyAuth, listRefsHandler);
 
 // GET /v1/repos/:slug/refs/* — get single ref
-refs.get("/:slug/refs/*", apiKeyAuth, async (c) => {
+const getRefHandler = async (c: any) => {
   const orgId = c.get("orgId");
   const db = c.get("db");
   const bucket = c.env.REPOS_BUCKET;
-  const { slug } = c.req.param();
-  const refPath = extractRefPath(c);
+  const { slug, namespace } = extractRepoParams(c);
+
+  const refPath = extractRefPath(c, slug, namespace);
 
   if (!refPath || refPath === "refs/") {
     return c.json({ error: "Ref path is required" }, 400);
   }
 
-  const [found] = await db
-    .select()
-    .from(repo)
-    .where(and(eq(repo.orgId, orgId), eq(repo.slug, slug)))
-    .limit(1);
-  if (!found) return c.json({ error: "Repository not found" }, 404);
+  const resolved = await resolveRepo(db, bucket, { orgId, slug, namespace });
+  if (!resolved) return c.json({ error: "Repository not found" }, 404);
 
-  const storage = new GitR2Storage(bucket, orgId, slug);
+  if (!hasRepoAccess(c.get("apiKeyPermissions"), resolved.scopeKey, "read")) {
+    return c.json({ error: "Insufficient permissions" }, 403);
+  }
+
+  const storage = resolved.storage;
   const sha = await storage.getRef(refPath);
   if (!sha) return c.json({ error: `Ref '${refPath}' not found` }, 404);
 
   return c.json({ ref: refPath, sha });
-});
+};
+refs.get("/:slug/refs/*", apiKeyAuth, getRefHandler);
+refs.get("/:namespace/:slug/refs/*", apiKeyAuth, getRefHandler);
 
 // PUT /v1/repos/:slug/refs/* — update ref (with optional CAS)
-refs.put("/:slug/refs/*", apiKeyAuth, async (c) => {
+const updateRefHandler = async (c: any) => {
   const orgId = c.get("orgId");
   const db = c.get("db");
   const bucket = c.env.REPOS_BUCKET;
-  const { slug } = c.req.param();
-  const refPath = extractRefPath(c);
+  const { slug, namespace } = extractRepoParams(c);
+
+  const refPath = extractRefPath(c, slug, namespace);
 
   if (!refPath || refPath === "refs/") {
     return c.json({ error: "Ref path is required" }, 400);
@@ -113,12 +123,14 @@ refs.put("/:slug/refs/*", apiKeyAuth, async (c) => {
     }, 429);
   }
 
-  const [found] = await db
-    .select()
-    .from(repo)
-    .where(and(eq(repo.orgId, orgId), eq(repo.slug, slug)))
-    .limit(1);
-  if (!found) return c.json({ error: "Repository not found" }, 404);
+  const resolved = await resolveRepo(db, bucket, { orgId, slug, namespace });
+  if (!resolved) return c.json({ error: "Repository not found" }, 404);
+
+  if (!hasRepoAccess(c.get("apiKeyPermissions"), resolved.scopeKey, "write")) {
+    return c.json({ error: "Insufficient permissions" }, 403);
+  }
+
+  const storage = resolved.storage;
 
   let body: { sha: string; expected_sha?: string };
   try {
@@ -132,8 +144,6 @@ refs.put("/:slug/refs/*", apiKeyAuth, async (c) => {
   if (!sha || !isValidSha(sha)) {
     return c.json({ error: "Valid 40-char hex SHA is required" }, 400);
   }
-
-  const storage = new GitR2Storage(bucket, orgId, slug);
 
   // Verify the target object exists
   const exists = await storage.hasObject(sha);
@@ -176,39 +186,46 @@ refs.put("/:slug/refs/*", apiKeyAuth, async (c) => {
     sha,
     previous_sha: previousSha,
   });
-});
+};
+refs.put("/:slug/refs/*", apiKeyAuth, updateRefHandler);
+refs.put("/:namespace/:slug/refs/*", apiKeyAuth, updateRefHandler);
 
 // DELETE /v1/repos/:slug/refs/* — delete ref
-refs.delete("/:slug/refs/*", apiKeyAuth, async (c) => {
+const deleteRefHandler = async (c: any) => {
   const orgId = c.get("orgId");
   const db = c.get("db");
   const bucket = c.env.REPOS_BUCKET;
-  const { slug } = c.req.param();
-  const refPath = extractRefPath(c);
+  const { slug, namespace } = extractRepoParams(c);
+
+  const refPath = extractRefPath(c, slug, namespace);
 
   if (!refPath || refPath === "refs/") {
     return c.json({ error: "Ref path is required" }, 400);
   }
 
-  const [found] = await db
-    .select()
-    .from(repo)
-    .where(and(eq(repo.orgId, orgId), eq(repo.slug, slug)))
-    .limit(1);
-  if (!found) return c.json({ error: "Repository not found" }, 404);
+  const resolved = await resolveRepo(db, bucket, { orgId, slug, namespace });
+  if (!resolved) return c.json({ error: "Repository not found" }, 404);
+
+  if (!hasRepoAccess(c.get("apiKeyPermissions"), resolved.scopeKey, "write")) {
+    return c.json({ error: "Insufficient permissions" }, 403);
+  }
+
+  const found = resolved.repo;
+  const storage = resolved.storage;
 
   // Prevent deleting default branch
   if (refPath === `refs/heads/${found.defaultBranch}`) {
     return c.json({ error: "Cannot delete the default branch" }, 400);
   }
 
-  const storage = new GitR2Storage(bucket, orgId, slug);
   const sha = await storage.getRef(refPath);
   if (!sha) return c.json({ error: `Ref '${refPath}' not found` }, 404);
 
   await storage.deleteRef(refPath);
 
   return c.json({ deleted: true, ref: refPath, sha });
-});
+};
+refs.delete("/:slug/refs/*", apiKeyAuth, deleteRefHandler);
+refs.delete("/:namespace/:slug/refs/*", apiKeyAuth, deleteRefHandler);
 
 export { refs };

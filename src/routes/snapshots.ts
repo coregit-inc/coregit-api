@@ -12,6 +12,9 @@ import { Hono } from "hono";
 import { nanoid } from "nanoid";
 import { eq, and } from "drizzle-orm";
 import { apiKeyAuth } from "../auth/middleware";
+import { hasRepoAccess } from "../auth/scopes";
+import { resolveRepo } from "../services/repo-resolver";
+import { extractRepoParams } from "./helpers";
 import { repo, snapshot } from "../db/schema";
 import { GitR2Storage } from "../git/storage";
 import type { Env, Variables } from "../types";
@@ -19,18 +22,21 @@ import type { Env, Variables } from "../types";
 const snapshots = new Hono<{ Bindings: Env; Variables: Variables }>();
 
 // POST /v1/repos/:slug/snapshots
-snapshots.post("/:slug/snapshots", apiKeyAuth, async (c) => {
+const createSnapshotHandler = async (c: any) => {
   const orgId = c.get("orgId");
   const db = c.get("db");
   const bucket = c.env.REPOS_BUCKET;
-  const { slug } = c.req.param();
+  const { slug, namespace } = extractRepoParams(c);
 
-  const [found] = await db
-    .select()
-    .from(repo)
-    .where(and(eq(repo.orgId, orgId), eq(repo.slug, slug)))
-    .limit(1);
-  if (!found) return c.json({ error: "Repository not found" }, 404);
+  const resolved = await resolveRepo(db, bucket, { orgId, slug, namespace });
+  if (!resolved) return c.json({ error: "Repository not found" }, 404);
+
+  if (!hasRepoAccess(c.get("apiKeyPermissions"), resolved.scopeKey, "write")) {
+    return c.json({ error: "Insufficient permissions" }, 403);
+  }
+
+  const found = resolved.repo;
+  const storage = resolved.storage;
 
   let body: { name: string; branch?: string; metadata?: Record<string, unknown> };
   try {
@@ -42,7 +48,6 @@ snapshots.post("/:slug/snapshots", apiKeyAuth, async (c) => {
   if (!body.name) return c.json({ error: "name is required" }, 400);
 
   const branch = body.branch || found.defaultBranch;
-  const storage = new GitR2Storage(bucket, orgId, slug);
   const commitSha = await storage.getRef(`refs/heads/${branch}`);
   if (!commitSha) return c.json({ error: `Branch '${branch}' not found` }, 404);
 
@@ -84,20 +89,25 @@ snapshots.post("/:slug/snapshots", apiKeyAuth, async (c) => {
     console.error("Failed to create snapshot:", error);
     return c.json({ error: "Failed to create snapshot" }, 500);
   }
-});
+};
+snapshots.post("/:slug/snapshots", apiKeyAuth, createSnapshotHandler);
+snapshots.post("/:namespace/:slug/snapshots", apiKeyAuth, createSnapshotHandler);
 
 // GET /v1/repos/:slug/snapshots
-snapshots.get("/:slug/snapshots", apiKeyAuth, async (c) => {
+const listSnapshotsHandler = async (c: any) => {
   const orgId = c.get("orgId");
   const db = c.get("db");
-  const { slug } = c.req.param();
+  const bucket = c.env.REPOS_BUCKET;
+  const { slug, namespace } = extractRepoParams(c);
 
-  const [found] = await db
-    .select()
-    .from(repo)
-    .where(and(eq(repo.orgId, orgId), eq(repo.slug, slug)))
-    .limit(1);
-  if (!found) return c.json({ error: "Repository not found" }, 404);
+  const resolved = await resolveRepo(db, bucket, { orgId, slug, namespace });
+  if (!resolved) return c.json({ error: "Repository not found" }, 404);
+
+  if (!hasRepoAccess(c.get("apiKeyPermissions"), resolved.scopeKey, "read")) {
+    return c.json({ error: "Insufficient permissions" }, 403);
+  }
+
+  const found = resolved.repo;
 
   const list = await db
     .select()
@@ -106,7 +116,7 @@ snapshots.get("/:slug/snapshots", apiKeyAuth, async (c) => {
     .orderBy(snapshot.createdAt);
 
   return c.json({
-    snapshots: list.map((s) => ({
+    snapshots: list.map((s: any) => ({
       name: s.name,
       branch: s.branch,
       commit_sha: s.commitSha,
@@ -114,20 +124,26 @@ snapshots.get("/:slug/snapshots", apiKeyAuth, async (c) => {
       created_at: s.createdAt,
     })),
   });
-});
+};
+snapshots.get("/:slug/snapshots", apiKeyAuth, listSnapshotsHandler);
+snapshots.get("/:namespace/:slug/snapshots", apiKeyAuth, listSnapshotsHandler);
 
 // GET /v1/repos/:slug/snapshots/:name
-snapshots.get("/:slug/snapshots/:name", apiKeyAuth, async (c) => {
+const getSnapshotHandler = async (c: any) => {
   const orgId = c.get("orgId");
   const db = c.get("db");
-  const { slug, name } = c.req.param();
+  const bucket = c.env.REPOS_BUCKET;
+  const { slug, namespace } = extractRepoParams(c);
+  const name = c.req.param("name");
 
-  const [found] = await db
-    .select()
-    .from(repo)
-    .where(and(eq(repo.orgId, orgId), eq(repo.slug, slug)))
-    .limit(1);
-  if (!found) return c.json({ error: "Repository not found" }, 404);
+  const resolved = await resolveRepo(db, bucket, { orgId, slug, namespace });
+  if (!resolved) return c.json({ error: "Repository not found" }, 404);
+
+  if (!hasRepoAccess(c.get("apiKeyPermissions"), resolved.scopeKey, "read")) {
+    return c.json({ error: "Insufficient permissions" }, 403);
+  }
+
+  const found = resolved.repo;
 
   const [snap] = await db
     .select()
@@ -144,20 +160,26 @@ snapshots.get("/:slug/snapshots/:name", apiKeyAuth, async (c) => {
     metadata: snap.metadata,
     created_at: snap.createdAt,
   });
-});
+};
+snapshots.get("/:slug/snapshots/:name", apiKeyAuth, getSnapshotHandler);
+snapshots.get("/:namespace/:slug/snapshots/:name", apiKeyAuth, getSnapshotHandler);
 
 // DELETE /v1/repos/:slug/snapshots/:name
-snapshots.delete("/:slug/snapshots/:name", apiKeyAuth, async (c) => {
+const deleteSnapshotHandler = async (c: any) => {
   const orgId = c.get("orgId");
   const db = c.get("db");
-  const { slug, name } = c.req.param();
+  const bucket = c.env.REPOS_BUCKET;
+  const { slug, namespace } = extractRepoParams(c);
+  const name = c.req.param("name");
 
-  const [found] = await db
-    .select()
-    .from(repo)
-    .where(and(eq(repo.orgId, orgId), eq(repo.slug, slug)))
-    .limit(1);
-  if (!found) return c.json({ error: "Repository not found" }, 404);
+  const resolved = await resolveRepo(db, bucket, { orgId, slug, namespace });
+  if (!resolved) return c.json({ error: "Repository not found" }, 404);
+
+  if (!hasRepoAccess(c.get("apiKeyPermissions"), resolved.scopeKey, "write")) {
+    return c.json({ error: "Insufficient permissions" }, 403);
+  }
+
+  const found = resolved.repo;
 
   const [snap] = await db
     .select()
@@ -169,21 +191,27 @@ snapshots.delete("/:slug/snapshots/:name", apiKeyAuth, async (c) => {
 
   await db.delete(snapshot).where(eq(snapshot.id, snap.id));
   return c.json({ deleted: true });
-});
+};
+snapshots.delete("/:slug/snapshots/:name", apiKeyAuth, deleteSnapshotHandler);
+snapshots.delete("/:namespace/:slug/snapshots/:name", apiKeyAuth, deleteSnapshotHandler);
 
 // POST /v1/repos/:slug/snapshots/:name/restore
-snapshots.post("/:slug/snapshots/:name/restore", apiKeyAuth, async (c) => {
+const restoreSnapshotHandler = async (c: any) => {
   const orgId = c.get("orgId");
   const db = c.get("db");
   const bucket = c.env.REPOS_BUCKET;
-  const { slug, name } = c.req.param();
+  const { slug, namespace } = extractRepoParams(c);
+  const name = c.req.param("name");
 
-  const [found] = await db
-    .select()
-    .from(repo)
-    .where(and(eq(repo.orgId, orgId), eq(repo.slug, slug)))
-    .limit(1);
-  if (!found) return c.json({ error: "Repository not found" }, 404);
+  const resolved = await resolveRepo(db, bucket, { orgId, slug, namespace });
+  if (!resolved) return c.json({ error: "Repository not found" }, 404);
+
+  if (!hasRepoAccess(c.get("apiKeyPermissions"), resolved.scopeKey, "write")) {
+    return c.json({ error: "Insufficient permissions" }, 403);
+  }
+
+  const found = resolved.repo;
+  const storage = resolved.storage;
 
   const [snap] = await db
     .select()
@@ -201,7 +229,6 @@ snapshots.post("/:slug/snapshots/:name/restore", apiKeyAuth, async (c) => {
   }
 
   const targetBranch = body.target_branch || snap.branch;
-  const storage = new GitR2Storage(bucket, orgId, slug);
 
   // Verify commit still exists
   const exists = await storage.hasObject(snap.commitSha);
@@ -225,6 +252,8 @@ snapshots.post("/:slug/snapshots/:name/restore", apiKeyAuth, async (c) => {
     branch: targetBranch,
     sha: snap.commitSha,
   });
-});
+};
+snapshots.post("/:slug/snapshots/:name/restore", apiKeyAuth, restoreSnapshotHandler);
+snapshots.post("/:namespace/:slug/snapshots/:name/restore", apiKeyAuth, restoreSnapshotHandler);
 
 export { snapshots };

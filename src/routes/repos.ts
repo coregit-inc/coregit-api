@@ -17,6 +17,9 @@ import { GitR2Storage } from "../git/storage";
 import { createTree, createCommit, hashGitObject, parseGitObject, parseCommit } from "../git/objects";
 import { recordUsage } from "../services/usage";
 import { checkFreeLimits } from "../services/limits";
+import { isMasterKey, hasRepoAccess, getAccessibleRepoKeys } from "../auth/scopes";
+import { resolveRepo, buildGitUrl, buildApiUrl } from "../services/repo-resolver";
+import { extractRepoParams, validateNamespace } from "./helpers";
 import type { Env, Variables } from "../types";
 
 const repos = new Hono<{ Bindings: Env; Variables: Variables }>();
@@ -29,12 +32,16 @@ function validateSlug(slug: string): boolean {
 
 // POST /v1/repos
 repos.post("/", apiKeyAuth, async (c) => {
+  if (!isMasterKey(c.get("apiKeyPermissions"))) {
+    return c.json({ error: "Only master API keys can create repositories" }, 403);
+  }
   const orgId = c.get("orgId");
   const db = c.get("db");
   const bucket = c.env.REPOS_BUCKET;
 
   let body: {
     slug: string;
+    namespace?: string;
     description?: string;
     default_branch?: string;
     visibility?: string;
@@ -46,13 +53,18 @@ repos.post("/", apiKeyAuth, async (c) => {
     return c.json({ error: "Invalid JSON body" }, 400);
   }
 
-  const { slug, description, default_branch = "main", visibility = "private", init = true } = body;
+  const { slug, namespace, description, default_branch = "main", visibility = "private", init = true } = body;
 
   if (!slug || typeof slug !== "string") {
     return c.json({ error: "slug is required" }, 400);
   }
   if (!validateSlug(slug)) {
     return c.json({ error: "Invalid slug. Use lowercase letters, numbers, hyphens. 1-100 chars." }, 400);
+  }
+  if (namespace !== undefined && namespace !== null) {
+    if (typeof namespace !== "string" || !validateNamespace(namespace)) {
+      return c.json({ error: "Invalid namespace. Use lowercase letters, numbers, hyphens. 1-100 chars." }, 400);
+    }
   }
   if (visibility !== "public" && visibility !== "private") {
     return c.json({ error: "visibility must be 'public' or 'private'" }, 400);
@@ -73,14 +85,10 @@ repos.post("/", apiKeyAuth, async (c) => {
       }, 429);
     }
 
-    // Check uniqueness
-    const existing = await db
-      .select({ id: repo.id })
-      .from(repo)
-      .where(and(eq(repo.orgId, orgId), eq(repo.slug, slug)))
-      .limit(1);
-
-    if (existing.length > 0) {
+    // Check uniqueness (use resolver which handles namespace correctly)
+    const ns = namespace || null;
+    const existingRepo = await resolveRepo(db, bucket, { orgId, slug, namespace: ns });
+    if (existingRepo) {
       return c.json({ error: "A repository with this slug already exists" }, 409);
     }
 
@@ -92,6 +100,7 @@ repos.post("/", apiKeyAuth, async (c) => {
       .values({
         id: repoId,
         orgId,
+        namespace: ns,
         slug,
         description: description || null,
         defaultBranch: default_branch,
@@ -100,7 +109,8 @@ repos.post("/", apiKeyAuth, async (c) => {
       .returning();
 
     // Initialize R2 storage
-    const storage = new GitR2Storage(bucket, orgId, slug);
+    const storageSuffix = ns ? `${ns}/${slug}` : slug;
+    const storage = new GitR2Storage(bucket, orgId, storageSuffix);
     await storage.setHead(`refs/heads/${default_branch}`);
 
     if (init) {
@@ -137,14 +147,13 @@ repos.post("/", apiKeyAuth, async (c) => {
     return c.json(
       {
         id: newRepo.id,
+        namespace: newRepo.namespace,
         slug: newRepo.slug,
         description: newRepo.description,
         default_branch: newRepo.defaultBranch,
         visibility: newRepo.visibility,
-        git_url: c.get("customDomain")
-          ? `https://${c.get("customDomain")}/${slug}.git`
-          : `https://api.coregit.dev/${orgSlug}/${slug}.git`,
-        api_url: `https://api.coregit.dev/v1/repos/${slug}`,
+        git_url: buildGitUrl(orgSlug, slug, ns, c.get("customDomain")),
+        api_url: buildApiUrl(slug, ns),
         created_at: newRepo.createdAt,
       },
       201
@@ -161,19 +170,35 @@ repos.get("/", apiKeyAuth, async (c) => {
   const db = c.get("db");
   const limit = Math.min(parseInt(c.req.query("limit") || "50", 10), 100);
   const offset = Math.max(parseInt(c.req.query("offset") || "0", 10), 0);
+  const nsFilter = c.req.query("namespace");
 
   try {
-    const repoList = await db
+    let conditions = eq(repo.orgId, orgId);
+    if (nsFilter) {
+      conditions = and(conditions, eq(repo.namespace, nsFilter))!;
+    }
+
+    let repoList = await db
       .select()
       .from(repo)
-      .where(eq(repo.orgId, orgId))
+      .where(conditions)
       .orderBy(repo.updatedAt)
       .limit(limit)
       .offset(offset);
 
+    // Scoped tokens: filter to only accessible repos
+    const accessibleKeys = getAccessibleRepoKeys(c.get("apiKeyPermissions"));
+    if (accessibleKeys !== null) {
+      repoList = repoList.filter((r: any) => {
+        const scopeKey = r.namespace ? `${r.namespace}/${r.slug}` : r.slug;
+        return accessibleKeys.includes(scopeKey);
+      });
+    }
+
     return c.json({
       repos: repoList.map((r) => ({
         id: r.id,
+        namespace: r.namespace,
         slug: r.slug,
         description: r.description,
         default_branch: r.defaultBranch,
@@ -190,26 +215,23 @@ repos.get("/", apiKeyAuth, async (c) => {
   }
 });
 
-// GET /v1/repos/:slug
-repos.get("/:slug", apiKeyAuth, async (c) => {
+// GET /v1/repos/:slug  and  GET /v1/repos/:namespace/:slug
+const getRepoHandler = async (c: any) => {
   const orgId = c.get("orgId");
   const db = c.get("db");
   const bucket = c.env.REPOS_BUCKET;
-  const { slug } = c.req.param();
+  const { slug, namespace } = extractRepoParams(c);
+  const resolved = await resolveRepo(db, bucket, { orgId, slug, namespace });
+
+  if (!resolved) return c.json({ error: "Repository not found" }, 404);
+  if (!hasRepoAccess(c.get("apiKeyPermissions"), resolved.scopeKey, "read")) {
+    return c.json({ error: "Insufficient permissions" }, 403);
+  }
+
+  const found = resolved.repo;
+  const storage = resolved.storage;
 
   try {
-    const [found] = await db
-      .select()
-      .from(repo)
-      .where(and(eq(repo.orgId, orgId), eq(repo.slug, slug)))
-      .limit(1);
-
-    if (!found) {
-      return c.json({ error: "Repository not found" }, 404);
-    }
-
-    // Check if repo is empty
-    const storage = new GitR2Storage(bucket, orgId, slug);
     const headSha = await storage.resolveHead();
     let isEmpty = !headSha;
 
@@ -228,7 +250,6 @@ repos.get("/:slug", apiKeyAuth, async (c) => {
       }
     }
 
-    // Look up org slug for git_url
     const [org] = await db
       .select({ slug: organization.slug })
       .from(organization)
@@ -238,15 +259,14 @@ repos.get("/:slug", apiKeyAuth, async (c) => {
 
     return c.json({
       id: found.id,
+      namespace: found.namespace,
       slug: found.slug,
       description: found.description,
       default_branch: found.defaultBranch,
       visibility: found.visibility,
       is_empty: isEmpty,
-      git_url: c.get("customDomain")
-          ? `https://${c.get("customDomain")}/${slug}.git`
-          : `https://api.coregit.dev/${orgSlug}/${slug}.git`,
-      api_url: `https://api.coregit.dev/v1/repos/${slug}`,
+      git_url: buildGitUrl(orgSlug, found.slug, found.namespace, c.get("customDomain")),
+      api_url: buildApiUrl(found.slug, found.namespace),
       created_at: found.createdAt,
       updated_at: found.updatedAt,
     });
@@ -254,13 +274,19 @@ repos.get("/:slug", apiKeyAuth, async (c) => {
     console.error("Failed to get repo:", error);
     return c.json({ error: "Failed to get repository" }, 500);
   }
-});
+};
+repos.get("/:slug", apiKeyAuth, getRepoHandler);
+repos.get("/:namespace/:slug", apiKeyAuth, getRepoHandler);
 
-// PATCH /v1/repos/:slug
-repos.patch("/:slug", apiKeyAuth, async (c) => {
+// PATCH /v1/repos/:slug  and  PATCH /v1/repos/:namespace/:slug
+const patchRepoHandler = async (c: any) => {
+  if (!isMasterKey(c.get("apiKeyPermissions"))) {
+    return c.json({ error: "Only master API keys can update repositories" }, 403);
+  }
   const orgId = c.get("orgId");
   const db = c.get("db");
-  const { slug } = c.req.param();
+  const bucket = c.env.REPOS_BUCKET;
+  const { slug, namespace } = extractRepoParams(c);
 
   let body: { description?: string; visibility?: string; default_branch?: string };
   try {
@@ -270,15 +296,9 @@ repos.patch("/:slug", apiKeyAuth, async (c) => {
   }
 
   try {
-    const [found] = await db
-      .select()
-      .from(repo)
-      .where(and(eq(repo.orgId, orgId), eq(repo.slug, slug)))
-      .limit(1);
-
-    if (!found) {
-      return c.json({ error: "Repository not found" }, 404);
-    }
+    const resolved = await resolveRepo(db, bucket, { orgId, slug, namespace });
+    if (!resolved) return c.json({ error: "Repository not found" }, 404);
+    const found = resolved.repo;
 
     const updates: Partial<typeof repo.$inferInsert> = {};
     if (body.description !== undefined) updates.description = body.description;
@@ -289,14 +309,12 @@ repos.patch("/:slug", apiKeyAuth, async (c) => {
       updates.visibility = body.visibility;
     }
     if (body.default_branch !== undefined) {
-      // Verify the branch actually exists before setting it as default
-      const storage = new GitR2Storage(c.env.REPOS_BUCKET, orgId, slug);
-      const branchSha = await storage.getRef(`refs/heads/${body.default_branch}`);
+      const branchSha = await resolved.storage.getRef(`refs/heads/${body.default_branch}`);
       if (!branchSha) {
         return c.json({ error: `Branch '${body.default_branch}' does not exist` }, 400);
       }
       updates.defaultBranch = body.default_branch;
-      await storage.setHead(`refs/heads/${body.default_branch}`);
+      await resolved.storage.setHead(`refs/heads/${body.default_branch}`);
     }
 
     if (Object.keys(updates).length === 0) {
@@ -311,6 +329,7 @@ repos.patch("/:slug", apiKeyAuth, async (c) => {
 
     return c.json({
       id: updated.id,
+      namespace: updated.namespace,
       slug: updated.slug,
       description: updated.description,
       default_branch: updated.defaultBranch,
@@ -321,28 +340,28 @@ repos.patch("/:slug", apiKeyAuth, async (c) => {
     console.error("Failed to update repo:", error);
     return c.json({ error: "Failed to update repository" }, 500);
   }
-});
+};
+repos.patch("/:slug", apiKeyAuth, patchRepoHandler);
+repos.patch("/:namespace/:slug", apiKeyAuth, patchRepoHandler);
 
-// DELETE /v1/repos/:slug
-repos.delete("/:slug", apiKeyAuth, async (c) => {
+// DELETE /v1/repos/:slug  and  DELETE /v1/repos/:namespace/:slug
+const deleteRepoHandler = async (c: any) => {
+  if (!isMasterKey(c.get("apiKeyPermissions"))) {
+    return c.json({ error: "Only master API keys can delete repositories" }, 403);
+  }
   const orgId = c.get("orgId");
   const db = c.get("db");
   const bucket = c.env.REPOS_BUCKET;
-  const { slug } = c.req.param();
+  const { slug, namespace } = extractRepoParams(c);
 
   try {
-    const [found] = await db
-      .select()
-      .from(repo)
-      .where(and(eq(repo.orgId, orgId), eq(repo.slug, slug)))
-      .limit(1);
-
-    if (!found) {
-      return c.json({ error: "Repository not found" }, 404);
-    }
+    const resolved = await resolveRepo(db, bucket, { orgId, slug, namespace });
+    if (!resolved) return c.json({ error: "Repository not found" }, 404);
+    const found = resolved.repo;
 
     // Delete R2 storage
-    const basePath = `${orgId}/${slug}/`;
+    const storageSuffix = found.namespace ? `${found.namespace}/${found.slug}` : found.slug;
+    const basePath = `${orgId}/${storageSuffix}/`;
     let cursor: string | undefined;
     const keysToDelete: string[] = [];
 
@@ -368,6 +387,8 @@ repos.delete("/:slug", apiKeyAuth, async (c) => {
     console.error("Failed to delete repo:", error);
     return c.json({ error: "Failed to delete repository" }, 500);
   }
-});
+};
+repos.delete("/:slug", apiKeyAuth, deleteRepoHandler);
+repos.delete("/:namespace/:slug", apiKeyAuth, deleteRepoHandler);
 
 export { repos };

@@ -9,9 +9,10 @@
  */
 
 import { Hono } from "hono";
-import { eq, and } from "drizzle-orm";
 import { apiKeyAuth } from "../auth/middleware";
-import { repo } from "../db/schema";
+import { hasRepoAccess } from "../auth/scopes";
+import { resolveRepo } from "../services/repo-resolver";
+import { extractRepoParams } from "./helpers";
 import { GitR2Storage } from "../git/storage";
 import {
   findMergeBase,
@@ -35,18 +36,21 @@ import type { Env, Variables } from "../types";
 const branches = new Hono<{ Bindings: Env; Variables: Variables }>();
 
 // POST /v1/repos/:slug/branches
-branches.post("/:slug/branches", apiKeyAuth, async (c) => {
+const createBranchHandler = async (c: any) => {
   const orgId = c.get("orgId");
   const db = c.get("db");
   const bucket = c.env.REPOS_BUCKET;
-  const { slug } = c.req.param();
+  const { slug, namespace } = extractRepoParams(c);
 
-  const [found] = await db
-    .select()
-    .from(repo)
-    .where(and(eq(repo.orgId, orgId), eq(repo.slug, slug)))
-    .limit(1);
-  if (!found) return c.json({ error: "Repository not found" }, 404);
+  const resolved = await resolveRepo(db, bucket, { orgId, slug, namespace });
+  if (!resolved) return c.json({ error: "Repository not found" }, 404);
+
+  if (!hasRepoAccess(c.get("apiKeyPermissions"), resolved.scopeKey, "write")) {
+    return c.json({ error: "Insufficient permissions" }, 403);
+  }
+
+  const found = resolved.repo;
+  const storage = resolved.storage;
 
   let body: { name: string; from?: string; from_sha?: string };
   try {
@@ -62,8 +66,6 @@ branches.post("/:slug/branches", apiKeyAuth, async (c) => {
   if (!isValidRefName(name)) {
     return c.json({ error: "Invalid branch name" }, 400);
   }
-
-  const storage = new GitR2Storage(bucket, orgId, slug);
 
   try {
     // Determine source SHA
@@ -95,23 +97,26 @@ branches.post("/:slug/branches", apiKeyAuth, async (c) => {
     console.error("Failed to create branch:", error);
     return c.json({ error: "Failed to create branch" }, 500);
   }
-});
+};
+branches.post("/:slug/branches", apiKeyAuth, createBranchHandler);
+branches.post("/:namespace/:slug/branches", apiKeyAuth, createBranchHandler);
 
 // GET /v1/repos/:slug/branches
-branches.get("/:slug/branches", apiKeyAuth, async (c) => {
+const listBranchesHandler = async (c: any) => {
   const orgId = c.get("orgId");
   const db = c.get("db");
   const bucket = c.env.REPOS_BUCKET;
-  const { slug } = c.req.param();
+  const { slug, namespace } = extractRepoParams(c);
 
-  const [found] = await db
-    .select()
-    .from(repo)
-    .where(and(eq(repo.orgId, orgId), eq(repo.slug, slug)))
-    .limit(1);
-  if (!found) return c.json({ error: "Repository not found" }, 404);
+  const resolved = await resolveRepo(db, bucket, { orgId, slug, namespace });
+  if (!resolved) return c.json({ error: "Repository not found" }, 404);
 
-  const storage = new GitR2Storage(bucket, orgId, slug);
+  if (!hasRepoAccess(c.get("apiKeyPermissions"), resolved.scopeKey, "read")) {
+    return c.json({ error: "Insufficient permissions" }, 403);
+  }
+
+  const found = resolved.repo;
+  const storage = resolved.storage;
 
   try {
     const refs = await storage.listRefs();
@@ -130,54 +135,64 @@ branches.get("/:slug/branches", apiKeyAuth, async (c) => {
     console.error("Failed to list branches:", error);
     return c.json({ error: "Failed to list branches" }, 500);
   }
-});
+};
+branches.get("/:slug/branches", apiKeyAuth, listBranchesHandler);
+branches.get("/:namespace/:slug/branches", apiKeyAuth, listBranchesHandler);
 
 // GET /v1/repos/:slug/branches/:name
-branches.get("/:slug/branches/:name", apiKeyAuth, async (c) => {
+const getBranchHandler = async (c: any) => {
   const orgId = c.get("orgId");
   const db = c.get("db");
   const bucket = c.env.REPOS_BUCKET;
-  const { slug, name } = c.req.param();
+  const { slug, namespace } = extractRepoParams(c);
+  const name = c.req.param("name");
 
-  const [found] = await db
-    .select()
-    .from(repo)
-    .where(and(eq(repo.orgId, orgId), eq(repo.slug, slug)))
-    .limit(1);
-  if (!found) return c.json({ error: "Repository not found" }, 404);
+  const resolved = await resolveRepo(db, bucket, { orgId, slug, namespace });
+  if (!resolved) return c.json({ error: "Repository not found" }, 404);
 
-  const storage = new GitR2Storage(bucket, orgId, slug);
+  if (!hasRepoAccess(c.get("apiKeyPermissions"), resolved.scopeKey, "read")) {
+    return c.json({ error: "Insufficient permissions" }, 403);
+  }
+
+  const storage = resolved.storage;
   const sha = await storage.getRef(`refs/heads/${name}`);
   if (!sha) return c.json({ error: "Branch not found" }, 404);
 
   return c.json({ name, sha });
-});
+};
+branches.get("/:slug/branches/:name", apiKeyAuth, getBranchHandler);
+branches.get("/:namespace/:slug/branches/:name", apiKeyAuth, getBranchHandler);
 
 // DELETE /v1/repos/:slug/branches/:name
-branches.delete("/:slug/branches/:name", apiKeyAuth, async (c) => {
+const deleteBranchHandler = async (c: any) => {
   const orgId = c.get("orgId");
   const db = c.get("db");
   const bucket = c.env.REPOS_BUCKET;
-  const { slug, name } = c.req.param();
+  const { slug, namespace } = extractRepoParams(c);
+  const name = c.req.param("name");
 
-  const [found] = await db
-    .select()
-    .from(repo)
-    .where(and(eq(repo.orgId, orgId), eq(repo.slug, slug)))
-    .limit(1);
-  if (!found) return c.json({ error: "Repository not found" }, 404);
+  const resolved = await resolveRepo(db, bucket, { orgId, slug, namespace });
+  if (!resolved) return c.json({ error: "Repository not found" }, 404);
+
+  if (!hasRepoAccess(c.get("apiKeyPermissions"), resolved.scopeKey, "write")) {
+    return c.json({ error: "Insufficient permissions" }, 403);
+  }
+
+  const found = resolved.repo;
+  const storage = resolved.storage;
 
   if (name === found.defaultBranch) {
     return c.json({ error: "Cannot delete the default branch" }, 400);
   }
 
-  const storage = new GitR2Storage(bucket, orgId, slug);
   const sha = await storage.getRef(`refs/heads/${name}`);
   if (!sha) return c.json({ error: "Branch not found" }, 404);
 
   await storage.deleteRef(`refs/heads/${name}`);
   return c.json({ deleted: true, name });
-});
+};
+branches.delete("/:slug/branches/:name", apiKeyAuth, deleteBranchHandler);
+branches.delete("/:namespace/:slug/branches/:name", apiKeyAuth, deleteBranchHandler);
 
 async function getTreeSha(storage: GitR2Storage, commitSha: string): Promise<string | null> {
   const raw = await storage.getObject(commitSha);
@@ -188,18 +203,22 @@ async function getTreeSha(storage: GitR2Storage, commitSha: string): Promise<str
 }
 
 // POST /v1/repos/:slug/branches/:name/merge
-branches.post("/:slug/branches/:name/merge", apiKeyAuth, async (c) => {
+const mergeBranchHandler = async (c: any) => {
   const orgId = c.get("orgId");
   const db = c.get("db");
   const bucket = c.env.REPOS_BUCKET;
-  const { slug, name } = c.req.param();
+  const { slug, namespace } = extractRepoParams(c);
+  const name = c.req.param("name");
 
-  const [found] = await db
-    .select()
-    .from(repo)
-    .where(and(eq(repo.orgId, orgId), eq(repo.slug, slug)))
-    .limit(1);
-  if (!found) return c.json({ error: "Repository not found" }, 404);
+  const resolved = await resolveRepo(db, bucket, { orgId, slug, namespace });
+  if (!resolved) return c.json({ error: "Repository not found" }, 404);
+
+  if (!hasRepoAccess(c.get("apiKeyPermissions"), resolved.scopeKey, "write")) {
+    return c.json({ error: "Insufficient permissions" }, 403);
+  }
+
+  const found = resolved.repo;
+  const storage = resolved.storage;
 
   let body: {
     target?: string;
@@ -221,7 +240,6 @@ branches.post("/:slug/branches/:name/merge", apiKeyAuth, async (c) => {
     return c.json({ error: "Invalid strategy. Must be: fast-forward, merge-commit, or squash" }, 400);
   }
 
-  const storage = new GitR2Storage(bucket, orgId, slug);
   const sourceSha = await storage.getRef(`refs/heads/${name}`);
   if (!sourceSha) return c.json({ error: `Source branch '${name}' not found` }, 404);
 
@@ -382,6 +400,8 @@ branches.post("/:slug/branches/:name/merge", apiKeyAuth, async (c) => {
     console.error("Failed to merge:", error);
     return c.json({ error: "Failed to merge branch" }, 500);
   }
-});
+};
+branches.post("/:slug/branches/:name/merge", apiKeyAuth, mergeBranchHandler);
+branches.post("/:namespace/:slug/branches/:name/merge", apiKeyAuth, mergeBranchHandler);
 
 export { branches };

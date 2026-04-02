@@ -5,8 +5,10 @@
  */
 
 import { Hono } from "hono";
-import { eq, and } from "drizzle-orm";
 import { apiKeyAuth } from "../auth/middleware";
+import { hasRepoAccess } from "../auth/scopes";
+import { resolveRepo } from "../services/repo-resolver";
+import { extractRepoParams } from "./helpers";
 import { repo } from "../db/schema";
 import { GitR2Storage } from "../git/storage";
 import { parseGitObject, parseCommit } from "../git/objects";
@@ -36,11 +38,12 @@ async function getTreeSha(storage: GitR2Storage, commitSha: string): Promise<str
 }
 
 // GET /v1/repos/:slug/diff
-diff.get("/:slug/diff", apiKeyAuth, async (c) => {
+const diffHandler = async (c: any) => {
   const orgId = c.get("orgId");
   const db = c.get("db");
   const bucket = c.env.REPOS_BUCKET;
-  const { slug } = c.req.param();
+  const { slug, namespace } = extractRepoParams(c);
+
   const baseRef = c.req.query("base");
   const headRef = c.req.query("head");
 
@@ -48,14 +51,14 @@ diff.get("/:slug/diff", apiKeyAuth, async (c) => {
     return c.json({ error: "base and head query parameters are required" }, 400);
   }
 
-  const [found] = await db
-    .select()
-    .from(repo)
-    .where(and(eq(repo.orgId, orgId), eq(repo.slug, slug)))
-    .limit(1);
-  if (!found) return c.json({ error: "Repository not found" }, 404);
+  const resolved = await resolveRepo(db, bucket, { orgId, slug, namespace });
+  if (!resolved) return c.json({ error: "Repository not found" }, 404);
 
-  const storage = new GitR2Storage(bucket, orgId, slug);
+  if (!hasRepoAccess(c.get("apiKeyPermissions"), resolved.scopeKey, "read")) {
+    return c.json({ error: "Insufficient permissions" }, 403);
+  }
+
+  const storage = resolved.storage;
 
   const [baseSha, headSha] = await Promise.all([
     resolveRef(storage, baseRef),
@@ -99,6 +102,8 @@ diff.get("/:slug/diff", apiKeyAuth, async (c) => {
     console.error("Failed to compute diff:", error);
     return c.json({ error: "Failed to compute diff" }, 500);
   }
-});
+};
+diff.get("/:slug/diff", apiKeyAuth, diffHandler);
+diff.get("/:namespace/:slug/diff", apiKeyAuth, diffHandler);
 
 export { diff };

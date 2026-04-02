@@ -13,7 +13,9 @@
 import { Hono } from "hono";
 import { eq, and } from "drizzle-orm";
 import { repo } from "../db/schema";
-import { parseBasicAuthKey, verifyApiKeyForGit } from "../auth/middleware";
+import { parseBasicAuthKey, verifyCredentialForGit } from "../auth/middleware";
+import { hasRepoAccess } from "../auth/scopes";
+import { resolveRepo } from "../services/repo-resolver";
 import { GitR2Storage } from "../git/storage";
 import {
   encodePktLine,
@@ -64,59 +66,42 @@ async function authenticateCDGit(c: any, requireAuth: boolean): Promise<CDGitAut
   const bucket = c.env.REPOS_BUCKET;
   const orgId = c.get("orgId");
 
+  const namespace = c.req.param("namespace") ?? null;
   let repoSlug = c.req.param("repo");
   if (!repoSlug) return c.text("Invalid path", 400);
   if (repoSlug.endsWith(".git")) repoSlug = repoSlug.slice(0, -4);
 
-  // For writes, always require API key
-  if (requireAuth) {
-    const apiKeyValue = parseBasicAuthKey(c.req.header("Authorization"));
-    if (!apiKeyValue) {
-      return c.text("", 401, { "WWW-Authenticate": 'Basic realm="CoreGit"' });
-    }
-    const authResult = await verifyApiKeyForGit(db, apiKeyValue);
+  const requiredAction = requireAuth ? "write" : "read";
+
+  // Try credential auth (API key or scoped token)
+  const credentialValue = parseBasicAuthKey(c.req.header("Authorization"));
+  if (credentialValue) {
+    const authResult = await verifyCredentialForGit(db, credentialValue);
     if (!authResult || authResult.orgId !== orgId) {
       return c.text("", 401, { "WWW-Authenticate": 'Basic realm="CoreGit"' });
     }
-  }
-
-  // For reads without auth, check repo is public
-  if (!requireAuth) {
-    const apiKeyValue = parseBasicAuthKey(c.req.header("Authorization"));
-    if (apiKeyValue) {
-      const authResult = await verifyApiKeyForGit(db, apiKeyValue);
-      if (!authResult || authResult.orgId !== orgId) {
-        return c.text("", 401, { "WWW-Authenticate": 'Basic realm="CoreGit"' });
-      }
-      // Auth passed — can access any repo in this org
-    } else {
-      // No auth — only public repos
-      const [found] = await db
-        .select()
-        .from(repo)
-        .where(and(eq(repo.orgId, orgId), eq(repo.slug, repoSlug)))
-        .limit(1);
-      if (!found || found.visibility !== "public") {
-        return c.text("", 401, { "WWW-Authenticate": 'Basic realm="CoreGit"' });
-      }
-      return { orgId, repoSlug, storage: new GitR2Storage(bucket, orgId, repoSlug), defaultBranch: found.defaultBranch };
+    const resolved = await resolveRepo(db, bucket, { orgId, slug: repoSlug, namespace });
+    if (!resolved) return c.text("Repository not found", 404);
+    if (!hasRepoAccess(authResult.scopes, resolved.scopeKey, requiredAction)) {
+      return c.text(`Token does not have ${requiredAction} access to this repository`, 403);
     }
+    return { orgId, repoSlug, storage: resolved.storage, defaultBranch: resolved.repo.defaultBranch };
+  } else if (requireAuth) {
+    return c.text("", 401, { "WWW-Authenticate": 'Basic realm="CoreGit"' });
+  } else {
+    // No auth — only public repos
+    const resolved = await resolveRepo(db, bucket, { orgId, slug: repoSlug, namespace });
+    if (!resolved || resolved.repo.visibility !== "public") {
+      return c.text("", 401, { "WWW-Authenticate": 'Basic realm="CoreGit"' });
+    }
+    return { orgId, repoSlug, storage: resolved.storage, defaultBranch: resolved.repo.defaultBranch };
   }
-
-  const [found] = await db
-    .select()
-    .from(repo)
-    .where(and(eq(repo.orgId, orgId), eq(repo.slug, repoSlug)))
-    .limit(1);
-  if (!found) return c.text("Repository not found", 404);
-
-  return { orgId, repoSlug, storage: new GitR2Storage(bucket, orgId, repoSlug), defaultBranch: found.defaultBranch };
 }
 
 // ── Routes ──
 
-// GET /:repo/info/refs
-customDomainGit.get("/:repo/info/refs", async (c) => {
+// GET /:repo/info/refs  and  GET /:namespace/:repo/info/refs
+const cdInfoRefsHandler = async (c: any) => {
   if (!c.get("customDomain")) return c.notFound();
 
   const service = c.req.query("service");
@@ -155,10 +140,12 @@ customDomainGit.get("/:repo/info/refs", async (c) => {
       "Cache-Control": "no-cache",
     },
   });
-});
+};
+customDomainGit.get("/:repo/info/refs", cdInfoRefsHandler);
+customDomainGit.get("/:namespace/:repo/info/refs", cdInfoRefsHandler);
 
 // POST /:repo/git-upload-pack
-customDomainGit.post("/:repo/git-upload-pack", async (c) => {
+const cdUploadPackHandler = async (c: any) => {
   if (!c.get("customDomain")) return c.notFound();
 
   const auth = await authenticateCDGit(c, false);
@@ -264,10 +251,12 @@ customDomainGit.post("/:repo/git-upload-pack", async (c) => {
   return new Response(finalResponse, {
     headers: { "Content-Type": "application/x-git-upload-pack-result" },
   });
-});
+};
+customDomainGit.post("/:repo/git-upload-pack", cdUploadPackHandler);
+customDomainGit.post("/:namespace/:repo/git-upload-pack", cdUploadPackHandler);
 
 // POST /:repo/git-receive-pack
-customDomainGit.post("/:repo/git-receive-pack", async (c) => {
+const cdReceivePackHandler = async (c: any) => {
   if (!c.get("customDomain")) return c.notFound();
 
   const auth = await authenticateCDGit(c, true);
@@ -400,6 +389,8 @@ customDomainGit.post("/:repo/git-receive-pack", async (c) => {
   return new Response(responseBytes, {
     headers: { "Content-Type": "application/x-git-receive-pack-result" },
   });
-});
+};
+customDomainGit.post("/:repo/git-receive-pack", cdReceivePackHandler);
+customDomainGit.post("/:namespace/:repo/git-receive-pack", cdReceivePackHandler);
 
 export { customDomainGit };

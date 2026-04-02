@@ -8,6 +8,7 @@
 import { Hono } from "hono";
 import { sql } from "drizzle-orm";
 import { apiKeyAuth } from "../auth/middleware";
+import { isMasterKey } from "../auth/scopes";
 import { getUsageSummary } from "../services/usage";
 import type { Env, Variables } from "../types";
 
@@ -15,6 +16,10 @@ const usage = new Hono<{ Bindings: Env; Variables: Variables }>();
 
 // GET /v1/usage
 usage.get("/", apiKeyAuth, async (c) => {
+  if (!isMasterKey(c.get("apiKeyPermissions"))) {
+    return c.json({ error: "Only master API keys can perform this action" }, 403);
+  }
+
   const orgId = c.get("orgId");
   const db = c.get("db");
 
@@ -47,6 +52,10 @@ usage.get("/", apiKeyAuth, async (c) => {
 
 // GET /v1/usage/details
 usage.get("/details", apiKeyAuth, async (c) => {
+  if (!isMasterKey(c.get("apiKeyPermissions"))) {
+    return c.json({ error: "Only master API keys can perform this action" }, 403);
+  }
+
   const orgId = c.get("orgId");
   const db = c.get("db");
   const limit = Math.min(parseInt(c.req.query("limit") || "100", 10), 500);

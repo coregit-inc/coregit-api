@@ -43,6 +43,7 @@ import { git } from "./routes/git";
 import { customDomainGit } from "./routes/custom-domain-git";
 import { workspace } from "./routes/workspace";
 import { sync } from "./routes/sync";
+import { tokens } from "./routes/tokens";
 import type { Env, Variables } from "./types";
 
 const app = new Hono<{ Bindings: Env; Variables: Variables }>();
@@ -196,6 +197,19 @@ app.use("/:org/:repo/*", async (c, next) => {
   await next();
 });
 
+// DB middleware for namespaced git routes: /:org/:namespace/:repo.git/*
+app.use("/:org/:namespace/:repo/*", async (c, next) => {
+  const orgParam = c.req.param("org");
+  if (orgParam === "v1") return next();
+  const repoParam = c.req.param("repo");
+  if (!repoParam?.endsWith(".git") && !repoParam?.includes(".git/")) return next();
+  if (!c.get("db")) {
+    if (!c.env.DATABASE_URL) return c.text("Database not configured", 500);
+    c.set("db", createDb(c.env.DATABASE_URL));
+  }
+  await next();
+});
+
 // ── Custom domain git routes (/:repo.git/* — no org prefix) ──
 
 app.route("/", customDomainGit);
@@ -213,6 +227,7 @@ app.route("/v1/repos", refs);
 app.route("/v1/repos", snapshots);
 app.route("/v1/repos", workspace);
 app.route("/v1/repos", sync);
+app.route("/v1", tokens);
 app.route("/v1/usage", usage);
 
 // ── Public read-only routes (no auth required) ──

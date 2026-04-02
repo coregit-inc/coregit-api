@@ -7,8 +7,10 @@
  */
 
 import { Hono } from "hono";
-import { eq, and } from "drizzle-orm";
 import { apiKeyAuth } from "../auth/middleware";
+import { hasRepoAccess } from "../auth/scopes";
+import { resolveRepo } from "../services/repo-resolver";
+import { extractRepoParams } from "./helpers";
 import { repo } from "../db/schema";
 import { GitR2Storage } from "../git/storage";
 import { parseGitObject, parseCommit } from "../git/objects";
@@ -29,11 +31,11 @@ export function parseAuthorString(author: string): { name: string; email: string
 }
 
 // POST /v1/repos/:slug/commits
-commits.post("/:slug/commits", apiKeyAuth, async (c) => {
+const createCommitHandler = async (c: any) => {
   const orgId = c.get("orgId");
   const db = c.get("db");
   const bucket = c.env.REPOS_BUCKET;
-  const { slug } = c.req.param();
+  const { slug, namespace } = extractRepoParams(c);
 
   // Free tier: check API call limit
   const apiLimit = await checkFreeLimits(db, orgId, c.get("orgTier"), "api_call");
@@ -46,12 +48,15 @@ commits.post("/:slug/commits", apiKeyAuth, async (c) => {
     }, 429);
   }
 
-  const [found] = await db
-    .select()
-    .from(repo)
-    .where(and(eq(repo.orgId, orgId), eq(repo.slug, slug)))
-    .limit(1);
-  if (!found) return c.json({ error: "Repository not found" }, 404);
+  const resolved = await resolveRepo(db, bucket, { orgId, slug, namespace });
+  if (!resolved) return c.json({ error: "Repository not found" }, 404);
+
+  if (!hasRepoAccess(c.get("apiKeyPermissions"), resolved.scopeKey, "write")) {
+    return c.json({ error: "Insufficient permissions" }, 403);
+  }
+
+  const found = resolved.repo;
+  const storage = resolved.storage;
 
   let body: {
     branch: string;
@@ -97,8 +102,6 @@ commits.post("/:slug/commits", apiKeyAuth, async (c) => {
     }
   }
 
-  const storage = new GitR2Storage(bucket, orgId, slug);
-
   try {
     const result = await createApiCommit(storage, branch, message, author, changes, parent_sha);
 
@@ -121,25 +124,30 @@ commits.post("/:slug/commits", apiKeyAuth, async (c) => {
     console.error("Failed to create commit:", error);
     return c.json({ error: "Failed to create commit" }, 500);
   }
-});
+};
+commits.post("/:slug/commits", apiKeyAuth, createCommitHandler);
+commits.post("/:namespace/:slug/commits", apiKeyAuth, createCommitHandler);
 
 // GET /v1/repos/:slug/commits
-commits.get("/:slug/commits", apiKeyAuth, async (c) => {
+const listCommitsHandler = async (c: any) => {
   const orgId = c.get("orgId");
   const db = c.get("db");
   const bucket = c.env.REPOS_BUCKET;
-  const { slug } = c.req.param();
+  const { slug, namespace } = extractRepoParams(c);
+
+  const resolved = await resolveRepo(db, bucket, { orgId, slug, namespace });
+  if (!resolved) return c.json({ error: "Repository not found" }, 404);
+
+  if (!hasRepoAccess(c.get("apiKeyPermissions"), resolved.scopeKey, "read")) {
+    return c.json({ error: "Insufficient permissions" }, 403);
+  }
+
+  const found = resolved.repo;
+  const storage = resolved.storage;
+
   const ref = c.req.query("ref") || c.req.query("branch");
   const limit = Math.min(parseInt(c.req.query("limit") || "20", 10), 100);
 
-  const [found] = await db
-    .select()
-    .from(repo)
-    .where(and(eq(repo.orgId, orgId), eq(repo.slug, slug)))
-    .limit(1);
-  if (!found) return c.json({ error: "Repository not found" }, 404);
-
-  const storage = new GitR2Storage(bucket, orgId, slug);
   const branchName = ref || found.defaultBranch;
   let commitSha = await storage.getRef(`refs/heads/${branchName}`);
 
@@ -183,23 +191,26 @@ commits.get("/:slug/commits", apiKeyAuth, async (c) => {
     console.error("Failed to list commits:", error);
     return c.json({ error: "Failed to list commits" }, 500);
   }
-});
+};
+commits.get("/:slug/commits", apiKeyAuth, listCommitsHandler);
+commits.get("/:namespace/:slug/commits", apiKeyAuth, listCommitsHandler);
 
 // GET /v1/repos/:slug/commits/:sha
-commits.get("/:slug/commits/:sha", apiKeyAuth, async (c) => {
+const getCommitHandler = async (c: any) => {
   const orgId = c.get("orgId");
   const db = c.get("db");
   const bucket = c.env.REPOS_BUCKET;
-  const { slug, sha } = c.req.param();
+  const { slug, namespace } = extractRepoParams(c);
+  const sha = c.req.param("sha");
 
-  const [found] = await db
-    .select()
-    .from(repo)
-    .where(and(eq(repo.orgId, orgId), eq(repo.slug, slug)))
-    .limit(1);
-  if (!found) return c.json({ error: "Repository not found" }, 404);
+  const resolved = await resolveRepo(db, bucket, { orgId, slug, namespace });
+  if (!resolved) return c.json({ error: "Repository not found" }, 404);
 
-  const storage = new GitR2Storage(bucket, orgId, slug);
+  if (!hasRepoAccess(c.get("apiKeyPermissions"), resolved.scopeKey, "read")) {
+    return c.json({ error: "Insufficient permissions" }, 403);
+  }
+
+  const storage = resolved.storage;
   const raw = await storage.getObject(sha);
   if (!raw) return c.json({ error: "Commit not found" }, 404);
 
@@ -218,6 +229,8 @@ commits.get("/:slug/commits/:sha", apiKeyAuth, async (c) => {
     timestamp: authorInfo.timestamp,
     parents: commit.parents,
   });
-});
+};
+commits.get("/:slug/commits/:sha", apiKeyAuth, getCommitHandler);
+commits.get("/:namespace/:slug/commits/:sha", apiKeyAuth, getCommitHandler);
 
 export { commits };

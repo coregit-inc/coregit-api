@@ -2,6 +2,9 @@ import { Hono } from "hono";
 import { and, eq } from "drizzle-orm";
 import { nanoid } from "nanoid";
 import { apiKeyAuth } from "../auth/middleware";
+import { isMasterKey } from "../auth/scopes";
+import { resolveRepo } from "../services/repo-resolver";
+import { extractRepoParams } from "./helpers";
 import type { Env, Variables } from "../types";
 import { repo, repoSync, repoSyncRun, externalConnection } from "../db/schema";
 import { GitR2Storage } from "../git/storage";
@@ -25,15 +28,20 @@ function parseGithubRemote(remote: string): { owner: string; repo: string } {
   return { owner, repo: name };
 }
 
-syncRoutes.post("/:slug/sync", apiKeyAuth, async (c) => {
+const syncHandler = async (c: any) => {
   const orgId = c.get("orgId");
   const db = c.get("db");
-  const { slug } = c.req.param();
+  const bucket = c.env.REPOS_BUCKET;
+  const { slug, namespace } = extractRepoParams(c);
+
+  if (!isMasterKey(c.get("apiKeyPermissions"))) {
+    return c.json({ error: "Only master API keys can perform this action" }, 403);
+  }
 
   let body: SyncRequestBody;
   let runId: string | null = null;
   try {
-    body = await c.req.json<SyncRequestBody>();
+    body = await c.req.json();
   } catch {
     return c.json({ error: "Invalid JSON body" }, 400);
   }
@@ -43,15 +51,11 @@ syncRoutes.post("/:slug/sync", apiKeyAuth, async (c) => {
   }
 
   try {
-    const [repoRecord] = await db
-      .select()
-      .from(repo)
-      .where(and(eq(repo.orgId, orgId), eq(repo.slug, slug)))
-      .limit(1);
+    const resolved = await resolveRepo(db, bucket, { orgId, slug, namespace });
+    if (!resolved) return c.json({ error: "Repository not found" }, 404);
 
-    if (!repoRecord) {
-      return c.json({ error: "Repository not found" }, 404);
-    }
+    const repoRecord = resolved.repo;
+    const storage = resolved.storage;
 
     const [syncConfig] = await db
       .select()
@@ -74,7 +78,6 @@ syncRoutes.post("/:slug/sync", apiKeyAuth, async (c) => {
     }
 
     const branch = body.branch || syncConfig.defaultBranch || repoRecord.defaultBranch;
-    const storage = new GitR2Storage(c.env.REPOS_BUCKET, orgId, slug);
     const token = await decryptSecret(c.env.SYNC_ENCRYPTION_KEY, connection.encryptedAccessToken);
     const author: CommitAuthor = { name: "CoreGit Sync", email: "sync@coregit.dev" };
 
@@ -151,13 +154,8 @@ syncRoutes.post("/:slug/sync", apiKeyAuth, async (c) => {
     }
     return c.json({ error: error instanceof Error ? error.message : "Sync failed" }, 500);
   }
-});
+};
+syncRoutes.post("/:slug/sync", apiKeyAuth, syncHandler);
+syncRoutes.post("/:namespace/:slug/sync", apiKeyAuth, syncHandler);
 
 export { syncRoutes as sync };
-
-
-
-
-
-
-

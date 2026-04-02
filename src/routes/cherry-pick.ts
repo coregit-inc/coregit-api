@@ -8,8 +8,10 @@
  */
 
 import { Hono } from "hono";
-import { eq, and } from "drizzle-orm";
 import { apiKeyAuth } from "../auth/middleware";
+import { hasRepoAccess } from "../auth/scopes";
+import { resolveRepo } from "../services/repo-resolver";
+import { extractRepoParams } from "./helpers";
 import { repo } from "../db/schema";
 import { GitR2Storage } from "../git/storage";
 import {
@@ -38,11 +40,11 @@ async function resolveRef(storage: GitR2Storage, ref: string): Promise<string | 
 }
 
 // POST /v1/repos/:slug/cherry-pick
-cherryPick.post("/:slug/cherry-pick", apiKeyAuth, async (c) => {
+const cherryPickHandler = async (c: any) => {
   const orgId = c.get("orgId");
   const db = c.get("db");
   const bucket = c.env.REPOS_BUCKET;
-  const { slug } = c.req.param();
+  const { slug, namespace } = extractRepoParams(c);
 
   // Free tier check
   const apiLimit = await checkFreeLimits(db, orgId, c.get("orgTier"), "api_call");
@@ -55,12 +57,15 @@ cherryPick.post("/:slug/cherry-pick", apiKeyAuth, async (c) => {
     }, 429);
   }
 
-  const [found] = await db
-    .select()
-    .from(repo)
-    .where(and(eq(repo.orgId, orgId), eq(repo.slug, slug)))
-    .limit(1);
-  if (!found) return c.json({ error: "Repository not found" }, 404);
+  const resolved = await resolveRepo(db, bucket, { orgId, slug, namespace });
+  if (!resolved) return c.json({ error: "Repository not found" }, 404);
+
+  if (!hasRepoAccess(c.get("apiKeyPermissions"), resolved.scopeKey, "write")) {
+    return c.json({ error: "Insufficient permissions" }, 403);
+  }
+
+  const found = resolved.repo;
+  const storage = resolved.storage;
 
   let body: {
     base: string;
@@ -80,8 +85,6 @@ cherryPick.post("/:slug/cherry-pick", apiKeyAuth, async (c) => {
   if (!base || !head || !onto) {
     return c.json({ error: "base, head, and onto are required" }, 400);
   }
-
-  const storage = new GitR2Storage(bucket, orgId, slug);
 
   // Resolve all refs in parallel
   const [baseSha, headSha, ontoSha] = await Promise.all([
@@ -165,6 +168,8 @@ cherryPick.post("/:slug/cherry-pick", apiKeyAuth, async (c) => {
     console.error("Failed to cherry-pick:", error);
     return c.json({ error: "Failed to cherry-pick commits" }, 500);
   }
-});
+};
+cherryPick.post("/:slug/cherry-pick", apiKeyAuth, cherryPickHandler);
+cherryPick.post("/:namespace/:slug/cherry-pick", apiKeyAuth, cherryPickHandler);
 
 export { cherryPick };

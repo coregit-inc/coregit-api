@@ -23,6 +23,7 @@ export const repo = pgTable(
   {
     id: text("id").primaryKey(),
     orgId: text("org_id").notNull(),           // references Better Auth organization.id
+    namespace: text("namespace"),               // optional user namespace (e.g. "alice")
     slug: text("slug").notNull(),
     description: text("description"),
     defaultBranch: text("default_branch").notNull().default("main"),
@@ -35,7 +36,10 @@ export const repo = pgTable(
   },
   (table) => [
     index("repo_org_idx").on(table.orgId),
-    uniqueIndex("repo_org_slug_idx").on(table.orgId, table.slug),
+    index("repo_namespace_idx").on(table.orgId, table.namespace),
+    // Uniqueness enforced via partial indexes in migration SQL:
+    //   (org_id, slug) WHERE namespace IS NULL
+    //   (org_id, namespace, slug) WHERE namespace IS NOT NULL
   ]
 );
 
@@ -103,6 +107,31 @@ export const webhook = pgTable(
 
 export type Webhook = typeof webhook.$inferSelect;
 export type NewWebhook = typeof webhook.$inferInsert;
+
+// Scoped tokens (short-lived, repo-scoped credentials for end-users)
+export const scopedToken = pgTable(
+  "scoped_token",
+  {
+    id: text("id").primaryKey(),
+    orgId: text("org_id").notNull(),
+    createdBy: text("created_by").notNull(),       // api_key id that minted this token
+    name: text("name").notNull(),
+    keyPrefix: text("key_prefix").notNull(),        // first 12 chars for display
+    keyHash: text("key_hash").notNull().unique(),   // SHA-256
+    scopes: jsonb("scopes").notNull(),              // {"repos:slug": ["read"]}
+    expiresAt: timestamp("expires_at").notNull(),
+    revokedAt: timestamp("revoked_at"),
+    lastUsed: timestamp("last_used"),
+    createdAt: timestamp("created_at").defaultNow().notNull(),
+  },
+  (table) => [
+    index("scoped_token_org_idx").on(table.orgId),
+    index("scoped_token_hash_idx").on(table.keyHash),
+  ]
+);
+
+export type ScopedToken = typeof scopedToken.$inferSelect;
+export type NewScopedToken = typeof scopedToken.$inferInsert;
 
 // ── Custom Domain ──
 

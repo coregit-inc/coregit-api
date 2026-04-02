@@ -14,7 +14,9 @@
 import { Hono } from "hono";
 import { eq, and } from "drizzle-orm";
 import { repo, organization } from "../db/schema";
-import { parseBasicAuthKey, verifyApiKeyForGit } from "../auth/middleware";
+import { parseBasicAuthKey, verifyCredentialForGit } from "../auth/middleware";
+import { hasRepoAccess, type Scopes } from "../auth/scopes";
+import { resolveRepo } from "../services/repo-resolver";
 import { GitR2Storage } from "../git/storage";
 import {
   encodePktLine,
@@ -65,69 +67,71 @@ interface GitAuthResult {
   defaultBranch: string;
 }
 
+/** Extract repo slug and optional namespace from git route params. */
+function extractGitRepoParams(c: any): { orgParam: string; repoSlug: string; namespace: string | null } {
+  const orgParam = c.req.param("org") || "";
+  const namespace = c.req.param("namespace") ?? null;
+  let repoSlug = c.req.param("repo") || "";
+  if (repoSlug.endsWith(".git")) repoSlug = repoSlug.slice(0, -4);
+  return { orgParam, repoSlug, namespace };
+}
+
 /**
- * Strict auth — requires valid API key. Used for write operations (receive-pack).
+ * Strict auth — requires valid credential with write access.
+ * Used for write operations (receive-pack / push).
  */
 async function authenticateGit(c: any): Promise<GitAuthResult | Response> {
   const db = c.get("db");
   const bucket = c.env.REPOS_BUCKET;
-
-  const orgParam = c.req.param("org");
-  let repoSlug = c.req.param("repo");
+  const { orgParam, repoSlug, namespace } = extractGitRepoParams(c);
   if (!orgParam || !repoSlug) return c.text("Invalid path", 400);
-  if (repoSlug.endsWith(".git")) repoSlug = repoSlug.slice(0, -4);
 
-  // Verify API key
-  const apiKeyValue = parseBasicAuthKey(c.req.header("Authorization"));
-  if (!apiKeyValue) {
+  const credentialValue = parseBasicAuthKey(c.req.header("Authorization"));
+  if (!credentialValue) {
     return c.text("", 401, { "WWW-Authenticate": 'Basic realm="CoreGit"' });
   }
 
-  const authResult = await verifyApiKeyForGit(db, apiKeyValue);
+  const authResult = await verifyCredentialForGit(db, credentialValue);
   if (!authResult) {
     return c.text("", 401, { "WWW-Authenticate": 'Basic realm="CoreGit"' });
   }
 
   const orgId = authResult.orgId;
+  const resolved = await resolveRepo(db, bucket, { orgId, slug: repoSlug, namespace });
+  if (!resolved) return c.text("Repository not found", 404);
 
-  const [found] = await db
-    .select()
-    .from(repo)
-    .where(and(eq(repo.orgId, orgId), eq(repo.slug, repoSlug)))
-    .limit(1);
+  if (!hasRepoAccess(authResult.scopes, resolved.scopeKey, "write")) {
+    return c.text("Token does not have write access to this repository", 403);
+  }
 
-  if (!found) return c.text("Repository not found", 404);
-
-  const storage = new GitR2Storage(bucket, orgId, repoSlug);
-  return { orgId, repoSlug, storage, defaultBranch: found.defaultBranch };
+  return { orgId, repoSlug, storage: resolved.storage, defaultBranch: resolved.repo.defaultBranch };
 }
 
 /**
  * Read-only auth — allows unauthenticated access to public repos.
+ * For authenticated requests, checks read scope.
  * Used for clone/fetch (upload-pack).
  */
 async function authenticateGitReadOnly(c: any): Promise<GitAuthResult | Response> {
   const db = c.get("db");
   const bucket = c.env.REPOS_BUCKET;
-
-  const orgParam = c.req.param("org");
-  let repoSlug = c.req.param("repo");
+  const { orgParam, repoSlug, namespace } = extractGitRepoParams(c);
   if (!orgParam || !repoSlug) return c.text("Invalid path", 400);
-  if (repoSlug.endsWith(".git")) repoSlug = repoSlug.slice(0, -4);
 
-  // Try API key auth first
-  const apiKeyValue = parseBasicAuthKey(c.req.header("Authorization"));
-  if (apiKeyValue) {
-    const authResult = await verifyApiKeyForGit(db, apiKeyValue);
+  // Try credential auth first (API key or scoped token)
+  const credentialValue = parseBasicAuthKey(c.req.header("Authorization"));
+  if (credentialValue) {
+    const authResult = await verifyCredentialForGit(db, credentialValue);
     if (authResult) {
       const orgId = authResult.orgId;
-      const [found] = await db
-        .select()
-        .from(repo)
-        .where(and(eq(repo.orgId, orgId), eq(repo.slug, repoSlug)))
-        .limit(1);
-      if (!found) return c.text("Repository not found", 404);
-      return { orgId, repoSlug, storage: new GitR2Storage(bucket, orgId, repoSlug), defaultBranch: found.defaultBranch };
+      const resolved = await resolveRepo(db, bucket, { orgId, slug: repoSlug, namespace });
+      if (!resolved) return c.text("Repository not found", 404);
+
+      if (!hasRepoAccess(authResult.scopes, resolved.scopeKey, "read")) {
+        return c.text("Token does not have read access to this repository", 403);
+      }
+
+      return { orgId, repoSlug, storage: resolved.storage, defaultBranch: resolved.repo.defaultBranch };
     }
   }
 
@@ -142,23 +146,18 @@ async function authenticateGitReadOnly(c: any): Promise<GitAuthResult | Response
     return c.text("", 401, { "WWW-Authenticate": 'Basic realm="CoreGit"' });
   }
 
-  const [found] = await db
-    .select()
-    .from(repo)
-    .where(and(eq(repo.orgId, org.id), eq(repo.slug, repoSlug)))
-    .limit(1);
-
-  if (!found || found.visibility !== "public") {
+  const resolved = await resolveRepo(db, bucket, { orgId: org.id, slug: repoSlug, namespace });
+  if (!resolved || resolved.repo.visibility !== "public") {
     return c.text("", 401, { "WWW-Authenticate": 'Basic realm="CoreGit"' });
   }
 
-  return { orgId: org.id, repoSlug, storage: new GitR2Storage(bucket, org.id, repoSlug), defaultBranch: found.defaultBranch };
+  return { orgId: org.id, repoSlug, storage: resolved.storage, defaultBranch: resolved.repo.defaultBranch };
 }
 
 // ── Routes ──
 
-// GET /:org/:repo.git/info/refs
-git.get("/:org/:repo/info/refs", async (c) => {
+// GET /:org/:repo.git/info/refs  and  GET /:org/:namespace/:repo.git/info/refs
+const infoRefsHandler = async (c: any) => {
   const service = c.req.query("service");
   if (!service || (service !== "git-upload-pack" && service !== "git-receive-pack")) {
     return c.text("Invalid or missing service parameter", 400);
@@ -199,10 +198,12 @@ git.get("/:org/:repo/info/refs", async (c) => {
       "Cache-Control": "no-cache",
     },
   });
-});
+};
+git.get("/:org/:repo/info/refs", infoRefsHandler);
+git.get("/:org/:namespace/:repo/info/refs", infoRefsHandler);
 
 // POST /:org/:repo.git/git-upload-pack
-git.post("/:org/:repo/git-upload-pack", async (c) => {
+const uploadPackHandler = async (c: any) => {
   // Clone/fetch — allow public access
   const auth = await authenticateGitReadOnly(c);
   if (auth instanceof Response) return auth;
@@ -317,10 +318,12 @@ git.post("/:org/:repo/git-upload-pack", async (c) => {
   return new Response(finalResponse, {
     headers: { "Content-Type": "application/x-git-upload-pack-result" },
   });
-});
+};
+git.post("/:org/:repo/git-upload-pack", uploadPackHandler);
+git.post("/:org/:namespace/:repo/git-upload-pack", uploadPackHandler);
 
 // POST /:org/:repo.git/git-receive-pack
-git.post("/:org/:repo/git-receive-pack", async (c) => {
+const receivePackHandler = async (c: any) => {
   // Push — always requires auth
   const auth = await authenticateGit(c);
   if (auth instanceof Response) return auth;
@@ -473,6 +476,8 @@ git.post("/:org/:repo/git-receive-pack", async (c) => {
   return new Response(responseBytes, {
     headers: { "Content-Type": "application/x-git-receive-pack-result" },
   });
-});
+};
+git.post("/:org/:repo/git-receive-pack", receivePackHandler);
+git.post("/:org/:namespace/:repo/git-receive-pack", receivePackHandler);
 
 export { git };
