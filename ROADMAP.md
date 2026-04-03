@@ -28,6 +28,11 @@
 - [x] **Line-level diff** — unified patch format (`?patch=true&context=3`), Myers algorithm
 - [x] **API key expiration UI** — в coregit-app (Select expiry при создании, Status badge, Last used)
 
+## P4 — AI-Native Features (конкурентное преимущество)
+
+- [x] **Cross-repo code search** — `POST /v1/search` (regex, path globs, context lines, 20s deadline)
+- [x] **Multi-repo workspace** — `POST /v1/workspace/exec` (mount N repos at /{slug}/, exec + commit per-repo)
+
 ## Не в скоупе (GitHub-only)
 
-- PR/MR flow, Issues, CI/CD, Code Search, SSH, GraphQL — отложено
+- PR/MR flow, Issues, CI/CD, SSH, GraphQL — отложено

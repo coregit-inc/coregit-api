@@ -14,6 +14,8 @@
  *   /v1/repos/:slug/snapshots    — Named restore points
  *   /v1/repos/:slug/exec         — Workspace: execute shell commands against repo
  *   /v1/repos/:slug/sync         — Sync from external providers (GitHub, GitLab)
+ *   /v1/search                   — Cross-repo code search
+ *   /v1/workspace/exec           — Multi-repo workspace (mount & exec across repos)
  *   /v1/usage                    — Usage tracking
  *   /:org/:repo.git/*            — Git Smart HTTP (clone/push/pull)
  *   /:repo.git/*                 — Git Smart HTTP via custom domain
@@ -41,10 +43,11 @@ import { usage } from "./routes/usage";
 import { publicRoutes } from "./routes/public";
 import { git } from "./routes/git";
 import { customDomainGit } from "./routes/custom-domain-git";
-import { workspace } from "./routes/workspace";
+import { workspace, multiWorkspace } from "./routes/workspace";
 import { sync } from "./routes/sync";
 import { tokens } from "./routes/tokens";
 import { webhooks } from "./routes/webhooks";
+import { search } from "./routes/search";
 import type { Env, Variables } from "./types";
 
 const app = new Hono<{ Bindings: Env; Variables: Variables }>();
@@ -246,6 +249,8 @@ app.route("/v1/repos", sync);
 app.route("/v1/repos", repos);
 app.route("/v1", tokens);
 app.route("/v1", webhooks);
+app.route("/v1", search);
+app.route("/v1", multiWorkspace);
 app.route("/v1/usage", usage);
 
 // ── Public read-only routes (no auth required) ──
