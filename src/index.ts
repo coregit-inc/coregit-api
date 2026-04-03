@@ -171,7 +171,18 @@ app.get("/", (c) => {
   return c.json({ name: "coregit-api", version: "0.1.0", status: "ok" });
 });
 
-app.get("/health", (c) => c.json({ status: "ok" }));
+app.get("/health", async (c) => {
+  if (!c.env.DATABASE_URL) {
+    return c.json({ status: "degraded", db: "not_configured" }, 503);
+  }
+  try {
+    const db = createDb(c.env.DATABASE_URL);
+    await db.execute(sql`SELECT 1`);
+    return c.json({ status: "ok", db: "ok" });
+  } catch {
+    return c.json({ status: "degraded", db: "unreachable" }, 503);
+  }
+});
 
 // ── DB middleware for API routes ──
 

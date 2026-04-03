@@ -12,7 +12,8 @@ import { extractRepoParams } from "./helpers";
 import { repo } from "../db/schema";
 import { GitR2Storage } from "../git/storage";
 import { parseGitObject, parseCommit } from "../git/objects";
-import { flattenTree, diffFlattenedTrees, computeDiffStatsFromDiffs } from "../git/cherry-pick";
+import { flattenTree, diffFlattenedTrees, computeDiffStatsFromDiffs, type FileDiff } from "../git/cherry-pick";
+import { unifiedFileDiff, isBinaryString } from "../services/unified-diff";
 import type { Env, Variables } from "../types";
 
 const diff = new Hono<{ Bindings: Env; Variables: Variables }>();
@@ -35,6 +36,59 @@ async function getTreeSha(storage: GitR2Storage, commitSha: string): Promise<str
   const obj = parseGitObject(raw);
   if (obj.type !== "commit") return null;
   return parseCommit(obj.content).tree;
+}
+
+/**
+ * Generate unified patch for a single file diff.
+ * Returns null for binary files.
+ */
+async function generatePatch(
+  storage: GitR2Storage,
+  fileDiff: FileDiff,
+  contextLines: number
+): Promise<string | null> {
+  const MAX_PATCH_SIZE = 1024 * 1024; // 1MB per file
+
+  async function readBlob(sha: string): Promise<{ content: Uint8Array; text: string | null }> {
+    const raw = await storage.getObject(sha);
+    if (!raw) return { content: new Uint8Array(0), text: "" };
+    const obj = parseGitObject(raw);
+    if (obj.type !== "blob") return { content: new Uint8Array(0), text: "" };
+    if (obj.content.byteLength > MAX_PATCH_SIZE) return { content: obj.content, text: null };
+    if (isBinaryString(obj.content)) return { content: obj.content, text: null };
+    return { content: obj.content, text: new TextDecoder().decode(obj.content) };
+  }
+
+  let oldText: string | null = null;
+  let newText: string | null = null;
+
+  if (fileDiff.type === "add") {
+    if (!fileDiff.newSha) return null;
+    const blob = await readBlob(fileDiff.newSha);
+    if (blob.text === null) return "Binary file added";
+    oldText = "";
+    newText = blob.text;
+  } else if (fileDiff.type === "delete") {
+    if (!fileDiff.oldSha) return null;
+    const blob = await readBlob(fileDiff.oldSha);
+    if (blob.text === null) return "Binary file deleted";
+    oldText = blob.text;
+    newText = "";
+  } else {
+    // modify
+    if (!fileDiff.oldSha || !fileDiff.newSha) return null;
+    const [oldBlob, newBlob] = await Promise.all([
+      readBlob(fileDiff.oldSha),
+      readBlob(fileDiff.newSha),
+    ]);
+    if (oldBlob.text === null || newBlob.text === null) return "Binary files differ";
+    oldText = oldBlob.text;
+    newText = newBlob.text;
+  }
+
+  const oldPath = fileDiff.type === "add" ? "/dev/null" : fileDiff.path;
+  const newPath = fileDiff.type === "delete" ? "/dev/null" : fileDiff.path;
+  return unifiedFileDiff(oldPath, newPath, oldText, newText, contextLines) || null;
 }
 
 // GET /v1/repos/:slug/diff
@@ -67,6 +121,9 @@ const diffHandler = async (c: any) => {
   if (!baseSha) return c.json({ error: `Base ref '${baseRef}' not found` }, 404);
   if (!headSha) return c.json({ error: `Head ref '${headRef}' not found` }, 404);
 
+  const includePatch = c.req.query("patch") === "true";
+  const contextLines = Math.min(parseInt(c.req.query("context") || "3", 10), 20);
+
   try {
     const [baseTreeSha, headTreeSha] = await Promise.all([
       getTreeSha(storage, baseSha),
@@ -83,11 +140,20 @@ const diffHandler = async (c: any) => {
     const diffs = diffFlattenedTrees(baseFlat, headFlat);
     const stats = await computeDiffStatsFromDiffs(storage, diffs);
 
-    const fileList = diffs.map((d) => ({
-      path: d.path,
-      status: d.type === "add" ? "added" : d.type === "delete" ? "removed" : "modified",
-      old_sha: d.oldSha || null,
-      new_sha: d.newSha || null,
+    // Build file list, optionally with unified patch
+    const fileList = await Promise.all(diffs.map(async (d) => {
+      const file: Record<string, unknown> = {
+        path: d.path,
+        status: d.type === "add" ? "added" : d.type === "delete" ? "removed" : "modified",
+        old_sha: d.oldSha || null,
+        new_sha: d.newSha || null,
+      };
+
+      if (includePatch) {
+        file.patch = await generatePatch(storage, d, contextLines);
+      }
+
+      return file;
     }));
 
     return c.json({

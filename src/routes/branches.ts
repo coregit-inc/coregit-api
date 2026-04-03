@@ -117,6 +117,8 @@ const listBranchesHandler = async (c: any) => {
 
   const found = resolved.repo;
   const storage = resolved.storage;
+  const limit = Math.min(parseInt(c.req.query("limit") || "100", 10), 500);
+  const cursor = c.req.query("cursor"); // branch name to start after (alphabetical)
 
   try {
     const refs = await storage.listRefs();
@@ -130,7 +132,23 @@ const listBranchesHandler = async (c: any) => {
 
     branchList.sort((a, b) => a.name.localeCompare(b.name));
 
-    return c.json({ branches: branchList, default_branch: found.defaultBranch });
+    // Apply cursor: skip branches <= cursor name
+    let startIdx = 0;
+    if (cursor) {
+      startIdx = branchList.findIndex((b) => b.name > cursor);
+      if (startIdx === -1) startIdx = branchList.length;
+    }
+
+    const page = branchList.slice(startIdx, startIdx + limit);
+    const hasMore = startIdx + limit < branchList.length;
+    const nextCursor = hasMore ? page[page.length - 1].name : null;
+
+    return c.json({
+      branches: page,
+      default_branch: found.defaultBranch,
+      total: branchList.length,
+      next_cursor: nextCursor,
+    });
   } catch (error) {
     console.error("Failed to list branches:", error);
     return c.json({ error: "Failed to list branches" }, 500);

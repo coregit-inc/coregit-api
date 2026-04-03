@@ -59,21 +59,59 @@ usage.get("/details", apiKeyAuth, async (c) => {
   const orgId = c.get("orgId");
   const db = c.get("db");
   const limit = Math.min(parseInt(c.req.query("limit") || "100", 10), 500);
-  const offset = parseInt(c.req.query("offset") || "0", 10);
+  const cursor = c.req.query("cursor");
+
+  // Backward compat: offset still works when no cursor
+  const offset = cursor ? 0 : parseInt(c.req.query("offset") || "0", 10);
 
   try {
-    const result = await db.execute(sql`
-      SELECT id, event_type, quantity, metadata, recorded_at
-      FROM usage_event
-      WHERE org_id = ${orgId}
-      ORDER BY recorded_at DESC
-      LIMIT ${limit} OFFSET ${offset}
-    `);
+    let result;
+    if (cursor) {
+      // cursor = "recorded_at_iso|id" base64-encoded
+      const decoded = (() => {
+        try {
+          const raw = atob(cursor);
+          const pipe = raw.indexOf("|");
+          if (pipe === -1) return null;
+          const ts = raw.slice(0, pipe);
+          const id = raw.slice(pipe + 1);
+          if (!ts || !id) return null;
+          return { recordedAt: ts, id };
+        } catch { return null; }
+      })();
+      if (!decoded) {
+        return c.json({ error: "Invalid cursor", code: "VALIDATION_ERROR" }, 400);
+      }
+      result = await db.execute(sql`
+        SELECT id, event_type, quantity, metadata, recorded_at
+        FROM usage_event
+        WHERE org_id = ${orgId}
+          AND (recorded_at, id) < (${decoded.recordedAt}::timestamptz, ${decoded.id})
+        ORDER BY recorded_at DESC, id DESC
+        LIMIT ${limit + 1}
+      `);
+    } else {
+      result = await db.execute(sql`
+        SELECT id, event_type, quantity, metadata, recorded_at
+        FROM usage_event
+        WHERE org_id = ${orgId}
+        ORDER BY recorded_at DESC, id DESC
+        LIMIT ${limit + 1} OFFSET ${offset}
+      `);
+    }
+
+    const rows = result.rows as { id: string; event_type: string; quantity: number; metadata: unknown; recorded_at: string }[];
+    const hasMore = rows.length > limit;
+    const events = hasMore ? rows.slice(0, limit) : rows;
+    const nextCursor = hasMore
+      ? btoa(`${events[events.length - 1].recorded_at}|${events[events.length - 1].id}`)
+      : null;
 
     return c.json({
-      events: result.rows,
+      events,
       limit,
-      offset,
+      next_cursor: nextCursor,
+      ...(cursor ? {} : { offset }),
     });
   } catch (error) {
     console.error("Failed to get usage details:", error);

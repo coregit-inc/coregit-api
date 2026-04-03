@@ -92,6 +92,8 @@ const listRefsHandler = async (c: any) => {
 
   const found = resolved.repo;
   const storage = resolved.storage;
+  const limit = Math.min(parseInt(c.req.query("limit") || "100", 10), 500);
+  const cursor = c.req.query("cursor"); // full ref name to start after
 
   try {
     const refs = await storage.listRefs();
@@ -109,7 +111,34 @@ const listRefsHandler = async (c: any) => {
     branchList.sort((a, b) => a.name.localeCompare(b.name));
     tagList.sort((a, b) => a.name.localeCompare(b.name));
 
-    return c.json({ branches: branchList, tags: tagList, default_branch: found.defaultBranch });
+    // Combine into single sorted list for pagination
+    const allRefs = [
+      ...branchList.map((b) => ({ ...b, sortKey: `branch:${b.name}` })),
+      ...tagList.map((t) => ({ ...t, sortKey: `tag:${t.name}` })),
+    ];
+    allRefs.sort((a, b) => a.sortKey.localeCompare(b.sortKey));
+
+    let startIdx = 0;
+    if (cursor) {
+      startIdx = allRefs.findIndex((r) => r.sortKey > cursor);
+      if (startIdx === -1) startIdx = allRefs.length;
+    }
+
+    const page = allRefs.slice(startIdx, startIdx + limit);
+    const hasMore = startIdx + limit < allRefs.length;
+    const nextCursor = hasMore ? page[page.length - 1].sortKey : null;
+
+    // Split page back into branches and tags for response
+    const pageBranches = page.filter((r) => r.type === "branch").map(({ name, sha, type }) => ({ name, sha, type }));
+    const pageTags = page.filter((r) => r.type === "tag").map(({ name, sha, type }) => ({ name, sha, type }));
+
+    return c.json({
+      branches: pageBranches,
+      tags: pageTags,
+      default_branch: found.defaultBranch,
+      total: allRefs.length,
+      next_cursor: nextCursor,
+    });
   } catch (error) {
     console.error("Failed to list refs:", error);
     return c.json({ error: "Failed to list refs" }, 500);

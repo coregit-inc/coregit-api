@@ -10,7 +10,7 @@
 
 import { Hono } from "hono";
 import { nanoid } from "nanoid";
-import { eq, and, or, isNull } from "drizzle-orm";
+import { eq, and, or, isNull, sql, desc } from "drizzle-orm";
 import { apiKeyAuth } from "../auth/middleware";
 import { repo, organization } from "../db/schema";
 import { GitR2Storage } from "../git/storage";
@@ -164,51 +164,88 @@ repos.post("/", apiKeyAuth, async (c) => {
   }
 });
 
+// Cursor helpers for keyset pagination
+function encodeCursor(updatedAt: Date, id: string): string {
+  return btoa(`${updatedAt.toISOString()}|${id}`);
+}
+
+function decodeCursor(cursor: string): { updatedAt: Date; id: string } | null {
+  try {
+    const decoded = atob(cursor);
+    const pipe = decoded.indexOf("|");
+    if (pipe === -1) return null;
+    const ts = new Date(decoded.slice(0, pipe));
+    const id = decoded.slice(pipe + 1);
+    if (isNaN(ts.getTime()) || !id) return null;
+    return { updatedAt: ts, id };
+  } catch {
+    return null;
+  }
+}
+
 // GET /v1/repos
 repos.get("/", apiKeyAuth, async (c) => {
   const orgId = c.get("orgId");
   const db = c.get("db");
   const limit = Math.min(parseInt(c.req.query("limit") || "50", 10), 100);
-  const offset = Math.max(parseInt(c.req.query("offset") || "0", 10), 0);
+  const cursor = c.req.query("cursor");
   const nsFilter = c.req.query("namespace");
 
+  // Backward compat: offset still works when no cursor provided
+  const offset = cursor ? 0 : Math.max(parseInt(c.req.query("offset") || "0", 10), 0);
+
   try {
-    let conditions: any = eq(repo.orgId, orgId);
+    let conditions: ReturnType<typeof eq> | ReturnType<typeof and> = eq(repo.orgId, orgId);
     if (nsFilter) {
-      conditions = and(conditions, eq(repo.namespace, nsFilter));
+      conditions = and(conditions, eq(repo.namespace, nsFilter))!;
     }
 
     // Scoped tokens: push scope filter to SQL for correct pagination
     const accessibleKeys = getAccessibleRepoKeys(c.get("apiKeyPermissions"));
     if (accessibleKeys !== null && accessibleKeys.length > 0) {
-      // Build SQL OR conditions for each accessible repo
       const scopeConditions = accessibleKeys.map((key) => {
         const slashIdx = key.indexOf("/");
         if (slashIdx !== -1) {
-          // namespaced: "alice/my-app"
           const ns = key.slice(0, slashIdx);
           const slug = key.slice(slashIdx + 1);
           return and(eq(repo.namespace, ns), eq(repo.slug, slug));
         }
-        // non-namespaced: "my-app"
         return and(isNull(repo.namespace), eq(repo.slug, key));
       });
-      conditions = and(conditions, or(...scopeConditions));
+      conditions = and(conditions, or(...scopeConditions))!;
     } else if (accessibleKeys !== null) {
-      // Token has no repo access at all
-      return c.json({ repos: [], limit, offset });
+      return c.json({ repos: [], limit, next_cursor: null });
+    }
+
+    // Keyset pagination: if cursor is provided, add WHERE clause
+    if (cursor) {
+      const parsed = decodeCursor(cursor);
+      if (!parsed) {
+        return c.json({ error: "Invalid cursor", code: "VALIDATION_ERROR" }, 400);
+      }
+      // (updated_at, id) < (cursor_updated_at, cursor_id) for DESC order
+      conditions = and(
+        conditions,
+        sql`(${repo.updatedAt}, ${repo.id}) < (${parsed.updatedAt.toISOString()}::timestamptz, ${parsed.id})`
+      )!;
     }
 
     const repoList = await db
       .select()
       .from(repo)
       .where(conditions)
-      .orderBy(repo.updatedAt)
-      .limit(limit)
-      .offset(offset);
+      .orderBy(desc(repo.updatedAt), desc(repo.id))
+      .limit(limit + 1)  // fetch one extra to detect next page
+      .offset(cursor ? 0 : offset);
+
+    const hasMore = repoList.length > limit;
+    const results = hasMore ? repoList.slice(0, limit) : repoList;
+    const nextCursor = hasMore
+      ? encodeCursor(results[results.length - 1].updatedAt, results[results.length - 1].id)
+      : null;
 
     return c.json({
-      repos: repoList.map((r) => ({
+      repos: results.map((r) => ({
         id: r.id,
         namespace: r.namespace,
         slug: r.slug,
@@ -219,7 +256,8 @@ repos.get("/", apiKeyAuth, async (c) => {
         updated_at: r.updatedAt,
       })),
       limit,
-      offset,
+      next_cursor: nextCursor,
+      ...(cursor ? {} : { offset }),
     });
   } catch (error) {
     console.error("Failed to list repos:", error);

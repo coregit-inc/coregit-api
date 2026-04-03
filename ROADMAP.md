@@ -14,18 +14,18 @@
 
 - [x] **Request ID на все ответы** — top-level middleware, X-Request-Id в каждом response
 - [x] **Structured error codes** — `errorResponse()` helper + `code` field
-- [ ] **Health check с DB ping** — `/health` проверяет Neon
+- [x] **Health check с DB ping** — `/health` проверяет Neon
 
 ## P2 — Performance
 
 - [x] **Packfile timeout** — abort через 25s, 504 с подсказкой `--depth 1`
-- [ ] **Keyset pagination** — repos, commits, usage (cursor вместо offset)
-- [ ] **Paginate branch/ref lists** — limit+cursor
+- [x] **Keyset pagination** — repos, commits, usage (cursor вместо offset, backward compat offset)
+- [x] **Paginate branch/ref lists** — limit+cursor (branches, refs endpoints)
 
 ## P3 — Features (конкурентный паритет)
 
 - [x] **Webhooks** — CRUD routes + HMAC-SHA256 delivery service (push, repo.*, branch.*)
-- [ ] **Line-level diff** — unified patch format
+- [x] **Line-level diff** — unified patch format (`?patch=true&context=3`), Myers algorithm
 - [ ] **API key expiration UI** — в coregit-app
 
 ## Не в скоупе (GitHub-only)

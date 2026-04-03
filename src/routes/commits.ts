@@ -147,19 +147,35 @@ const listCommitsHandler = async (c: any) => {
 
   const ref = c.req.query("ref") || c.req.query("branch");
   const limit = Math.min(parseInt(c.req.query("limit") || "20", 10), 100);
+  const cursor = c.req.query("cursor"); // SHA to resume from (exclusive)
 
   const branchName = ref || found.defaultBranch;
-  let commitSha = await storage.getRef(`refs/heads/${branchName}`);
 
-  // Try as raw SHA
-  if (!commitSha && branchName && /^[0-9a-f]{40}$/i.test(branchName)) {
-    commitSha = branchName;
+  // If cursor provided, start from the cursor's parent; otherwise resolve ref
+  let commitSha: string | null = null;
+  if (cursor && /^[0-9a-f]{40}$/i.test(cursor)) {
+    // Walk from cursor's first parent (cursor itself was already returned)
+    const cursorRaw = await storage.getObject(cursor);
+    if (!cursorRaw) return c.json({ error: "Cursor commit not found" }, 400);
+    const cursorObj = parseGitObject(cursorRaw);
+    if (cursorObj.type !== "commit") return c.json({ error: "Cursor is not a commit" }, 400);
+    const cursorCommit = parseCommit(cursorObj.content);
+    commitSha = cursorCommit.parents[0] || null;
+  } else {
+    commitSha = await storage.getRef(`refs/heads/${branchName}`);
+    // Try as raw SHA
+    if (!commitSha && branchName && /^[0-9a-f]{40}$/i.test(branchName)) {
+      commitSha = branchName;
+    }
   }
 
-  if (!commitSha) return c.json({ error: "Ref not found" }, 404);
+  if (!commitSha) {
+    if (cursor) return c.json({ commits: [], ref: branchName, has_more: false, next_cursor: null });
+    return c.json({ error: "Ref not found" }, 404);
+  }
 
   try {
-    const commitList: any[] = [];
+    const commitList: { sha: string; message: string; author_name: string; author_email: string; timestamp: number; parents: string[] }[] = [];
     let currentSha: string | null = commitSha;
 
     while (currentSha && commitList.length < limit) {
@@ -182,10 +198,14 @@ const listCommitsHandler = async (c: any) => {
       currentSha = commit.parents[0] || null;
     }
 
+    const hasMore = currentSha !== null && commitList.length >= limit;
+    const nextCursor = hasMore ? commitList[commitList.length - 1].sha : null;
+
     return c.json({
       commits: commitList,
       ref: branchName,
-      has_more: currentSha !== null && commitList.length >= limit,
+      has_more: hasMore,
+      next_cursor: nextCursor,
     });
   } catch (error) {
     console.error("Failed to list commits:", error);
