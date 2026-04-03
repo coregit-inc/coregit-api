@@ -21,6 +21,7 @@ import {
 
 export interface ExecOptions {
   branch?: string;
+  ref?: string;
   cwd?: string;
   env?: Record<string, string>;
   commit?: boolean;
@@ -56,19 +57,43 @@ export async function execInWorkspace(
   options: ExecOptions = {}
 ): Promise<ExecResult> {
   const startTime = Date.now();
-  const branch = options.branch || "main";
+  const branch = options.branch;
+  const ref = options.ref;
 
-  // 1. Resolve branch → commit → tree
-  const branchRef = `refs/heads/${branch}`;
-  const commitSha = await storage.getRef(branchRef);
-  if (!commitSha) {
-    return {
-      stdout: "",
-      stderr: `fatal: branch '${branch}' not found\n`,
-      exitCode: 128,
-      changedFiles: [],
-      executionTimeMs: Date.now() - startTime,
-    };
+  // 1. Resolve ref/branch → commit → tree
+  let commitSha: string | null = null;
+  let branchRef: string | null = null;
+
+  if (ref) {
+    // Resolve arbitrary ref (SHA, branch name, tag)
+    commitSha = await resolveRefToCommit(storage, ref);
+    if (!commitSha) {
+      return {
+        stdout: "",
+        stderr: `fatal: ref '${ref}' not found\n`,
+        exitCode: 128,
+        changedFiles: [],
+        executionTimeMs: Date.now() - startTime,
+      };
+    }
+    // If branch is also provided, use it for committing
+    if (branch) {
+      branchRef = `refs/heads/${branch}`;
+    }
+  } else {
+    // Default: resolve branch (backwards compatible)
+    const targetBranch = branch || "main";
+    branchRef = `refs/heads/${targetBranch}`;
+    commitSha = await storage.getRef(branchRef);
+    if (!commitSha) {
+      return {
+        stdout: "",
+        stderr: `fatal: branch '${targetBranch}' not found\n`,
+        exitCode: 128,
+        changedFiles: [],
+        executionTimeMs: Date.now() - startTime,
+      };
+    }
   }
 
   const commitRaw = await storage.getObject(commitSha);
@@ -134,6 +159,15 @@ export async function execInWorkspace(
   let newCommitSha: string | undefined;
 
   if (options.commit && changedFiles.length > 0) {
+    if (!branchRef) {
+      return {
+        stdout,
+        stderr: stderr + "error: branch is required when commit=true with a ref\n",
+        exitCode: 1,
+        changedFiles,
+        executionTimeMs: Date.now() - startTime,
+      };
+    }
     if (!options.commitMessage) {
       return {
         stdout,
@@ -233,6 +267,24 @@ async function commitChanges(
   }
 
   return commitSha;
+}
+
+/**
+ * Resolve a ref string (branch name, tag name, or SHA) to a commit SHA.
+ */
+async function resolveRefToCommit(storage: GitR2Storage, ref: string): Promise<string | null> {
+  if (ref === "HEAD") return storage.resolveHead();
+  const [branchSha, tagSha] = await Promise.all([
+    storage.getRef(`refs/heads/${ref}`),
+    storage.getRef(`refs/tags/${ref}`),
+  ]);
+  if (branchSha) return branchSha;
+  if (tagSha) return tagSha;
+  if (/^[0-9a-f]{40}$/i.test(ref)) {
+    const exists = await storage.hasObject(ref);
+    if (exists) return ref;
+  }
+  return null;
 }
 
 /**

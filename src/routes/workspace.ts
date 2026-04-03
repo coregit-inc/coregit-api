@@ -57,6 +57,7 @@ const execHandler = async (c: any) => {
   let body: {
     command?: string;
     branch?: string;
+    ref?: string;
     cwd?: string;
     env?: Record<string, string>;
     commit?: boolean;
@@ -79,10 +80,14 @@ const execHandler = async (c: any) => {
   if (body.commit && !body.commit_message) {
     return c.json({ error: "commit_message is required when commit=true" }, 400);
   }
+  if (body.commit && body.ref && !body.branch) {
+    return c.json({ error: "branch is required when using commit=true with ref" }, 400);
+  }
 
   try {
     const result = await execInWorkspace(storage, body.command, {
       branch: body.branch,
+      ref: body.ref,
       cwd: body.cwd,
       env: body.env,
       commit: body.commit,
