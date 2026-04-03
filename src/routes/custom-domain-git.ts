@@ -211,7 +211,21 @@ const cdUploadPackHandler = async (c: any) => {
     });
   }
 
-  const { packfile, shallowCommits } = await generatePackfile(wantShas, haveShas, storage, depth);
+  let packfile: Uint8Array;
+  let shallowCommits: string[];
+  try {
+    const result = await generatePackfile(wantShas, haveShas, storage, depth);
+    packfile = result.packfile;
+    shallowCommits = result.shallowCommits;
+  } catch (err: unknown) {
+    if (err instanceof Error && err.name === "PackfileTimeoutError") {
+      return new Response(
+        "ERR Repository too large for clone. Use shallow clone: git clone --depth 1\n",
+        { status: 504, headers: { "Content-Type": "text/plain" } }
+      );
+    }
+    throw err;
+  }
 
   const responseParts: Uint8Array[] = [];
   if (depth !== undefined) {

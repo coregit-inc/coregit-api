@@ -264,18 +264,29 @@ export interface GeneratePackfileResult {
   shallowCommits: string[];
 }
 
+/** Max CPU time for packfile generation (leaves 5s buffer before Worker 30s limit) */
+const PACKFILE_DEADLINE_MS = 25_000;
+
+export class PackfileTimeoutError extends Error {
+  constructor(public objectCount: number) {
+    super(`Packfile generation timed out after collecting ${objectCount} objects`);
+    this.name = "PackfileTimeoutError";
+  }
+}
+
 export async function generatePackfile(
   wantShas: string[],
   haveShas: string[],
   storage: GitR2Storage,
   depth?: number
 ): Promise<GeneratePackfileResult> {
+  const deadline = Date.now() + PACKFILE_DEADLINE_MS;
   // Map caches parsed objects during traversal — eliminates second fetch pass
   const objectsToSend = new Map<string, { type: GitObjectType; content: Uint8Array }>();
   const haveSet = new Set(haveShas);
   const shallowCommits = new Set<string>();
 
-  await collectReachableObjectsBFS(wantShas, storage, objectsToSend, haveSet, depth, shallowCommits);
+  await collectReachableObjectsBFS(wantShas, storage, objectsToSend, haveSet, depth, shallowCommits, deadline);
 
   // Use cached objects — no second fetch pass needed
   const objects = Array.from(objectsToSend.entries()).map(([sha, { type, content }]) => ({
@@ -303,13 +314,17 @@ async function collectReachableObjectsBFS(
   collected: Map<string, { type: GitObjectType; content: Uint8Array }>,
   exclude: Set<string>,
   depth?: number,
-  shallowCommits?: Set<string>
+  shallowCommits?: Set<string>,
+  deadline?: number
 ): Promise<void> {
   let queue: { sha: string; commitDepth: number }[] = startShas
     .filter((s) => !collected.has(s) && !exclude.has(s))
     .map((s) => ({ sha: s, commitDepth: 0 }));
 
   while (queue.length > 0) {
+    if (deadline && Date.now() > deadline) {
+      throw new PackfileTimeoutError(collected.size);
+    }
     const batch = queue.splice(0, FETCH_BATCH_SIZE);
 
     const results = await Promise.all(

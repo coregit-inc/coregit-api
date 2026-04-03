@@ -44,14 +44,18 @@ import { customDomainGit } from "./routes/custom-domain-git";
 import { workspace } from "./routes/workspace";
 import { sync } from "./routes/sync";
 import { tokens } from "./routes/tokens";
+import { webhooks } from "./routes/webhooks";
 import type { Env, Variables } from "./types";
 
 const app = new Hono<{ Bindings: Env; Variables: Variables }>();
 
-// ── Security headers ──
+// ── Request ID + Security headers ──
 
 app.use("*", async (c, next) => {
+  const requestId = crypto.randomUUID().slice(0, 8);
+  c.set("requestId", requestId);
   await next();
+  c.header("X-Request-Id", requestId);
   c.header("X-Content-Type-Options", "nosniff");
   c.header("X-Frame-Options", "DENY");
   c.header("Referrer-Policy", "strict-origin-when-cross-origin");
@@ -230,6 +234,7 @@ app.route("/v1/repos", workspace);
 app.route("/v1/repos", sync);
 app.route("/v1/repos", repos);
 app.route("/v1", tokens);
+app.route("/v1", webhooks);
 app.route("/v1/usage", usage);
 
 // ── Public read-only routes (no auth required) ──
@@ -247,10 +252,9 @@ app.notFound((c) => c.json({ error: "Not found" }, 404));
 // ── Error handler ──
 
 app.onError((err, c) => {
-  const requestId = crypto.randomUUID().slice(0, 8);
+  const requestId = c.get("requestId") || crypto.randomUUID().slice(0, 8);
   console.error(`[${requestId}] ${c.req.method} ${c.req.path}:`, err);
-  c.header("X-Request-Id", requestId);
-  return c.json({ error: "Internal server error", request_id: requestId }, 500);
+  return c.json({ error: "Internal server error", code: "INTERNAL_ERROR", request_id: requestId }, 500);
 });
 
 export default app;

@@ -20,5 +20,6 @@ export interface Variables {
   orgTier: "free" | "usage";
   dodoCustomerId: string | null;
   customDomain: string | null;
+  requestId: string;
 }
 

@@ -13,6 +13,7 @@ import { sql } from "drizzle-orm";
 import type { Env, Variables } from "../types";
 import { getOrgPlan } from "../services/limits";
 import { recordUsage } from "../services/usage";
+import { checkRateLimit, rateLimitHeaders } from "../services/rate-limit";
 import type { Scopes } from "./scopes";
 
 const encoder = new TextEncoder();
@@ -71,10 +72,13 @@ async function verifyMasterKey(
   const keyHash = await sha256(keyValue);
 
   const result = await db.execute(
-    sql`SELECT id, org_id FROM api_key WHERE key_hash = ${keyHash} LIMIT 1`
+    sql`SELECT id, org_id, expires_at FROM api_key
+        WHERE key_hash = ${keyHash}
+          AND (expires_at IS NULL OR expires_at > NOW())
+        LIMIT 1`
   );
 
-  const row = result.rows[0] as { id: string; org_id: string } | undefined;
+  const row = result.rows[0] as { id: string; org_id: string; expires_at: string | null } | undefined;
   if (!row) return null;
 
   return { orgId: row.org_id, scopes: null, tokenId: row.id, keyHash };
@@ -150,7 +154,22 @@ export const apiKeyAuth = createMiddleware<{
   c.set("orgTier", orgPlan.tier);
   c.set("dodoCustomerId", orgPlan.dodoCustomerId);
 
+  // ── Per-key rate limiting ──
+  const rl = checkRateLimit(authResult.tokenId);
+  const rlHeaders = rateLimitHeaders(rl);
+  if (!rl.allowed) {
+    for (const [k, v] of Object.entries(rlHeaders)) {
+      c.header(k, v);
+    }
+    return c.json({ error: "Rate limit exceeded", code: "RATE_LIMITED" }, 429);
+  }
+
   await next();
+
+  // Attach rate limit headers to successful responses
+  for (const [k, v] of Object.entries(rlHeaders)) {
+    c.header(k, v);
+  }
 
   // Record api_call usage for every authenticated request
   recordUsage(c.executionCtx, db, authResult.orgId, "api_call", 1, {

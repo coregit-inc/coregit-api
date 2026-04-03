@@ -93,7 +93,7 @@ export async function checkFreeLimits(
       const result = await db.execute(
         sql`SELECT COUNT(*)::int AS count FROM repo WHERE org_id = ${orgId}`
       );
-      used = (result.rows[0] as any)?.count ?? 0;
+      used = (result.rows[0] as { count: number } | undefined)?.count ?? 0;
       setCache(cacheKey, used);
     }
     return {
