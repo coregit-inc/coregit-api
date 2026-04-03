@@ -26,7 +26,7 @@
 
 - [x] **Webhooks** — CRUD routes + HMAC-SHA256 delivery service (push, repo.*, branch.*)
 - [x] **Line-level diff** — unified patch format (`?patch=true&context=3`), Myers algorithm
-- [ ] **API key expiration UI** — в coregit-app
+- [x] **API key expiration UI** — в coregit-app (Select expiry при создании, Status badge, Last used)
 
 ## Не в скоупе (GitHub-only)
 
