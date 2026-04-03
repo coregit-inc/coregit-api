@@ -101,8 +101,8 @@ async function authenticateCDGit(c: any, requireAuth: boolean): Promise<CDGitAut
 // ── Routes ──
 
 // GET /:repo/info/refs  and  GET /:namespace/:repo/info/refs
-const cdInfoRefsHandler = async (c: any) => {
-  if (!c.get("customDomain")) return c.notFound();
+const cdInfoRefsHandler = async (c: any, next: any) => {
+  if (!c.get("customDomain")) return next();
 
   const service = c.req.query("service");
   if (!service || (service !== "git-upload-pack" && service !== "git-receive-pack")) {
@@ -145,8 +145,8 @@ customDomainGit.get("/:repo/info/refs", cdInfoRefsHandler);
 customDomainGit.get("/:namespace/:repo/info/refs", cdInfoRefsHandler);
 
 // POST /:repo/git-upload-pack
-const cdUploadPackHandler = async (c: any) => {
-  if (!c.get("customDomain")) return c.notFound();
+const cdUploadPackHandler = async (c: any, next: any) => {
+  if (!c.get("customDomain")) return next();
 
   const auth = await authenticateCDGit(c, false);
   if (auth instanceof Response) return auth;
@@ -270,8 +270,8 @@ customDomainGit.post("/:repo/git-upload-pack", cdUploadPackHandler);
 customDomainGit.post("/:namespace/:repo/git-upload-pack", cdUploadPackHandler);
 
 // POST /:repo/git-receive-pack
-const cdReceivePackHandler = async (c: any) => {
-  if (!c.get("customDomain")) return c.notFound();
+const cdReceivePackHandler = async (c: any, next: any) => {
+  if (!c.get("customDomain")) return next();
 
   const auth = await authenticateCDGit(c, true);
   if (auth instanceof Response) return auth;
