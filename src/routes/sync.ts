@@ -11,6 +11,8 @@ import { GitR2Storage } from "../git/storage";
 import { decryptSecret } from "../services/secret-manager";
 import { syncFromGithub } from "../services/github-sync";
 import { syncFromGitlab } from "../services/gitlab-sync";
+import { exportToGithub } from "../services/github-export";
+import { exportToGitlab } from "../services/gitlab-export";
 import type { CommitAuthor } from "../services/commit-builder";
 
 const syncRoutes = new Hono<{ Bindings: Env; Variables: Variables }>();
@@ -90,6 +92,73 @@ const syncHandler = async (c: any) => {
       message: `Sync started for ${syncConfig.provider}`,
     });
 
+    const direction = syncConfig.direction || "import";
+
+    if (direction === "export") {
+      // Export: CoreGit → GitHub/GitLab
+      let exportResult;
+      if (syncConfig.provider === "github") {
+        const { owner, repo: ghRepo } = parseGithubRemote(syncConfig.remote);
+        exportResult = await exportToGithub({
+          token,
+          owner,
+          repo: ghRepo,
+          branch,
+          storage,
+          lastSyncedSha: syncConfig.lastSyncedSha ?? null,
+        });
+      } else if (syncConfig.provider === "gitlab") {
+        exportResult = await exportToGitlab({
+          token,
+          projectPath: syncConfig.remote,
+          branch,
+          storage,
+          lastSyncedSha: syncConfig.lastSyncedSha ?? null,
+        });
+      } else {
+        throw new Error(`Unsupported provider ${syncConfig.provider}`);
+      }
+
+      // Update lastSyncedSha to current CoreGit HEAD after export
+      const currentHead = await storage.getRef(`refs/heads/${branch}`);
+      await db
+        .update(repoSync)
+        .set({
+          lastSyncedSha: currentHead || syncConfig.lastSyncedSha,
+          lastSyncedAt: new Date(),
+          lastError: null,
+          defaultBranch: branch,
+          updatedAt: new Date(),
+        })
+        .where(eq(repoSync.id, syncConfig.id));
+
+      const remoteSha = syncConfig.provider === "github"
+        ? (exportResult as { githubSha: string }).githubSha
+        : (exportResult as { gitlabSha: string }).gitlabSha;
+
+      await db
+        .update(repoSyncRun)
+        .set({
+          status: exportResult.skipped ? "skipped" : "success",
+          commitSha: currentHead || null,
+          remoteSha,
+          completedAt: new Date(),
+          message: exportResult.skipped
+            ? "Already up to date"
+            : `Exported ${exportResult.filesChanged} files`,
+        })
+        .where(eq(repoSyncRun.id, runId));
+
+      return c.json({
+        synced: !exportResult.skipped,
+        remote_sha: remoteSha,
+        commit_sha: currentHead,
+        files_changed: exportResult.filesChanged,
+        direction: "export",
+      });
+    }
+
+    // Import: GitHub/GitLab → CoreGit (existing logic)
     let result;
     if (syncConfig.provider === "github") {
       const { owner, repo: ghRepo } = parseGithubRemote(syncConfig.remote);
@@ -143,6 +212,7 @@ const syncHandler = async (c: any) => {
       commit_sha: result.commitSha,
       files_changed: result.filesChanged,
       deleted: result.deleted,
+      direction: "import",
     });
   } catch (error) {
     console.error("Sync failed", error);

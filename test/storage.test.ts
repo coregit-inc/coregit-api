@@ -11,44 +11,9 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { zlibSync } from "fflate";
 import { createGitObjectRaw } from "../src/git/objects";
+import { createMockBucket } from "./helpers/mock-r2";
 
 // ── Mock R2Bucket ──
-
-function createMockBucket() {
-  const store = new Map<string, Uint8Array>();
-
-  const bucket = {
-    get: vi.fn(async (key: string) => {
-      const data = store.get(key);
-      if (!data) return null;
-      return {
-        arrayBuffer: async () => data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength),
-        text: async () => new TextDecoder().decode(data),
-        etag: `etag-${key}`,
-      };
-    }),
-    put: vi.fn(async (key: string, value: unknown, _opts?: unknown) => {
-      if (value instanceof Uint8Array) {
-        store.set(key, value);
-      } else if (value instanceof ArrayBuffer) {
-        store.set(key, new Uint8Array(value));
-      } else if (typeof value === "string") {
-        store.set(key, new TextEncoder().encode(value));
-      }
-      return { etag: `etag-${key}` };
-    }),
-    head: vi.fn(async (key: string) => {
-      return store.has(key) ? { key } : null;
-    }),
-    delete: vi.fn(async () => {}),
-    list: vi.fn(async () => ({ objects: [], truncated: false })),
-    _store: store,
-  };
-
-  return bucket as unknown as R2Bucket & { _store: Map<string, Uint8Array> };
-}
-
-// ── Dynamically import GitR2Storage (needs R2Bucket types) ──
 
 async function createStorage(bucket: R2Bucket) {
   const { GitR2Storage } = await import("../src/git/storage");

@@ -12,8 +12,8 @@
  */
 
 import { Hono } from "hono";
-import { eq, and } from "drizzle-orm";
-import { repo, organization } from "../db/schema";
+import { eq, and, isNull } from "drizzle-orm";
+import { repo, organization, repoSync, repoSyncRun, externalConnection } from "../db/schema";
 import { parseBasicAuthKey, verifyCredentialForGit } from "../auth/middleware";
 import { hasRepoAccess, type Scopes } from "../auth/scopes";
 import { resolveRepo } from "../services/repo-resolver";
@@ -30,6 +30,10 @@ import { parseCommit, parseGitObject } from "../git/objects";
 import { recordUsage } from "../services/usage";
 import { getDodoCustomerId } from "../services/dodo";
 import { isValidSha, isValidRefPath } from "../git/validation";
+import { decryptSecret } from "../services/secret-manager";
+import { exportToGithub } from "../services/github-export";
+import { exportToGitlab } from "../services/gitlab-export";
+import { nanoid } from "nanoid";
 import type { Env, Variables } from "../types";
 
 const encoder = new TextEncoder();
@@ -152,6 +156,149 @@ async function authenticateGitReadOnly(c: any): Promise<GitAuthResult | Response
   }
 
   return { orgId: org.id, repoSlug, storage: resolved.storage, defaultBranch: resolved.repo.defaultBranch };
+}
+
+// ── Auto-export trigger ──
+
+/**
+ * After a successful git push, check if this repo has an export sync config
+ * with autoSync=true and trigger the export.
+ */
+async function triggerAutoExport(
+  db: any,
+  orgId: string,
+  repoSlug: string,
+  namespace: string | null,
+  successfulRefs: string[],
+  env: Env,
+  storage: GitR2Storage
+): Promise<void> {
+  if (successfulRefs.length === 0) return;
+
+  // Find repo record
+  const condition = namespace
+    ? and(eq(repo.orgId, orgId), eq(repo.namespace, namespace), eq(repo.slug, repoSlug))
+    : and(eq(repo.orgId, orgId), isNull(repo.namespace), eq(repo.slug, repoSlug));
+
+  let repoRecord;
+  try {
+    [repoRecord] = await db.select().from(repo).where(condition).limit(1);
+  } catch (err) {
+    console.error("Auto-export: failed to find repo:", err);
+    return;
+  }
+  if (!repoRecord) return;
+
+  // Find export sync config
+  const [syncCfg] = await db
+    .select()
+    .from(repoSync)
+    .where(
+      and(
+        eq(repoSync.repoId, repoRecord.id),
+        eq(repoSync.direction, "export"),
+        eq(repoSync.autoSync, true)
+      )
+    )
+    .limit(1);
+
+  if (!syncCfg) return;
+
+  // Check if any of the pushed refs match the sync branch
+  const syncBranch = syncCfg.defaultBranch || repoRecord.defaultBranch;
+  const matchRef = `refs/heads/${syncBranch}`;
+  if (!successfulRefs.includes(matchRef)) return;
+
+  // Compare with lastSyncedSha to avoid infinite loops
+  const currentHead = await storage.getRef(matchRef);
+  if (currentHead && currentHead === syncCfg.lastSyncedSha) return;
+
+  // Fetch connection
+  const [conn] = await db
+    .select()
+    .from(externalConnection)
+    .where(eq(externalConnection.id, syncCfg.connectionId))
+    .limit(1);
+
+  if (!conn) return;
+
+  const token = await decryptSecret(env.SYNC_ENCRYPTION_KEY, conn.encryptedAccessToken);
+
+  const runId = nanoid();
+  await db.insert(repoSyncRun).values({
+    id: runId,
+    syncId: syncCfg.id,
+    status: "running",
+    startedAt: new Date(),
+    message: `Auto-export triggered by git push`,
+  });
+
+  try {
+    let exportResult;
+    if (syncCfg.provider === "github") {
+      const [owner, ghRepo] = syncCfg.remote.split("/");
+      if (!owner || !ghRepo) throw new Error("Invalid remote format");
+      exportResult = await exportToGithub({
+        token,
+        owner,
+        repo: ghRepo,
+        branch: syncBranch,
+        storage,
+        lastSyncedSha: syncCfg.lastSyncedSha ?? null,
+      });
+    } else if (syncCfg.provider === "gitlab") {
+      exportResult = await exportToGitlab({
+        token,
+        projectPath: syncCfg.remote,
+        branch: syncBranch,
+        storage,
+        lastSyncedSha: syncCfg.lastSyncedSha ?? null,
+      });
+    } else {
+      throw new Error(`Unsupported provider: ${syncCfg.provider}`);
+    }
+
+    const remoteSha = syncCfg.provider === "github"
+      ? (exportResult as { githubSha: string }).githubSha
+      : (exportResult as { gitlabSha: string }).gitlabSha;
+
+    await db
+      .update(repoSync)
+      .set({
+        lastSyncedSha: currentHead || syncCfg.lastSyncedSha,
+        lastSyncedAt: new Date(),
+        lastError: null,
+      })
+      .where(eq(repoSync.id, syncCfg.id));
+
+    await db
+      .update(repoSyncRun)
+      .set({
+        status: exportResult.skipped ? "skipped" : "success",
+        commitSha: currentHead || null,
+        remoteSha,
+        completedAt: new Date(),
+        message: exportResult.skipped
+          ? "Already up to date"
+          : `Exported ${exportResult.filesChanged} files`,
+      })
+      .where(eq(repoSyncRun.id, runId));
+  } catch (err) {
+    console.error("Auto-export failed:", err);
+    await db
+      .update(repoSyncRun)
+      .set({
+        status: "error",
+        completedAt: new Date(),
+        message: err instanceof Error ? err.message : "Export failed",
+      })
+      .where(eq(repoSyncRun.id, runId));
+
+    await db
+      .update(repoSync)
+      .set({ lastError: err instanceof Error ? err.message : "Export failed" })
+      .where(eq(repoSync.id, syncCfg.id));
+  }
 }
 
 // ── Routes ──
@@ -486,6 +633,18 @@ const receivePackHandler = async (c: any) => {
   recordUsage(c.executionCtx, db, orgId, "git_transfer_bytes", body.length, {
     operation: "receive-pack",
   }, c.env.DODO_PAYMENTS_API_KEY, dodoCustomerIdPush);
+
+  // Trigger auto-export if configured
+  const successfulRefs = refResults
+    .filter((r) => r.success)
+    .map((r) => r.refName);
+
+  if (successfulRefs.length > 0) {
+    const { repoSlug: pushRepoSlug, namespace: pushNamespace } = extractGitRepoParams(c);
+    c.executionCtx.waitUntil(
+      triggerAutoExport(db, orgId, pushRepoSlug, pushNamespace, successfulRefs, c.env, storage)
+    );
+  }
 
   return new Response(responseBytes, {
     headers: { "Content-Type": "application/x-git-receive-pack-result" },

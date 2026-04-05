@@ -45,6 +45,9 @@ import { git } from "./routes/git";
 import { customDomainGit } from "./routes/custom-domain-git";
 import { workspace, multiWorkspace } from "./routes/workspace";
 import { sync } from "./routes/sync";
+import { syncConfig } from "./routes/sync-config";
+import { syncWebhooks } from "./routes/sync-webhooks";
+import { connections } from "./routes/connections";
 import { tokens } from "./routes/tokens";
 import { webhooks } from "./routes/webhooks";
 import { search } from "./routes/search";
@@ -250,11 +253,17 @@ app.route("/v1/repos", refs);
 app.route("/v1/repos", snapshots);
 app.route("/v1/repos", workspace);
 app.route("/v1/repos", sync);
+app.route("/v1/repos", syncConfig);
 app.route("/v1/repos", repos);
+app.route("/v1", connections);
 app.route("/v1", tokens);
 app.route("/v1", webhooks);
 app.route("/v1", search);
 app.route("/v1", audit);
+
+// ── Public webhook endpoints (no auth) — MUST be before auth-gated routes ──
+// Sync webhooks use DB directly, mounted on /v1 but skip apiKeyAuth
+app.route("/v1", syncWebhooks);
 app.route("/v1", multiWorkspace);
 app.route("/v1/usage", usage);
 
