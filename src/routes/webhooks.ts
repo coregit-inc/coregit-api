@@ -74,26 +74,35 @@ webhooks.post("/webhooks", apiKeyAuth, async (c) => {
   const id = nanoid();
   const secret = generateSecret();
 
-  // Encrypt secret before storing
-  const encryptionKey = c.env.WEBHOOK_ENCRYPTION_KEY || c.env.SYNC_ENCRYPTION_KEY;
-  const encryptedSecret = await encryptSecret(encryptionKey, secret);
+  try {
+    // Encrypt secret before storing
+    const encryptionKey = c.env.WEBHOOK_ENCRYPTION_KEY || c.env.SYNC_ENCRYPTION_KEY;
+    const encryptedSecret = await encryptSecret(encryptionKey, secret);
 
-  await db.insert(webhook).values({
-    id,
-    orgId,
-    url: body.url,
-    secret: encryptedSecret,
-    events: body.events,
-    active: "true",
-  });
+    await db.insert(webhook).values({
+      id,
+      orgId,
+      url: body.url,
+      secret: encryptedSecret,
+      events: body.events,
+      active: "true",
+    });
 
-  recordAudit(c.executionCtx, db, {
-    orgId, actorId: c.get("apiKeyId"), actorType: "master_key",
-    action: "webhook.create", resourceType: "webhook", resourceId: id,
-    metadata: { url: body.url, events: body.events }, requestId: c.get("requestId"),
-  });
+    recordAudit(c.executionCtx, db, {
+      orgId, actorId: c.get("apiKeyId"), actorType: "master_key",
+      action: "webhook.create", resourceType: "webhook", resourceId: id,
+      metadata: { url: body.url, events: body.events }, requestId: c.get("requestId"),
+    });
 
-  return c.json({ id, url: body.url, events: body.events, secret, active: true }, 201);
+    return c.json({ id, url: body.url, events: body.events, secret, active: true }, 201);
+  } catch (err) {
+    console.error("Webhook creation failed:", err);
+    return c.json({
+      error: "Failed to create webhook",
+      code: "INTERNAL_ERROR",
+      detail: err instanceof Error ? err.message : String(err),
+    }, 500);
+  }
 });
 
 // GET /v1/webhooks

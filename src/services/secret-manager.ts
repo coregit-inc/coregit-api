@@ -3,11 +3,13 @@ const decoder = new TextDecoder();
 const keyCache = new Map<string, CryptoKey>();
 
 function decodeKeyBytes(secret: string): ArrayBuffer {
+  // Support both hex (64 chars) and base64 encoding
+  const isHex = /^[0-9a-fA-F]{64}$/.test(secret);
   try {
-    const buf = Buffer.from(secret, "base64");
+    const buf = Buffer.from(secret, isHex ? "hex" : "base64");
     return buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength);
   } catch {
-    throw new Error("SYNC_ENCRYPTION_KEY must be base64-encoded");
+    throw new Error("Encryption key must be hex (64 chars) or base64-encoded (32 bytes)");
   }
 }
 
