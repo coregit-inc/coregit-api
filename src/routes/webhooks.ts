@@ -9,13 +9,14 @@
  */
 
 import { Hono } from "hono";
-import { sql } from "drizzle-orm";
+import { sql, eq, and, desc } from "drizzle-orm";
 import { nanoid } from "nanoid";
 import { apiKeyAuth } from "../auth/middleware";
 import { isMasterKey } from "../auth/scopes";
 import { recordAudit } from "../services/audit";
 import { isPrivateUrl } from "../services/url-validator";
 import { encryptSecret } from "../services/secret-manager";
+import { webhook } from "../db/schema";
 import type { Env, Variables } from "../types";
 
 const VALID_EVENTS = ["push", "repo.created", "repo.deleted", "branch.created", "branch.deleted", "*"];
@@ -77,10 +78,14 @@ webhooks.post("/webhooks", apiKeyAuth, async (c) => {
   const encryptionKey = c.env.WEBHOOK_ENCRYPTION_KEY || c.env.SYNC_ENCRYPTION_KEY;
   const encryptedSecret = await encryptSecret(encryptionKey, secret);
 
-  await db.execute(sql`
-    INSERT INTO webhook (id, org_id, url, secret, events, active)
-    VALUES (${id}, ${orgId}, ${body.url}, ${encryptedSecret}, ${body.events}::text[], true)
-  `);
+  await db.insert(webhook).values({
+    id,
+    orgId,
+    url: body.url,
+    secret: encryptedSecret,
+    events: body.events,
+    active: "true",
+  });
 
   recordAudit(c.executionCtx, db, {
     orgId, actorId: c.get("apiKeyId"), actorType: "master_key",
@@ -100,12 +105,19 @@ webhooks.get("/webhooks", apiKeyAuth, async (c) => {
   const db = c.get("db");
   const orgId = c.get("orgId");
 
-  const result = await db.execute(
-    sql`SELECT id, url, events, active, created_at FROM webhook
-        WHERE org_id = ${orgId} ORDER BY created_at DESC`
-  );
+  const rows = await db
+    .select({
+      id: webhook.id,
+      url: webhook.url,
+      events: webhook.events,
+      active: webhook.active,
+      created_at: webhook.createdAt,
+    })
+    .from(webhook)
+    .where(eq(webhook.orgId, orgId))
+    .orderBy(desc(webhook.createdAt));
 
-  return c.json({ webhooks: result.rows });
+  return c.json({ webhooks: rows });
 });
 
 // GET /v1/webhooks/:id
@@ -118,16 +130,23 @@ webhooks.get("/webhooks/:id", apiKeyAuth, async (c) => {
   const orgId = c.get("orgId");
   const id = c.req.param("id");
 
-  const result = await db.execute(
-    sql`SELECT id, url, events, active, created_at FROM webhook
-        WHERE id = ${id} AND org_id = ${orgId} LIMIT 1`
-  );
+  const rows = await db
+    .select({
+      id: webhook.id,
+      url: webhook.url,
+      events: webhook.events,
+      active: webhook.active,
+      created_at: webhook.createdAt,
+    })
+    .from(webhook)
+    .where(and(eq(webhook.id, id), eq(webhook.orgId, orgId)))
+    .limit(1);
 
-  if (result.rows.length === 0) {
+  if (rows.length === 0) {
     return c.json({ error: "Webhook not found", code: "NOT_FOUND" }, 404);
   }
 
-  return c.json(result.rows[0]);
+  return c.json(rows[0]);
 });
 
 // PATCH /v1/webhooks/:id
@@ -147,8 +166,8 @@ webhooks.patch("/webhooks/:id", apiKeyAuth, async (c) => {
     return c.json({ error: "Invalid JSON body", code: "VALIDATION_ERROR" }, 400);
   }
 
-  const sets: string[] = [];
-  const values: unknown[] = [];
+  const updates: Partial<{ url: string; events: string[]; active: string }> = {};
+  const fields: string[] = [];
 
   if (body.url !== undefined) {
     if (!body.url.startsWith("https://")) {
@@ -157,8 +176,8 @@ webhooks.patch("/webhooks/:id", apiKeyAuth, async (c) => {
     if (isPrivateUrl(body.url)) {
       return c.json({ error: "Webhook URL must not point to private or internal addresses", code: "VALIDATION_ERROR" }, 400);
     }
-    sets.push("url");
-    values.push(body.url);
+    updates.url = body.url;
+    fields.push("url");
   }
 
   if (body.events !== undefined) {
@@ -167,36 +186,28 @@ webhooks.patch("/webhooks/:id", apiKeyAuth, async (c) => {
         return c.json({ error: `Invalid event: ${ev}`, code: "VALIDATION_ERROR" }, 400);
       }
     }
-    sets.push("events");
-    values.push(body.events);
+    updates.events = body.events;
+    fields.push("events");
   }
 
   if (body.active !== undefined) {
-    sets.push("active");
-    values.push(String(body.active));
+    updates.active = String(body.active);
+    fields.push("active");
   }
 
-  if (sets.length === 0) {
+  if (fields.length === 0) {
     return c.json({ error: "No fields to update", code: "VALIDATION_ERROR" }, 400);
   }
 
-  // Build dynamic update — safe because column names are hardcoded above
-  const setClauses = sets.map((col, i) => {
-    if (col === "events") return sql`events = ${body.events}::text[]`;
-    if (col === "url") return sql`url = ${body.url}`;
-    if (col === "active") return sql`active = ${body.active}`;
-    return sql``;
-  });
-
-  // Execute individual updates since drizzle raw sql doesn't easily compose SET clauses
-  for (const clause of setClauses) {
-    await db.execute(sql`UPDATE webhook SET ${clause} WHERE id = ${id} AND org_id = ${orgId}`);
-  }
+  await db
+    .update(webhook)
+    .set(updates)
+    .where(and(eq(webhook.id, id), eq(webhook.orgId, orgId)));
 
   recordAudit(c.executionCtx, db, {
     orgId, actorId: c.get("apiKeyId"), actorType: "master_key",
     action: "webhook.update", resourceType: "webhook", resourceId: id,
-    metadata: { fields: sets }, requestId: c.get("requestId"),
+    metadata: { fields }, requestId: c.get("requestId"),
   });
 
   return c.json({ updated: true });
@@ -212,9 +223,9 @@ webhooks.delete("/webhooks/:id", apiKeyAuth, async (c) => {
   const orgId = c.get("orgId");
   const id = c.req.param("id");
 
-  await db.execute(
-    sql`DELETE FROM webhook WHERE id = ${id} AND org_id = ${orgId}`
-  );
+  await db
+    .delete(webhook)
+    .where(and(eq(webhook.id, id), eq(webhook.orgId, orgId)));
 
   recordAudit(c.executionCtx, db, {
     orgId, actorId: c.get("apiKeyId"), actorType: "master_key",
