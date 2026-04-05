@@ -89,6 +89,36 @@ const execHandler = async (c: any) => {
     return c.json({ error: "branch is required when using commit=true with ref" }, 400);
   }
 
+  // Validate cwd
+  if (body.cwd !== undefined) {
+    if (typeof body.cwd !== "string" || body.cwd.length > 1024 || body.cwd.includes("\0")) {
+      return c.json({ error: "Invalid cwd" }, 400);
+    }
+    if (!body.cwd.startsWith("/")) {
+      return c.json({ error: "cwd must be an absolute path" }, 400);
+    }
+  }
+
+  // Validate env
+  if (body.env !== undefined) {
+    if (typeof body.env !== "object" || Array.isArray(body.env) || body.env === null) {
+      return c.json({ error: "env must be an object" }, 400);
+    }
+    const envKeys = Object.keys(body.env);
+    if (envKeys.length > 50) {
+      return c.json({ error: "Too many env variables (max 50)" }, 400);
+    }
+    const blocked = ["PATH", "HOME", "LD_PRELOAD", "LD_LIBRARY_PATH"];
+    for (const key of envKeys) {
+      if (blocked.includes(key.toUpperCase())) {
+        return c.json({ error: `Cannot override env variable: ${key}` }, 400);
+      }
+      if (key.includes("\0") || (typeof body.env[key] === "string" && body.env[key].includes("\0"))) {
+        return c.json({ error: "env contains null byte" }, 400);
+      }
+    }
+  }
+
   try {
     const result = await execInWorkspace(storage, body.command, {
       branch: body.branch,
@@ -174,6 +204,36 @@ multiWorkspace.post("/workspace/exec", apiKeyAuth, async (c) => {
   }
   if (body.commit && !body.commit_message) {
     return c.json({ error: "commit_message is required when commit=true" }, 400);
+  }
+
+  // Validate cwd
+  if (body.cwd !== undefined) {
+    if (typeof body.cwd !== "string" || body.cwd.length > 1024 || body.cwd.includes("\0")) {
+      return c.json({ error: "Invalid cwd" }, 400);
+    }
+    if (!body.cwd.startsWith("/")) {
+      return c.json({ error: "cwd must be an absolute path" }, 400);
+    }
+  }
+
+  // Validate env
+  if (body.env !== undefined) {
+    if (typeof body.env !== "object" || Array.isArray(body.env) || body.env === null) {
+      return c.json({ error: "env must be an object" }, 400);
+    }
+    const envKeys = Object.keys(body.env);
+    if (envKeys.length > 50) {
+      return c.json({ error: "Too many env variables (max 50)" }, 400);
+    }
+    const blocked = ["PATH", "HOME", "LD_PRELOAD", "LD_LIBRARY_PATH"];
+    for (const key of envKeys) {
+      if (blocked.includes(key.toUpperCase())) {
+        return c.json({ error: `Cannot override env variable: ${key}` }, 400);
+      }
+      if (key.includes("\0") || (typeof body.env[key] === "string" && body.env[key].includes("\0"))) {
+        return c.json({ error: "env contains null byte" }, 400);
+      }
+    }
   }
 
   // Check for duplicate slugs

@@ -9,6 +9,7 @@ export interface Env {
   CF_ZONE_ID?: string;
   CF_API_TOKEN?: string;
   SYNC_ENCRYPTION_KEY: string;
+  WEBHOOK_ENCRYPTION_KEY?: string;
   INTERNAL_SYNC_TOKEN?: string;
 }
 

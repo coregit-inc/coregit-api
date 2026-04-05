@@ -237,3 +237,28 @@ export const repoSyncRun = pgTable(
 
 export type RepoSyncRun = typeof repoSyncRun.$inferSelect;
 export type NewRepoSyncRun = typeof repoSyncRun.$inferInsert;
+
+// Audit log (security events)
+export const auditLog = pgTable(
+  "audit_log",
+  {
+    id: bigint("id", { mode: "number" }).primaryKey().generatedAlwaysAsIdentity(),
+    orgId: text("org_id").notNull(),
+    actorId: text("actor_id").notNull(),
+    actorType: text("actor_type").notNull(),      // 'master_key' | 'scoped_token' | 'internal'
+    action: text("action").notNull(),              // 'repo.create' | 'repo.delete' | 'token.create' | etc.
+    resourceType: text("resource_type").notNull(), // 'repo' | 'token' | 'webhook' | 'branch'
+    resourceId: text("resource_id"),
+    metadata: jsonb("metadata"),
+    ipAddress: text("ip_address"),
+    requestId: text("request_id"),
+    createdAt: timestamp("created_at").defaultNow().notNull(),
+  },
+  (table) => [
+    index("audit_log_org_idx").on(table.orgId, table.createdAt),
+    index("audit_log_actor_idx").on(table.actorId),
+  ]
+);
+
+export type AuditLog = typeof auditLog.$inferSelect;
+export type NewAuditLog = typeof auditLog.$inferInsert;

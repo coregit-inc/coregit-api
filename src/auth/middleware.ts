@@ -13,7 +13,7 @@ import { sql } from "drizzle-orm";
 import type { Env, Variables } from "../types";
 import { getOrgPlan } from "../services/limits";
 import { recordUsage } from "../services/usage";
-import { checkRateLimit, rateLimitHeaders } from "../services/rate-limit";
+import { checkRateLimit, rateLimitHeaders, checkOrgRateLimit, orgRateLimitHeaders } from "../services/rate-limit";
 import type { Scopes } from "./scopes";
 
 const encoder = new TextEncoder();
@@ -162,6 +162,16 @@ export const apiKeyAuth = createMiddleware<{
       c.header(k, v);
     }
     return c.json({ error: "Rate limit exceeded", code: "RATE_LIMITED" }, 429);
+  }
+
+  // ── Per-org rate limiting ──
+  const orgRl = checkOrgRateLimit(authResult.orgId);
+  const orgRlHeaders = orgRateLimitHeaders(orgRl);
+  if (!orgRl.allowed) {
+    for (const [k, v] of Object.entries(orgRlHeaders)) {
+      c.header(k, v);
+    }
+    return c.json({ error: "Organization rate limit exceeded", code: "RATE_LIMITED" }, 429);
   }
 
   await next();

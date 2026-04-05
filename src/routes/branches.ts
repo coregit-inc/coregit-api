@@ -31,6 +31,7 @@ import {
   hashGitObject,
 } from "../git/objects";
 import { isValidRefName } from "../git/validation";
+import { recordAudit } from "../services/audit";
 import type { Env, Variables } from "../types";
 
 const branches = new Hono<{ Bindings: Env; Variables: Variables }>();
@@ -91,6 +92,13 @@ const createBranchHandler = async (c: any) => {
     }
 
     await storage.setRef(`refs/heads/${name}`, sourceSha);
+
+    recordAudit(c.executionCtx, db, {
+      orgId, actorId: c.get("apiKeyId"),
+      actorType: c.get("apiKeyPermissions") === null ? "master_key" : "scoped_token",
+      action: "branch.create", resourceType: "branch", resourceId: name,
+      metadata: { repo: slug, sha: sourceSha }, requestId: c.get("requestId"),
+    });
 
     return c.json({ name, sha: sourceSha, created: true }, 201);
   } catch (error) {
@@ -207,6 +215,14 @@ const deleteBranchHandler = async (c: any) => {
   if (!sha) return c.json({ error: "Branch not found" }, 404);
 
   await storage.deleteRef(`refs/heads/${name}`);
+
+  recordAudit(c.executionCtx, db, {
+    orgId, actorId: c.get("apiKeyId"),
+    actorType: c.get("apiKeyPermissions") === null ? "master_key" : "scoped_token",
+    action: "branch.delete", resourceType: "branch", resourceId: name,
+    metadata: { repo: slug }, requestId: c.get("requestId"),
+  });
+
   return c.json({ deleted: true, name });
 };
 branches.delete("/:slug/branches/:name", apiKeyAuth, deleteBranchHandler);

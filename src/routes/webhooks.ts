@@ -13,6 +13,9 @@ import { sql } from "drizzle-orm";
 import { nanoid } from "nanoid";
 import { apiKeyAuth } from "../auth/middleware";
 import { isMasterKey } from "../auth/scopes";
+import { recordAudit } from "../services/audit";
+import { isPrivateUrl } from "../services/url-validator";
+import { encryptSecret } from "../services/secret-manager";
 import type { Env, Variables } from "../types";
 
 const VALID_EVENTS = ["push", "repo.created", "repo.deleted", "branch.created", "branch.deleted", "*"];
@@ -56,6 +59,10 @@ webhooks.post("/webhooks", async (c) => {
     return c.json({ error: "url must use HTTPS", code: "VALIDATION_ERROR" }, 400);
   }
 
+  if (isPrivateUrl(body.url)) {
+    return c.json({ error: "Webhook URL must not point to private or internal addresses", code: "VALIDATION_ERROR" }, 400);
+  }
+
   if (!Array.isArray(body.events) || body.events.length === 0) {
     return c.json({ error: "events must be a non-empty array", code: "VALIDATION_ERROR" }, 400);
   }
@@ -69,10 +76,20 @@ webhooks.post("/webhooks", async (c) => {
   const id = nanoid();
   const secret = generateSecret();
 
+  // Encrypt secret before storing
+  const encryptionKey = c.env.WEBHOOK_ENCRYPTION_KEY || c.env.SYNC_ENCRYPTION_KEY;
+  const encryptedSecret = await encryptSecret(encryptionKey, secret);
+
   await db.execute(sql`
     INSERT INTO webhook (id, org_id, url, secret, events, active)
-    VALUES (${id}, ${orgId}, ${body.url}, ${secret}, ${body.events}, 'true')
+    VALUES (${id}, ${orgId}, ${body.url}, ${encryptedSecret}, ${body.events}, 'true')
   `);
+
+  recordAudit(c.executionCtx, db, {
+    orgId, actorId: c.get("apiKeyId"), actorType: "master_key",
+    action: "webhook.create", resourceType: "webhook", resourceId: id,
+    metadata: { url: body.url, events: body.events }, requestId: c.get("requestId"),
+  });
 
   return c.json({ id, url: body.url, events: body.events, secret, active: true }, 201);
 });
@@ -140,6 +157,9 @@ webhooks.patch("/webhooks/:id", async (c) => {
     if (!body.url.startsWith("https://")) {
       return c.json({ error: "url must use HTTPS", code: "VALIDATION_ERROR" }, 400);
     }
+    if (isPrivateUrl(body.url)) {
+      return c.json({ error: "Webhook URL must not point to private or internal addresses", code: "VALIDATION_ERROR" }, 400);
+    }
     sets.push("url");
     values.push(body.url);
   }
@@ -176,6 +196,12 @@ webhooks.patch("/webhooks/:id", async (c) => {
     await db.execute(sql`UPDATE webhook SET ${clause} WHERE id = ${id} AND org_id = ${orgId}`);
   }
 
+  recordAudit(c.executionCtx, db, {
+    orgId, actorId: c.get("apiKeyId"), actorType: "master_key",
+    action: "webhook.update", resourceType: "webhook", resourceId: id,
+    metadata: { fields: sets }, requestId: c.get("requestId"),
+  });
+
   return c.json({ updated: true });
 });
 
@@ -192,6 +218,12 @@ webhooks.delete("/webhooks/:id", async (c) => {
   await db.execute(
     sql`DELETE FROM webhook WHERE id = ${id} AND org_id = ${orgId}`
   );
+
+  recordAudit(c.executionCtx, db, {
+    orgId, actorId: c.get("apiKeyId"), actorType: "master_key",
+    action: "webhook.delete", resourceType: "webhook", resourceId: id,
+    requestId: c.get("requestId"),
+  });
 
   return c.json({ deleted: true });
 });

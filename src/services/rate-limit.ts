@@ -123,6 +123,82 @@ function evictStale(now: number): void {
   }
 }
 
+// ── Per-org rate limiting ──
+
+const ORG_PER_MINUTE = 2000;
+const ORG_PER_HOUR = 50_000;
+
+const orgWindows = new Map<string, KeyWindow>();
+let orgCheckCount = 0;
+
+export function checkOrgRateLimit(orgId: string): RateLimitResult {
+  const now = Date.now();
+
+  orgCheckCount++;
+  if (orgCheckCount >= 500) {
+    orgCheckCount = 0;
+    const hourAgo = now - HOUR_MS;
+    for (const [key, win] of orgWindows) {
+      if (win.timestamps.length === 0 || win.timestamps[win.timestamps.length - 1] < hourAgo) {
+        orgWindows.delete(key);
+      }
+    }
+    if (orgWindows.size > 5_000) {
+      const keys = [...orgWindows.keys()];
+      for (let i = 0; i < keys.length / 2; i++) {
+        orgWindows.delete(keys[i]);
+      }
+    }
+  }
+
+  let win = orgWindows.get(orgId);
+  if (!win) {
+    win = { timestamps: [] };
+    orgWindows.set(orgId, win);
+  }
+
+  const hourCutoff = now - HOUR_MS;
+  while (win.timestamps.length > 0 && win.timestamps[0] < hourCutoff) {
+    win.timestamps.shift();
+  }
+
+  const minuteCutoff = now - MINUTE_MS;
+  let minuteUsed = 0;
+  for (let i = win.timestamps.length - 1; i >= 0; i--) {
+    if (win.timestamps[i] >= minuteCutoff) minuteUsed++;
+    else break;
+  }
+
+  const hourUsed = win.timestamps.length;
+
+  if (minuteUsed >= ORG_PER_MINUTE) {
+    return {
+      allowed: false, minuteUsed, hourUsed,
+      retryAfterSec: Math.ceil((win.timestamps[win.timestamps.length - minuteUsed] + MINUTE_MS - now) / 1000),
+    };
+  }
+  if (hourUsed >= ORG_PER_HOUR) {
+    return {
+      allowed: false, minuteUsed, hourUsed,
+      retryAfterSec: Math.ceil((win.timestamps[0] + HOUR_MS - now) / 1000),
+    };
+  }
+
+  win.timestamps.push(now);
+  return { allowed: true, minuteUsed: minuteUsed + 1, hourUsed: hourUsed + 1, retryAfterSec: 0 };
+}
+
+export function orgRateLimitHeaders(result: RateLimitResult): Record<string, string> {
+  const headers: Record<string, string> = {
+    "X-Org-RateLimit-Limit": String(ORG_PER_MINUTE),
+    "X-Org-RateLimit-Remaining": String(Math.max(0, ORG_PER_MINUTE - result.minuteUsed)),
+  };
+  if (!result.allowed) {
+    headers["Retry-After"] = String(Math.max(1, result.retryAfterSec));
+  }
+  return headers;
+}
+
 /** Rate limit headers for the response */
 export function rateLimitHeaders(result: RateLimitResult): Record<string, string> {
   const headers: Record<string, string> = {

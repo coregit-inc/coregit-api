@@ -7,6 +7,7 @@
 
 import { sql } from "drizzle-orm";
 import type { Database } from "../db";
+import { decryptSecret } from "./secret-manager";
 
 const encoder = new TextEncoder();
 
@@ -50,16 +51,18 @@ export function deliverWebhooks(
   db: Database,
   orgId: string,
   event: WebhookEventType,
-  data: Record<string, unknown>
+  data: Record<string, unknown>,
+  encryptionKey?: string
 ): void {
-  ctx.waitUntil(doDeliver(db, orgId, event, data));
+  ctx.waitUntil(doDeliver(db, orgId, event, data, encryptionKey));
 }
 
 async function doDeliver(
   db: Database,
   orgId: string,
   event: WebhookEventType,
-  data: Record<string, unknown>
+  data: Record<string, unknown>,
+  encryptionKey?: string
 ): Promise<void> {
   // Fetch active webhooks that subscribe to this event
   const result = await db.execute(
@@ -87,7 +90,17 @@ async function doDeliver(
     .filter((wh) => wh.events.includes(event) || wh.events.includes("*"))
     .map(async (wh) => {
       try {
-        const signature = await sign(wh.secret, body);
+        // Decrypt secret if encryption key is available (new encrypted format contains ':')
+        let secret = wh.secret;
+        if (encryptionKey && wh.secret.includes(":")) {
+          try {
+            secret = await decryptSecret(encryptionKey, wh.secret);
+          } catch {
+            console.error(`[webhook] ${wh.id} failed to decrypt secret, skipping`);
+            return;
+          }
+        }
+        const signature = await sign(secret, body);
         const response = await fetch(wh.url, {
           method: "POST",
           headers: {

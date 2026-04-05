@@ -48,6 +48,7 @@ import { sync } from "./routes/sync";
 import { tokens } from "./routes/tokens";
 import { webhooks } from "./routes/webhooks";
 import { search } from "./routes/search";
+import { audit } from "./routes/audit";
 import type { Env, Variables } from "./types";
 
 const app = new Hono<{ Bindings: Env; Variables: Variables }>();
@@ -68,7 +69,7 @@ app.use("*", async (c, next) => {
 
 // ── Custom domain resolution (must run before CORS and routes) ──
 
-const DOMAIN_CACHE = new Map<string, { orgId: string; ts: number }>();
+const DOMAIN_CACHE = new Map<string, { orgId: string; status: string; ts: number }>();
 const DOMAIN_CACHE_TTL = 60_000;
 
 app.use("*", async (c, next) => {
@@ -87,6 +88,9 @@ app.use("*", async (c, next) => {
   // Custom domain request — resolve org
   const cached = DOMAIN_CACHE.get(host);
   if (cached && Date.now() - cached.ts < DOMAIN_CACHE_TTL) {
+    if (cached.status !== "active") {
+      return c.text("Domain is not active", 403);
+    }
     if (!c.env.DATABASE_URL) return c.text("Database not configured", 500);
     const db = createDb(c.env.DATABASE_URL);
     c.set("db", db);
@@ -111,7 +115,7 @@ app.use("*", async (c, next) => {
     return c.text("Unknown domain", 421);
   }
 
-  DOMAIN_CACHE.set(host, { orgId: row.org_id, ts: Date.now() });
+  DOMAIN_CACHE.set(host, { orgId: row.org_id, status: row.status, ts: Date.now() });
   if (DOMAIN_CACHE.size > 200) {
     const oldest = DOMAIN_CACHE.keys().next().value;
     if (oldest) DOMAIN_CACHE.delete(oldest);
@@ -250,6 +254,7 @@ app.route("/v1/repos", repos);
 app.route("/v1", tokens);
 app.route("/v1", webhooks);
 app.route("/v1", search);
+app.route("/v1", audit);
 app.route("/v1", multiWorkspace);
 app.route("/v1/usage", usage);
 
@@ -269,7 +274,11 @@ app.notFound((c) => c.json({ error: "Not found" }, 404));
 
 app.onError((err, c) => {
   const requestId = c.get("requestId") || crypto.randomUUID().slice(0, 8);
-  console.error(`[${requestId}] ${c.req.method} ${c.req.path}:`, err);
+  if (c.env.ENVIRONMENT === "development") {
+    console.error(`[${requestId}] ${c.req.method} ${c.req.path}:`, err);
+  } else {
+    console.error(`[${requestId}] ${c.req.method} ${c.req.path}: ${err?.message || "Unknown error"}`);
+  }
   return c.json({ error: "Internal server error", code: "INTERNAL_ERROR", request_id: requestId }, 500);
 });
 

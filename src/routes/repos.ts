@@ -16,6 +16,7 @@ import { repo, organization } from "../db/schema";
 import { GitR2Storage } from "../git/storage";
 import { createTree, createCommit, hashGitObject, parseGitObject, parseCommit } from "../git/objects";
 import { recordUsage } from "../services/usage";
+import { recordAudit } from "../services/audit";
 import { checkFreeLimits } from "../services/limits";
 import { isMasterKey, hasRepoAccess, getAccessibleRepoKeys } from "../auth/scopes";
 import { resolveRepo, buildGitUrl, buildApiUrl } from "../services/repo-resolver";
@@ -133,8 +134,13 @@ repos.post("/", apiKeyAuth, async (c) => {
       await storage.setRef(`refs/heads/${default_branch}`, commitSha);
     }
 
-    // Track usage
+    // Track usage + audit
     recordUsage(c.executionCtx, db, orgId, "repo_created", 1, { repo_id: repoId }, c.env.DODO_PAYMENTS_API_KEY, c.get("dodoCustomerId"));
+    recordAudit(c.executionCtx, db, {
+      orgId, actorId: c.get("apiKeyId"), actorType: "master_key",
+      action: "repo.create", resourceType: "repo", resourceId: repoId,
+      metadata: { slug, namespace: ns }, requestId: c.get("requestId"),
+    });
 
     // Look up org slug for git_url
     const [org] = await db
@@ -377,6 +383,12 @@ const patchRepoHandler = async (c: any) => {
       .where(eq(repo.id, found.id))
       .returning();
 
+    recordAudit(c.executionCtx, db, {
+      orgId, actorId: c.get("apiKeyId"), actorType: "master_key",
+      action: "repo.update", resourceType: "repo", resourceId: found.id,
+      metadata: { fields: Object.keys(updates) }, requestId: c.get("requestId"),
+    });
+
     return c.json({
       id: updated.id,
       namespace: updated.namespace,
@@ -431,6 +443,11 @@ const deleteRepoHandler = async (c: any) => {
     await db.delete(repo).where(eq(repo.id, found.id));
 
     recordUsage(c.executionCtx, db, orgId, "repo_deleted", 1, { repo_id: found.id }, c.env.DODO_PAYMENTS_API_KEY, c.get("dodoCustomerId"));
+    recordAudit(c.executionCtx, db, {
+      orgId, actorId: c.get("apiKeyId"), actorType: "master_key",
+      action: "repo.delete", resourceType: "repo", resourceId: found.id,
+      metadata: { slug: found.slug }, requestId: c.get("requestId"),
+    });
 
     return c.json({ deleted: true });
   } catch (error) {

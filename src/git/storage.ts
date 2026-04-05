@@ -54,12 +54,17 @@ export class GitR2Storage {
     const compressed = new Uint8Array(await obj.arrayBuffer());
 
     // Decompress using sync unzlibSync — matches zlibSync format, no async overhead
+    const MAX_DECOMPRESSED_SIZE = 100 * 1024 * 1024; // 100 MB
     let result: Uint8Array;
     try {
       result = unzlibSync(compressed);
     } catch {
       // If decompression fails, return raw (might be uncompressed)
       result = compressed;
+    }
+
+    if (result.byteLength > MAX_DECOMPRESSED_SIZE) {
+      throw new Error(`Git object exceeds ${MAX_DECOMPRESSED_SIZE} byte decompression limit`);
     }
 
     // Populate cache with simple size-based eviction
