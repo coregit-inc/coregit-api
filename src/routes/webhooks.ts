@@ -22,15 +22,12 @@ const VALID_EVENTS = ["push", "repo.created", "repo.deleted", "branch.created", 
 
 const webhooks = new Hono<{ Bindings: Env; Variables: Variables }>();
 
-// All webhook routes require master key
-webhooks.use("/*", apiKeyAuth);
-
 function generateSecret(): string {
   return "whsec_" + nanoid(32);
 }
 
 // POST /v1/webhooks
-webhooks.post("/webhooks", async (c) => {
+webhooks.post("/webhooks", apiKeyAuth, async (c) => {
   if (!isMasterKey(c.get("apiKeyPermissions"))) {
     return c.json({ error: "Only master API keys can manage webhooks", code: "FORBIDDEN" }, 403);
   }
@@ -95,7 +92,7 @@ webhooks.post("/webhooks", async (c) => {
 });
 
 // GET /v1/webhooks
-webhooks.get("/webhooks", async (c) => {
+webhooks.get("/webhooks", apiKeyAuth, async (c) => {
   if (!isMasterKey(c.get("apiKeyPermissions"))) {
     return c.json({ error: "Only master API keys can manage webhooks", code: "FORBIDDEN" }, 403);
   }
@@ -112,7 +109,7 @@ webhooks.get("/webhooks", async (c) => {
 });
 
 // GET /v1/webhooks/:id
-webhooks.get("/webhooks/:id", async (c) => {
+webhooks.get("/webhooks/:id", apiKeyAuth, async (c) => {
   if (!isMasterKey(c.get("apiKeyPermissions"))) {
     return c.json({ error: "Only master API keys can manage webhooks", code: "FORBIDDEN" }, 403);
   }
@@ -134,7 +131,7 @@ webhooks.get("/webhooks/:id", async (c) => {
 });
 
 // PATCH /v1/webhooks/:id
-webhooks.patch("/webhooks/:id", async (c) => {
+webhooks.patch("/webhooks/:id", apiKeyAuth, async (c) => {
   if (!isMasterKey(c.get("apiKeyPermissions"))) {
     return c.json({ error: "Only master API keys can manage webhooks", code: "FORBIDDEN" }, 403);
   }
@@ -206,7 +203,7 @@ webhooks.patch("/webhooks/:id", async (c) => {
 });
 
 // DELETE /v1/webhooks/:id
-webhooks.delete("/webhooks/:id", async (c) => {
+webhooks.delete("/webhooks/:id", apiKeyAuth, async (c) => {
   if (!isMasterKey(c.get("apiKeyPermissions"))) {
     return c.json({ error: "Only master API keys can manage webhooks", code: "FORBIDDEN" }, 403);
   }
