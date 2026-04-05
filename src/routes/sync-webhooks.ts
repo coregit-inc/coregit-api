@@ -171,45 +171,47 @@ async function runImportSync(
   }
 }
 
+
 // POST /v1/sync-webhooks/github
 syncWebhooks.post("/sync-webhooks/github", async (c) => {
-  const event = c.req.header("X-GitHub-Event");
-  if (event !== "push") {
-    return c.json({ ignored: true, reason: "not a push event" });
-  }
-
-  const signature = c.req.header("X-Hub-Signature-256");
-  if (!signature) {
-    return c.json({ error: "Missing signature" }, 401);
-  }
-
-  const rawBody = await c.req.text();
-  let payload: { repository?: { full_name?: string }; ref?: string };
   try {
-    payload = JSON.parse(rawBody);
-  } catch {
-    return c.json({ error: "Invalid JSON" }, 400);
-  }
+    const event = c.req.header("X-GitHub-Event");
+    if (event !== "push") {
+      return c.json({ ignored: true, reason: "not a push event" });
+    }
 
-  const fullName = payload.repository?.full_name;
-  if (!fullName) {
-    return c.json({ error: "Missing repository.full_name" }, 400);
-  }
+    const signature = c.req.header("X-Hub-Signature-256");
+    if (!signature) {
+      return c.json({ error: "Missing signature" }, 401);
+    }
 
-  // Find matching sync configs — DB already set by /v1/* middleware
-  const db = c.get("db") || createDb(c.env.DATABASE_URL);
+    const rawBody = await c.req.text();
+    let payload: { repository?: { full_name?: string }; ref?: string };
+    try {
+      payload = JSON.parse(rawBody);
+    } catch {
+      return c.json({ error: "Invalid JSON" }, 400);
+    }
 
-  const syncConfigs = await db
-    .select()
-    .from(repoSync)
-    .where(
-      and(
-        eq(repoSync.remote, fullName),
-        eq(repoSync.provider, "github"),
-        eq(repoSync.direction, "import"),
-        eq(repoSync.autoSync, true)
-      )
-    );
+    const fullName = payload.repository?.full_name;
+    if (!fullName) {
+      return c.json({ error: "Missing repository.full_name" }, 400);
+    }
+
+    // Find matching sync configs — DB already set by /v1/* middleware
+    const db = c.get("db") || createDb(c.env.DATABASE_URL);
+
+    const syncConfigs = await db
+      .select()
+      .from(repoSync)
+      .where(
+        and(
+          eq(repoSync.remote, fullName),
+          eq(repoSync.provider, "github"),
+          eq(repoSync.direction, "import"),
+          eq(repoSync.autoSync, true)
+        )
+      );
 
   if (syncConfigs.length === 0) {
     return c.json({ ignored: true, reason: "no matching sync config" });
@@ -244,77 +246,86 @@ syncWebhooks.post("/sync-webhooks/github", async (c) => {
   }
 
   return c.json({ accepted: true });
+  } catch (err) {
+    console.error("GitHub webhook handler error:", err);
+    return c.json({ error: err instanceof Error ? err.message : "Webhook processing failed" }, 500);
+  }
 });
 
 // POST /v1/sync-webhooks/gitlab
 syncWebhooks.post("/sync-webhooks/gitlab", async (c) => {
-  const gitlabEvent = c.req.header("X-Gitlab-Event");
-  if (gitlabEvent !== "Push Hook") {
-    return c.json({ ignored: true, reason: "not a push event" });
-  }
-
-  const gitlabToken = c.req.header("X-Gitlab-Token");
-  if (!gitlabToken) {
-    return c.json({ error: "Missing X-Gitlab-Token" }, 401);
-  }
-
-  let payload: { project?: { path_with_namespace?: string }; ref?: string };
   try {
-    payload = await c.req.json();
-  } catch {
-    return c.json({ error: "Invalid JSON" }, 400);
-  }
-
-  const projectPath = payload.project?.path_with_namespace;
-  if (!projectPath) {
-    return c.json({ error: "Missing project.path_with_namespace" }, 400);
-  }
-
-  const db = c.get("db") || createDb(c.env.DATABASE_URL);
-
-  const syncConfigs = await db
-    .select()
-    .from(repoSync)
-    .where(
-      and(
-        eq(repoSync.remote, projectPath),
-        eq(repoSync.provider, "gitlab"),
-        eq(repoSync.direction, "import"),
-        eq(repoSync.autoSync, true)
-      )
-    );
-
-  if (syncConfigs.length === 0) {
-    return c.json({ ignored: true, reason: "no matching sync config" });
-  }
-
-  // Verify token against each matching sync config
-  let matched = false;
-  for (const cfg of syncConfigs) {
-    const expectedSecret = await computeWebhookSecret(c.env.SYNC_ENCRYPTION_KEY, cfg.id);
-    if (timingSafeEqual(gitlabToken, expectedSecret)) {
-      matched = true;
-
-      const [conn] = await db
-        .select()
-        .from(externalConnection)
-        .where(eq(externalConnection.id, cfg.connectionId))
-        .limit(1);
-
-      if (conn) {
-        c.executionCtx.waitUntil(
-          runImportSync(db, c.env.REPOS_BUCKET, cfg, conn, c.env.SYNC_ENCRYPTION_KEY)
-        );
-      }
-      break;
+    const gitlabEvent = c.req.header("X-Gitlab-Event");
+    if (gitlabEvent !== "Push Hook") {
+      return c.json({ ignored: true, reason: "not a push event" });
     }
-  }
 
-  if (!matched) {
-    return c.json({ error: "Token verification failed" }, 401);
-  }
+    const gitlabToken = c.req.header("X-Gitlab-Token");
+    if (!gitlabToken) {
+      return c.json({ error: "Missing X-Gitlab-Token" }, 401);
+    }
 
-  return c.json({ accepted: true });
+    let payload: { project?: { path_with_namespace?: string }; ref?: string };
+    try {
+      payload = await c.req.json();
+    } catch {
+      return c.json({ error: "Invalid JSON" }, 400);
+    }
+
+    const projectPath = payload.project?.path_with_namespace;
+    if (!projectPath) {
+      return c.json({ error: "Missing project.path_with_namespace" }, 400);
+    }
+
+    const db = c.get("db") || createDb(c.env.DATABASE_URL);
+
+    const syncConfigs = await db
+      .select()
+      .from(repoSync)
+      .where(
+        and(
+          eq(repoSync.remote, projectPath),
+          eq(repoSync.provider, "gitlab"),
+          eq(repoSync.direction, "import"),
+          eq(repoSync.autoSync, true)
+        )
+      );
+
+    if (syncConfigs.length === 0) {
+      return c.json({ ignored: true, reason: "no matching sync config" });
+    }
+
+    // Verify token against each matching sync config
+    let matched = false;
+    for (const cfg of syncConfigs) {
+      const expectedSecret = await computeWebhookSecret(c.env.SYNC_ENCRYPTION_KEY, cfg.id);
+      if (timingSafeEqual(gitlabToken, expectedSecret)) {
+        matched = true;
+
+        const [conn] = await db
+          .select()
+          .from(externalConnection)
+          .where(eq(externalConnection.id, cfg.connectionId))
+          .limit(1);
+
+        if (conn) {
+          c.executionCtx.waitUntil(
+            runImportSync(db, c.env.REPOS_BUCKET, cfg, conn, c.env.SYNC_ENCRYPTION_KEY)
+          );
+        }
+        break;
+      }
+    }
+
+    if (!matched) {
+      return c.json({ error: "Token verification failed" }, 401);
+    }
+
+    return c.json({ accepted: true });
+  } catch (err) {
+    console.error("GitLab webhook handler error:", err);
+    return c.json({ error: err instanceof Error ? err.message : "Webhook processing failed" }, 500);
+  }
 });
 
 export { syncWebhooks };

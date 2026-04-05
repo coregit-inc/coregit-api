@@ -35,3 +35,4 @@ invocation_logs = true
 # GITHUB_CLIENT_ID       — GitHub OAuth (for dashboard login)
 # GITHUB_CLIENT_SECRET
 # DODO_PAYMENTS_API_KEY  — Dodo Payments API key for usage event ingestion
+# SYNC_ENCRYPTION_KEY    — 32-byte hex key for encrypting external connection tokens & webhook secrets
