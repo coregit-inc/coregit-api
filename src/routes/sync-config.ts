@@ -245,6 +245,10 @@ const createConfigHandler = async (c: any) => {
     }
   }
 
+  if (webhookId) {
+    await db.update(repoSync).set({ externalWebhookId: String(webhookId) }).where(eq(repoSync.id, syncId));
+  }
+
   return c.json(
     {
       id: syncId,
@@ -375,33 +379,54 @@ const patchConfigHandler = async (c: any) => {
   const newDirection = body.direction ?? existing.direction;
   const newAutoSync = body.auto_sync ?? existing.autoSync;
   const remote = body.remote ?? existing.remote;
+  const needsWebhook = newAutoSync && newDirection === "import";
+  const remoteChanged = body.remote !== undefined && body.remote !== existing.remote;
 
-  if (newAutoSync && newDirection === "import") {
-    // Ensure webhook exists (register if needed)
-    try {
-      const [conn] = await db
-        .select()
-        .from(externalConnection)
-        .where(eq(externalConnection.id, existing.connectionId))
-        .limit(1);
-      if (conn) {
-        const token = await decryptSecret(c.env.SYNC_ENCRYPTION_KEY, conn.encryptedAccessToken);
+  try {
+    const [conn] = await db
+      .select()
+      .from(externalConnection)
+      .where(eq(externalConnection.id, existing.connectionId))
+      .limit(1);
+
+    if (conn) {
+      const token = await decryptSecret(c.env.SYNC_ENCRYPTION_KEY, conn.encryptedAccessToken);
+
+      // Delete old webhook if no longer needed or remote changed
+      if (existing.externalWebhookId && (!needsWebhook || remoteChanged)) {
+        const hookId = parseInt(existing.externalWebhookId, 10);
+        if (conn.provider === "github") {
+          const parsed = parseRemote(existing.remote, "github");
+          if (parsed) await deleteGithubWebhook(token, parsed.owner, parsed.repo, hookId);
+        } else if (conn.provider === "gitlab") {
+          await deleteGitlabWebhook(token, existing.remote, hookId);
+        }
+        await db.update(repoSync).set({ externalWebhookId: null }).where(eq(repoSync.id, existing.id));
+      }
+
+      // Register new webhook if needed and doesn't already exist (or remote changed)
+      if (needsWebhook && (!existing.externalWebhookId || remoteChanged)) {
         const secret = await computeWebhookSecret(c.env.SYNC_ENCRYPTION_KEY, existing.id);
+        let newWebhookId: number | null = null;
 
         if (conn.provider === "github") {
           const parsed = parseRemote(remote, "github");
           if (parsed) {
             const webhookUrl = `https://api.coregit.dev/v1/sync-webhooks/github`;
-            await registerGithubWebhook(token, parsed.owner, parsed.repo, webhookUrl, secret);
+            newWebhookId = await registerGithubWebhook(token, parsed.owner, parsed.repo, webhookUrl, secret);
           }
         } else if (conn.provider === "gitlab") {
           const webhookUrl = `https://api.coregit.dev/v1/sync-webhooks/gitlab`;
-          await registerGitlabWebhook(token, remote, webhookUrl, secret);
+          newWebhookId = await registerGitlabWebhook(token, remote, webhookUrl, secret);
+        }
+
+        if (newWebhookId) {
+          await db.update(repoSync).set({ externalWebhookId: String(newWebhookId) }).where(eq(repoSync.id, existing.id));
         }
       }
-    } catch (err) {
-      console.error("Webhook registration on config update failed:", err);
     }
+  } catch (err) {
+    console.error("Webhook lifecycle update failed:", err);
   }
 
   return c.json({ updated: true });
@@ -430,6 +455,32 @@ const deleteConfigHandler = async (c: any) => {
     .limit(1);
 
   if (!existing) return c.json({ error: "Sync config not found" }, 404);
+
+  // Clean up external webhook before deleting
+  if (existing.externalWebhookId) {
+    try {
+      const [conn] = await db
+        .select()
+        .from(externalConnection)
+        .where(eq(externalConnection.id, existing.connectionId))
+        .limit(1);
+      if (conn) {
+        const token = await decryptSecret(c.env.SYNC_ENCRYPTION_KEY, conn.encryptedAccessToken);
+        const hookId = parseInt(existing.externalWebhookId, 10);
+        if (conn.provider === "github") {
+          const parsed = parseRemote(existing.remote, "github");
+          if (parsed) {
+            await deleteGithubWebhook(token, parsed.owner, parsed.repo, hookId);
+          }
+        } else if (conn.provider === "gitlab") {
+          await deleteGitlabWebhook(token, existing.remote, hookId);
+        }
+      }
+    } catch (err) {
+      console.error("Webhook cleanup failed:", err);
+      // Non-fatal — still delete the config
+    }
+  }
 
   // Delete cascade will handle repoSyncRun records
   await db.delete(repoSync).where(eq(repoSync.id, existing.id));

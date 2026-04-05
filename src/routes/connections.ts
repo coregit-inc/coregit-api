@@ -211,6 +211,37 @@ connections.patch("/connections/:id", apiKeyAuth, async (c) => {
   return c.json({ updated: true });
 });
 
+// POST /v1/connections/:id/test
+connections.post("/connections/:id/test", apiKeyAuth, async (c) => {
+  const orgId = c.get("orgId");
+  const db = c.get("db");
+  const connId = c.req.param("id");
+
+  const [conn] = await db
+    .select()
+    .from(externalConnection)
+    .where(and(eq(externalConnection.id, connId), eq(externalConnection.orgId, orgId)))
+    .limit(1);
+
+  if (!conn) {
+    return c.json({ error: "Connection not found" }, 404);
+  }
+
+  try {
+    const token = await decryptSecret(c.env.SYNC_ENCRYPTION_KEY, conn.encryptedAccessToken);
+    const username =
+      conn.provider === "github"
+        ? await validateGithubToken(token)
+        : await validateGitlabToken(token);
+    return c.json({ valid: true, username });
+  } catch (err) {
+    return c.json({
+      valid: false,
+      error: err instanceof Error ? err.message : "Token validation failed",
+    });
+  }
+});
+
 // DELETE /v1/connections/:id
 connections.delete("/connections/:id", apiKeyAuth, async (c) => {
   const orgId = c.get("orgId");

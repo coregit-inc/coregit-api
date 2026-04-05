@@ -200,6 +200,7 @@ export const repoSync = pgTable(
     lastSyncedSha: text("last_synced_sha"),
     lastSyncedAt: timestamp("last_synced_at"),
     lastError: text("last_error"),
+    externalWebhookId: text("external_webhook_id"),
     createdAt: timestamp("created_at").defaultNow().notNull(),
     updatedAt: timestamp("updated_at")
       .defaultNow()
