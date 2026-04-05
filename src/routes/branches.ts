@@ -255,7 +255,7 @@ const mergeBranchHandler = async (c: any) => {
   const storage = resolved.storage;
 
   let body: {
-    target?: string;
+    source: string;
     strategy?: "fast-forward" | "merge-commit" | "squash";
     message?: string;
     author?: { name: string; email: string };
@@ -267,15 +267,20 @@ const mergeBranchHandler = async (c: any) => {
     return c.json({ error: "Invalid JSON body" }, 400);
   }
 
-  const target = body.target || found.defaultBranch;
+  const target = name;
+  const source = body.source;
   const strategy = body.strategy || "fast-forward";
+
+  if (!source) {
+    return c.json({ error: "Source branch is required (body.source)" }, 400);
+  }
 
   if (!["fast-forward", "merge-commit", "squash"].includes(strategy)) {
     return c.json({ error: "Invalid strategy. Must be: fast-forward, merge-commit, or squash" }, 400);
   }
 
-  const sourceSha = await storage.getRef(`refs/heads/${name}`);
-  if (!sourceSha) return c.json({ error: `Source branch '${name}' not found` }, 404);
+  const sourceSha = await storage.getRef(`refs/heads/${source}`);
+  if (!sourceSha) return c.json({ error: `Source branch '${source}' not found` }, 404);
 
   const targetRef = await storage.getRefWithEtag(`refs/heads/${target}`);
   if (!targetRef) return c.json({ error: `Target branch '${target}' not found` }, 404);
@@ -342,7 +347,7 @@ const mergeBranchHandler = async (c: any) => {
       }
 
       // Create merge commit with two parents
-      const mergeMessage = body.message || `Merge branch '${name}' into ${target}`;
+      const mergeMessage = body.message || `Merge branch '${source}' into ${target}`;
       const mergeCommitContent = createCommit({
         tree: mergedTreeSha,
         parents: [targetSha, sourceSha],
@@ -407,7 +412,7 @@ const mergeBranchHandler = async (c: any) => {
       }
 
       // Create squash commit (single parent = target)
-      const squashMessage = body.message || `Squash merge branch '${name}' into ${target}`;
+      const squashMessage = body.message || `Squash merge branch '${source}' into ${target}`;
       const squashCommitContent = createCommit({
         tree: treeSha!,
         parents: [targetSha],

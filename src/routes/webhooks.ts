@@ -79,7 +79,7 @@ webhooks.post("/webhooks", apiKeyAuth, async (c) => {
 
   await db.execute(sql`
     INSERT INTO webhook (id, org_id, url, secret, events, active)
-    VALUES (${id}, ${orgId}, ${body.url}, ${encryptedSecret}, ${body.events}, 'true')
+    VALUES (${id}, ${orgId}, ${body.url}, ${encryptedSecret}, ${body.events}::text[], true)
   `);
 
   recordAudit(c.executionCtx, db, {
@@ -182,9 +182,9 @@ webhooks.patch("/webhooks/:id", apiKeyAuth, async (c) => {
 
   // Build dynamic update — safe because column names are hardcoded above
   const setClauses = sets.map((col, i) => {
-    if (col === "events") return sql`events = ${body.events}`;
+    if (col === "events") return sql`events = ${body.events}::text[]`;
     if (col === "url") return sql`url = ${body.url}`;
-    if (col === "active") return sql`active = ${String(body.active)}`;
+    if (col === "active") return sql`active = ${body.active}`;
     return sql``;
   });
 
