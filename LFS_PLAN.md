@@ -157,10 +157,13 @@ Content-Type: application/vnd.git-lfs+json
 6. Проверить storage quota перед генерацией URL
 
 **Download:**
-1. Auth → resolve org + repo
-2. Для каждого object: проверить существует ли в R2
+1. Auth → resolve org + repo (для public repos auth опциональна — как git clone)
+2. Для каждого object: `LFS_BUCKET.head(key)` через R2 binding (не presigned, быстрее)
 3. Если да → сгенерировать presigned GET URL (1 час TTL)
 4. Если нет → вернуть per-object error `{ "code": 404, "message": "Object not found" }`
+
+**Public repos:**
+Если repo visibility = "public", Batch API download работает без auth (как git clone для public repos). Upload всегда требует auth.
 
 **Deduplication:**
 LFS objects адресуются по SHA-256. Если два repo в одном org загружают одинаковый файл, можно хранить одну копию. Но для простоты и изоляции — хранить per-repo.
@@ -196,12 +199,22 @@ const downloadUrl = await r2.sign(
 );
 ```
 
-### Secrets нужные в wrangler.toml:
+### wrangler.toml additions:
+```toml
+# R2 binding для HEAD/list checks (быстро, без presigned URLs)
+[[r2_buckets]]
+binding = "LFS_BUCKET"
+bucket_name = "coregit-lfs"
 ```
+
+```
+# Secrets для presigned URL generation (wrangler secret put)
 R2_ACCESS_KEY_ID          — R2 API token (S3-compatible)
 R2_SECRET_ACCESS_KEY      — R2 API secret
 R2_ACCOUNT_ID             — Cloudflare Account ID
 ```
+
+R2 binding используется для `HEAD`/`list`/`delete` операций (из Worker напрямую). Presigned URLs генерируются через S3 API credentials для direct client upload/download.
 
 ---
 
@@ -472,7 +485,7 @@ LFS объекты могут стать orphaned когда:
 | `src/services/lfs-presign.ts` | NEW: R2 presigned URL generation via aws4fetch |
 | `src/db/schema.ts` | ADD: lfs_object, lfs_lock tables |
 | `src/index.ts` | REGISTER: LFS routes |
-| `wrangler.toml` | ADD: coregit-lfs R2 binding (optional, for HEAD checks) |
+| `wrangler.toml` | ADD: LFS_BUCKET R2 binding + secrets |
 
 ---
 
