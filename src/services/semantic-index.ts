@@ -1,6 +1,7 @@
 /**
  * Semantic search indexing service.
- * Handles delta indexing (per-commit) and full reindexing (fan-out via queue).
+ * Content-addressed: vectors keyed by blob SHA (like git itself).
+ * Same content = same vector, no duplication across branches/commits.
  */
 
 import { eq, and, sql } from "drizzle-orm";
@@ -12,8 +13,7 @@ import { chunkFile } from "./chunker";
 import { embedCode } from "./voyage";
 import {
   upsertVectors,
-  deleteByPrefix,
-  deleteNamespace,
+  vectorsExist,
   type VectorRecord,
 } from "./pinecone";
 import { semanticIndex } from "../db/schema";
@@ -29,7 +29,7 @@ export interface IndexFileMessage {
   repoStorageSuffix: string;
   branch: string;
   commitSha: string;
-  /** True when this message is part of a full-reindex fan-out (namespace already wiped). */
+  /** True when this message is part of a full-reindex fan-out. */
   isFullReindex?: boolean;
   files: Array<{
     path: string;
@@ -49,8 +49,9 @@ export interface FullReindexMessage {
 
 export type IndexingMessage = IndexFileMessage | FullReindexMessage;
 
-function pineconeNamespace(orgId: string, repoId: string, branch: string): string {
-  return `${orgId}/${repoId}/${branch}`;
+/** One namespace per repo — all versions live together. */
+function pineconeNamespace(orgId: string, repoId: string): string {
+  return `${orgId}/${repoId}`;
 }
 
 // ── Delta indexing (per-commit) ──
@@ -64,62 +65,68 @@ export async function processIndexFileMessage(
   const host = env.PINECONE_INDEX_HOST!;
   const pineconeKey = env.PINECONE_API_KEY!;
   const voyageKey = env.VOYAGE_API_KEY!;
-  const namespace = pineconeNamespace(orgId, repoId, branch);
+  const namespace = pineconeNamespace(orgId, repoId);
 
-  // Race condition check: skip if a newer commit was already indexed
-  const [existing] = await db
-    .select({ lastCommitSha: semanticIndex.lastCommitSha })
-    .from(semanticIndex)
-    .where(and(eq(semanticIndex.repoId, repoId), eq(semanticIndex.branch, branch)))
-    .limit(1);
+  // Race condition check: skip if a newer commit was already indexed for this branch
+  if (!msg.isFullReindex) {
+    const [existing] = await db
+      .select({ lastCommitSha: semanticIndex.lastCommitSha })
+      .from(semanticIndex)
+      .where(and(eq(semanticIndex.repoId, repoId), eq(semanticIndex.branch, branch)))
+      .limit(1);
 
-  // If index exists with a different commit and it's not our parent, skip
-  // (simplified: just check if lastCommitSha matches our expected parent)
-  if (existing?.lastCommitSha && existing.lastCommitSha !== commitSha) {
-    // Another commit was already indexed — this message may be stale
-    // Read the commit to check if our commit's parent matches lastCommitSha
-    const storage = new GitR2Storage(env.REPOS_BUCKET, orgId, repoStorageSuffix);
-    const raw = await storage.getObject(commitSha);
-    if (raw) {
-      const obj = parseGitObject(raw);
-      if (obj.type === "commit") {
-        const commit = parseCommit(obj.content);
-        const parent = commit.parents[0];
-        if (parent && parent !== existing.lastCommitSha) {
-          // Our parent is not the last indexed commit — skip (stale message)
-          console.log(`Skipping stale index message: ${commitSha} (last indexed: ${existing.lastCommitSha})`);
-          return 0;
+    if (existing?.lastCommitSha && existing.lastCommitSha !== commitSha) {
+      const storage = new GitR2Storage(env.REPOS_BUCKET, orgId, repoStorageSuffix);
+      const raw = await storage.getObject(commitSha);
+      if (raw) {
+        const obj = parseGitObject(raw);
+        if (obj.type === "commit") {
+          const commit = parseCommit(obj.content);
+          const parent = commit.parents[0];
+          if (parent && parent !== existing.lastCommitSha) {
+            console.log(`Skipping stale index message: ${commitSha} (last indexed: ${existing.lastCommitSha})`);
+            return 0;
+          }
         }
       }
     }
   }
 
-  const storage = new GitR2Storage(env.REPOS_BUCKET, orgId, repoStorageSuffix);
-  const allChunks: { text: string; filePath: string; startLine: number; endLine: number; language: string; chunkIndex: number; blobSha: string }[] = [];
-
-  // Delete old vectors for changed/deleted/renamed files
-  // Skip during full reindex — processFullReindex already wiped the namespace
-  if (!msg.isFullReindex) {
-    const pathsToDelete: string[] = [];
-    for (const file of files) {
-      pathsToDelete.push(file.path);
-      if (file.oldPath) pathsToDelete.push(file.oldPath);
-    }
-
-    for (const path of pathsToDelete) {
-      await deleteByPrefix(host, pineconeKey, namespace, `${path}#`).catch((err) => {
-        console.error(`deleteByPrefix failed for ${path}:`, err);
-      });
-    }
-  }
-
-  // Read blobs and chunk non-deleted files
+  // Collect blob SHAs that need embedding
+  const blobsToProcess: Array<{ path: string; blobSha: string }> = [];
   for (const file of files) {
     if (file.action === "delete" || !file.blobSha) continue;
+    blobsToProcess.push({ path: file.path, blobSha: file.blobSha });
+  }
 
-    const blobRaw = await storage.getObject(file.blobSha);
+  if (blobsToProcess.length === 0) return 0;
+
+  // Check which blob SHAs already have vectors (content-addressed dedup)
+  const checkIds = blobsToProcess.map((b) => `${b.blobSha}:0`);
+  const existingIds = await vectorsExist(host, pineconeKey, namespace, checkIds);
+
+  // Filter to only new blobs
+  const newBlobs = blobsToProcess.filter((b) => !existingIds.has(`${b.blobSha}:0`));
+
+  if (newBlobs.length === 0) {
+    // All blobs already embedded — just update DB tracking
+    if (!msg.isFullReindex) {
+      await updateIndexTracking(db, repoId, orgId, branch, commitSha, 0);
+    }
+    return 0;
+  }
+
+  // Read blobs and chunk
+  const storage = new GitR2Storage(env.REPOS_BUCKET, orgId, repoStorageSuffix);
+  const allChunks: Array<{
+    text: string; filePath: string; startLine: number; endLine: number;
+    language: string; chunkIndex: number; blobSha: string;
+  }> = [];
+
+  for (const { path, blobSha } of newBlobs) {
+    const blobRaw = await storage.getObject(blobSha);
     if (!blobRaw) {
-      console.error(`Blob not found: ${file.blobSha} for ${file.path}`);
+      console.error(`Blob not found: ${blobSha} for ${path}`);
       continue;
     }
 
@@ -127,7 +134,7 @@ export async function processIndexFileMessage(
     if (blobObj.type !== "blob") continue;
 
     const text = new TextDecoder().decode(blobObj.content);
-    const chunks = chunkFile(file.path, text);
+    const chunks = chunkFile(path, text);
 
     for (const chunk of chunks) {
       allChunks.push({
@@ -137,22 +144,21 @@ export async function processIndexFileMessage(
         endLine: chunk.end_line,
         language: chunk.language,
         chunkIndex: chunk.chunk_index,
-        blobSha: file.blobSha,
+        blobSha,
       });
     }
   }
 
   if (allChunks.length > 0) {
-    // Embed all chunks
     const embeddings = await embedCode(
       allChunks.map((c) => c.text),
       "document",
       voyageKey
     );
 
-    // Build vectors (no text stored in Pinecone)
+    // Content-addressed vector IDs: {blob_sha}:{chunk_index}
     const vectors: VectorRecord[] = allChunks.map((chunk, i) => ({
-      id: `${chunk.filePath}#${chunk.chunkIndex}`,
+      id: `${chunk.blobSha}:${chunk.chunkIndex}`,
       values: embeddings[i],
       metadata: {
         file_path: chunk.filePath,
@@ -167,34 +173,40 @@ export async function processIndexFileMessage(
     await upsertVectors(host, pineconeKey, namespace, vectors);
   }
 
-  // Update DB — only for delta indexing.
-  // Full-reindex batches are tracked via incrementBatchCounter instead.
+  // Update DB — only for delta indexing (full-reindex uses incrementBatchCounter)
   if (!msg.isFullReindex) {
-    await db
-      .insert(semanticIndex)
-      .values({
-        id: nanoid(),
-        repoId,
-        orgId,
-        branch,
-        lastCommitSha: commitSha,
-        chunksCount: allChunks.length,
-        status: "ready",
-        indexedAt: new Date(),
-      })
-      .onConflictDoUpdate({
-        target: [semanticIndex.repoId, semanticIndex.branch],
-        set: {
-          lastCommitSha: commitSha,
-          chunksCount: sql`${semanticIndex.chunksCount} + ${allChunks.length}`,
-          status: "ready",
-          indexedAt: new Date(),
-          error: null,
-        },
-      });
+    await updateIndexTracking(db, repoId, orgId, branch, commitSha, allChunks.length);
   }
 
   return allChunks.length;
+}
+
+async function updateIndexTracking(
+  db: Database, repoId: string, orgId: string, branch: string,
+  commitSha: string, newChunks: number
+): Promise<void> {
+  await db
+    .insert(semanticIndex)
+    .values({
+      id: nanoid(),
+      repoId,
+      orgId,
+      branch,
+      lastCommitSha: commitSha,
+      chunksCount: newChunks,
+      status: "ready",
+      indexedAt: new Date(),
+    })
+    .onConflictDoUpdate({
+      target: [semanticIndex.repoId, semanticIndex.branch],
+      set: {
+        lastCommitSha: commitSha,
+        chunksCount: sql`${semanticIndex.chunksCount} + ${newChunks}`,
+        status: "ready",
+        indexedAt: new Date(),
+        error: null,
+      },
+    });
 }
 
 // ── Full reindex (fan-out via queue) ──
@@ -205,16 +217,8 @@ export async function processFullReindex(
   db: Database
 ): Promise<void> {
   const { orgId, repoId, repoStorageSuffix, branch } = msg;
-  const host = env.PINECONE_INDEX_HOST!;
-  const pineconeKey = env.PINECONE_API_KEY!;
-  const namespace = pineconeNamespace(orgId, repoId, branch);
 
-  // 1. Delete entire namespace
-  await deleteNamespace(host, pineconeKey, namespace).catch((err) => {
-    console.error(`deleteNamespace failed for ${namespace}:`, err);
-  });
-
-  // 2. Flatten tree from branch HEAD
+  // Flatten tree from branch HEAD
   const storage = new GitR2Storage(env.REPOS_BUCKET, orgId, repoStorageSuffix);
   const commitSha = await storage.getRef(`refs/heads/${branch}`);
   if (!commitSha) {
@@ -229,49 +233,26 @@ export async function processFullReindex(
   const commit = parseCommit(obj.content);
   const tree = await flattenTree(storage, commit.tree);
 
-  // 3. Collect all files
+  // Collect all files
   const allFiles: Array<{ path: string; blobSha: string }> = [];
   for (const [path, entry] of tree) {
-    if (entry.mode === "40000") continue; // skip dirs
+    if (entry.mode === "40000") continue;
     allFiles.push({ path, blobSha: entry.sha });
   }
 
   if (allFiles.length === 0) {
-    await db
-      .insert(semanticIndex)
-      .values({
-        id: nanoid(),
-        repoId,
-        orgId,
-        branch,
-        lastCommitSha: commitSha,
-        chunksCount: 0,
-        status: "ready",
-        indexedAt: new Date(),
-      })
-      .onConflictDoUpdate({
-        target: [semanticIndex.repoId, semanticIndex.branch],
-        set: {
-          lastCommitSha: commitSha,
-          chunksCount: 0,
-          totalBatches: 0,
-          processedBatches: 0,
-          status: "ready",
-          indexedAt: new Date(),
-          error: null,
-        },
-      });
+    await updateIndexTracking(db, repoId, orgId, branch, commitSha, 0);
     return;
   }
 
-  // 4. Split into batches and fan-out via queue
+  // Split into batches and fan-out via queue
   const BATCH_SIZE = 200;
   const batches: typeof allFiles[] = [];
   for (let i = 0; i < allFiles.length; i += BATCH_SIZE) {
     batches.push(allFiles.slice(i, i + BATCH_SIZE));
   }
 
-  // Update DB: set status to indexing with batch tracking
+  // Set status to indexing with batch tracking
   await db
     .insert(semanticIndex)
     .values({
@@ -297,7 +278,6 @@ export async function processFullReindex(
       },
     });
 
-  // 5. Send each batch as IndexFileMessage
   const queue = env.INDEXING_QUEUE;
   if (!queue) {
     console.error("INDEXING_QUEUE not configured");
@@ -325,7 +305,6 @@ export async function processFullReindex(
 
 /**
  * Increment processedBatches and check if all batches are done.
- * Called after each batch is processed during full reindex.
  */
 export async function incrementBatchCounter(
   db: Database,
@@ -354,10 +333,7 @@ export async function incrementBatchCounter(
         .update(semanticIndex)
         .set({ status: "ready", indexedAt: new Date() })
         .where(
-          and(
-            eq(semanticIndex.repoId, repoId),
-            eq(semanticIndex.branch, branch)
-          )
+          and(eq(semanticIndex.repoId, repoId), eq(semanticIndex.branch, branch))
         );
     }
   }

@@ -20,6 +20,7 @@ export interface Env {
   VOYAGE_API_KEY?: string;
   PINECONE_INDEX_HOST?: string;
   INDEXING_QUEUE?: Queue;
+  TREE_CACHE?: KVNamespace;
 }
 
 export interface Variables {

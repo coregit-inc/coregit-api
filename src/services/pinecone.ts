@@ -174,6 +174,46 @@ export async function deleteByPrefix(
 }
 
 /**
+ * Check which vector IDs exist in a namespace.
+ * Pinecone fetch limit: 100 IDs per request → batched automatically.
+ */
+export async function vectorsExist(
+  host: string,
+  apiKey: string,
+  namespace: string,
+  ids: string[]
+): Promise<Set<string>> {
+  const existing = new Set<string>();
+  const FETCH_BATCH = 100;
+
+  for (let i = 0; i < ids.length; i += FETCH_BATCH) {
+    const batch = ids.slice(i, i + FETCH_BATCH);
+    const res = await fetch(pineconeUrl(host, "/vectors/fetch"), {
+      method: "POST",
+      headers: pineconeHeaders(apiKey),
+      body: JSON.stringify({ ids: batch, namespace }),
+    });
+
+    if (!res.ok) {
+      const errorBody = await res.text();
+      throw new Error(`Pinecone fetch failed (${res.status}): ${errorBody}`);
+    }
+
+    const data = (await res.json()) as {
+      vectors: Record<string, unknown>;
+    };
+
+    if (data.vectors) {
+      for (const id of Object.keys(data.vectors)) {
+        existing.add(id);
+      }
+    }
+  }
+
+  return existing;
+}
+
+/**
  * Delete an entire namespace (all vectors).
  */
 export async function deleteNamespace(

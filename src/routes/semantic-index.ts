@@ -140,20 +140,25 @@ const deleteIndexHandler = async (c: any) => {
     // optional body
   }
 
-  const branch = body.branch || resolved.repo.defaultBranch;
-  const pineconeNs = `${orgId}/${resolved.repo.id}/${branch}`;
+  if (body.branch) {
+    // Branch specified: only delete DB record (vectors are shared, can't delete per-branch)
+    await db
+      .delete(semanticIndex)
+      .where(and(eq(semanticIndex.repoId, resolved.repo.id), eq(semanticIndex.branch, body.branch)));
+    return c.json({ deleted: true, branch: body.branch, vectors_deleted: false });
+  }
 
-  // Delete vectors from Pinecone
+  // No branch: delete entire Pinecone namespace + all DB records
+  const pineconeNs = `${orgId}/${resolved.repo.id}`;
   await deleteNamespace(c.env.PINECONE_INDEX_HOST!, c.env.PINECONE_API_KEY!, pineconeNs).catch((err) => {
     console.error(`deleteNamespace failed: ${err}`);
   });
 
-  // Delete DB record
   await db
     .delete(semanticIndex)
-    .where(and(eq(semanticIndex.repoId, resolved.repo.id), eq(semanticIndex.branch, branch)));
+    .where(eq(semanticIndex.repoId, resolved.repo.id));
 
-  return c.json({ deleted: true, branch });
+  return c.json({ deleted: true, vectors_deleted: true });
 };
 
 semanticIndexRoutes.delete("/:slug/index", apiKeyAuth, deleteIndexHandler);

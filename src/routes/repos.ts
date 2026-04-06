@@ -12,7 +12,7 @@ import { Hono } from "hono";
 import { nanoid } from "nanoid";
 import { eq, and, or, isNull, sql, desc } from "drizzle-orm";
 import { apiKeyAuth } from "../auth/middleware";
-import { repo, organization, semanticIndex } from "../db/schema";
+import { repo, organization } from "../db/schema";
 import { GitR2Storage } from "../git/storage";
 import { createTree, createCommit, hashGitObject, parseGitObject, parseCommit } from "../git/objects";
 import { recordUsage } from "../services/usage";
@@ -440,21 +440,14 @@ const deleteRepoHandler = async (c: any) => {
       await bucket.delete(keysToDelete.slice(i, i + 1000));
     }
 
-    // Delete Pinecone namespaces for all indexed branches (fire-and-forget)
+    // Delete Pinecone namespace (one per repo, content-addressed)
     if (c.env.PINECONE_API_KEY && c.env.PINECONE_INDEX_HOST) {
-      const indexes = await db.select().from(semanticIndex).where(eq(semanticIndex.repoId, found.id));
-      if (indexes.length > 0) {
-        c.executionCtx.waitUntil(
-          Promise.all(
-            indexes.map((idx: { branch: string }) =>
-              deleteNamespace(
-                c.env.PINECONE_INDEX_HOST!, c.env.PINECONE_API_KEY!,
-                `${orgId}/${found.id}/${idx.branch}`
-              ).catch((err) => console.error(`Failed to delete namespace ${idx.branch}:`, err))
-            )
-          )
-        );
-      }
+      c.executionCtx.waitUntil(
+        deleteNamespace(
+          c.env.PINECONE_INDEX_HOST!, c.env.PINECONE_API_KEY!,
+          `${orgId}/${found.id}`
+        ).catch((err) => console.error("Failed to delete Pinecone namespace:", err))
+      );
     }
 
     // Delete DB record (cascades to snapshots + semantic_index)
