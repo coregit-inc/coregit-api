@@ -10,7 +10,7 @@
  *   case_sensitive?: boolean  — (default: false)
  *   context_lines?: number   — lines of context around matches (default: 2, max: 10)
  *   max_results?:   number   — total matches to return (default: 100, max: 500)
- *   branch?:        string   — branch to search (default: each repo's default branch)
+ *   ref?:           string   — branch name or commit SHA (default: each repo's default branch)
  *   path_pattern?:  string   — glob-like filter on file paths (e.g. "src/*.ts")
  */
 
@@ -44,7 +44,7 @@ interface SearchRequest {
   case_sensitive?: boolean;
   context_lines?: number;
   max_results?: number;
-  branch?: string;
+  ref?: string;
   path_pattern?: string;
 }
 
@@ -73,7 +73,7 @@ async function searchRepo(
   storage: GitR2Storage,
   repoSlug: string,
   repoNamespace: string | null,
-  branchName: string,
+  ref: string,
   query: RegExp,
   pathFilter: RegExp | null,
   contextLines: number,
@@ -82,8 +82,11 @@ async function searchRepo(
 ): Promise<{ matches: SearchMatch[]; truncated: boolean }> {
   const matches: SearchMatch[] = [];
 
-  // Resolve branch → commit → tree
-  const commitSha = await storage.getRef(`refs/heads/${branchName}`);
+  // Resolve ref (branch name or commit SHA) → commit → tree
+  let commitSha = await storage.getRef(`refs/heads/${ref}`);
+  if (!commitSha && /^[0-9a-f]{40}$/i.test(ref)) {
+    commitSha = ref; // treat as raw commit SHA
+  }
   if (!commitSha) return { matches: [], truncated: false };
 
   const raw = await storage.getObject(commitSha);
@@ -234,13 +237,13 @@ search.post("/search", apiKeyAuth, async (c) => {
 
     const storageSuffix = r.namespace ? `${r.namespace}/${r.slug}` : r.slug;
     const storage = new GitR2Storage(bucket, orgId, storageSuffix);
-    const branchName = body.branch || r.defaultBranch;
+    const ref = body.ref || r.defaultBranch;
 
     const result = await searchRepo(
       storage,
       r.slug,
       r.namespace,
-      branchName,
+      ref,
       query,
       pathFilter,
       contextLines,
