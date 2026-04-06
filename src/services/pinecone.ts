@@ -188,11 +188,14 @@ export async function vectorsExist(
 
   for (let i = 0; i < ids.length; i += FETCH_BATCH) {
     const batch = ids.slice(i, i + FETCH_BATCH);
-    const res = await fetch(pineconeUrl(host, "/vectors/fetch"), {
-      method: "POST",
-      headers: pineconeHeaders(apiKey),
-      body: JSON.stringify({ ids: batch, namespace }),
-    });
+    const params = new URLSearchParams();
+    for (const id of batch) params.append("ids", id);
+    params.set("namespace", namespace);
+
+    const res = await fetch(
+      pineconeUrl(host, `/vectors/fetch?${params.toString()}`),
+      { method: "GET", headers: pineconeHeaders(apiKey) }
+    );
 
     if (!res.ok) {
       const errorBody = await res.text();
