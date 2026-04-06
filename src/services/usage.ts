@@ -71,6 +71,10 @@ function mapToDodoEvent(eventType: UsageEventType): string | null {
       return DODO_EVENTS.apiCall;
     case "git_transfer_bytes":
       return DODO_EVENTS.gitTransfer;
+    case "semantic_search_query":
+      return DODO_EVENTS.semanticSearch;
+    case "semantic_index_chunks":
+      return DODO_EVENTS.semanticIndex;
     case "repo_created":
     case "repo_deleted":
       return null; // repos are free — no Dodo billing

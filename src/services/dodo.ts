@@ -18,6 +18,8 @@ export const DODO_EVENTS = {
   apiCall: "coregit.api_call",
   gitTransfer: "coregit.git_transfer",
   storage: "coregit.storage",
+  semanticSearch: "coregit.semantic_search",
+  semanticIndex: "coregit.semantic_index",
 } as const;
 
 /**

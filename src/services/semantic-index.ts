@@ -29,6 +29,8 @@ export interface IndexFileMessage {
   repoStorageSuffix: string;
   branch: string;
   commitSha: string;
+  /** True when this message is part of a full-reindex fan-out (namespace already wiped). */
+  isFullReindex?: boolean;
   files: Array<{
     path: string;
     action: "create" | "edit" | "delete" | "rename";
@@ -57,7 +59,7 @@ export async function processIndexFileMessage(
   msg: IndexFileMessage,
   env: Env,
   db: Database
-): Promise<void> {
+): Promise<number> {
   const { orgId, repoId, repoStorageSuffix, branch, commitSha, files } = msg;
   const host = env.PINECONE_INDEX_HOST!;
   const pineconeKey = env.PINECONE_API_KEY!;
@@ -86,7 +88,7 @@ export async function processIndexFileMessage(
         if (parent && parent !== existing.lastCommitSha) {
           // Our parent is not the last indexed commit — skip (stale message)
           console.log(`Skipping stale index message: ${commitSha} (last indexed: ${existing.lastCommitSha})`);
-          return;
+          return 0;
         }
       }
     }
@@ -96,16 +98,19 @@ export async function processIndexFileMessage(
   const allChunks: { text: string; filePath: string; startLine: number; endLine: number; language: string; chunkIndex: number; blobSha: string }[] = [];
 
   // Delete old vectors for changed/deleted/renamed files
-  const pathsToDelete: string[] = [];
-  for (const file of files) {
-    pathsToDelete.push(file.path);
-    if (file.oldPath) pathsToDelete.push(file.oldPath);
-  }
+  // Skip during full reindex — processFullReindex already wiped the namespace
+  if (!msg.isFullReindex) {
+    const pathsToDelete: string[] = [];
+    for (const file of files) {
+      pathsToDelete.push(file.path);
+      if (file.oldPath) pathsToDelete.push(file.oldPath);
+    }
 
-  for (const path of pathsToDelete) {
-    await deleteByPrefix(host, pineconeKey, namespace, `${path}#`).catch((err) => {
-      console.error(`deleteByPrefix failed for ${path}:`, err);
-    });
+    for (const path of pathsToDelete) {
+      await deleteByPrefix(host, pineconeKey, namespace, `${path}#`).catch((err) => {
+        console.error(`deleteByPrefix failed for ${path}:`, err);
+      });
+    }
   }
 
   // Read blobs and chunk non-deleted files
@@ -162,29 +167,34 @@ export async function processIndexFileMessage(
     await upsertVectors(host, pineconeKey, namespace, vectors);
   }
 
-  // Update or create semantic_index record
-  await db
-    .insert(semanticIndex)
-    .values({
-      id: nanoid(),
-      repoId,
-      orgId,
-      branch,
-      lastCommitSha: commitSha,
-      chunksCount: allChunks.length,
-      status: "ready",
-      indexedAt: new Date(),
-    })
-    .onConflictDoUpdate({
-      target: [semanticIndex.repoId, semanticIndex.branch],
-      set: {
+  // Update DB — only for delta indexing.
+  // Full-reindex batches are tracked via incrementBatchCounter instead.
+  if (!msg.isFullReindex) {
+    await db
+      .insert(semanticIndex)
+      .values({
+        id: nanoid(),
+        repoId,
+        orgId,
+        branch,
         lastCommitSha: commitSha,
-        chunksCount: sql`${semanticIndex.chunksCount} + ${allChunks.length}`,
+        chunksCount: allChunks.length,
         status: "ready",
         indexedAt: new Date(),
-        error: null,
-      },
-    });
+      })
+      .onConflictDoUpdate({
+        target: [semanticIndex.repoId, semanticIndex.branch],
+        set: {
+          lastCommitSha: commitSha,
+          chunksCount: sql`${semanticIndex.chunksCount} + ${allChunks.length}`,
+          status: "ready",
+          indexedAt: new Date(),
+          error: null,
+        },
+      });
+  }
+
+  return allChunks.length;
 }
 
 // ── Full reindex (fan-out via queue) ──
@@ -302,6 +312,7 @@ export async function processFullReindex(
       repoStorageSuffix,
       branch,
       commitSha,
+      isFullReindex: true,
       files: batch.map((f) => ({
         path: f.path,
         action: "create" as const,

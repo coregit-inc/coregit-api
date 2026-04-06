@@ -318,21 +318,29 @@ export default {
     for (const message of batch.messages) {
       try {
         if (message.body.type === "index_files") {
-          await processIndexFileMessage(message.body, env, db);
-          // If this is part of a full reindex fan-out, increment batch counter
-          await incrementBatchCounter(
-            db,
-            message.body.repoId,
-            message.body.branch,
-            message.body.files.filter((f) => f.action !== "delete").length
-          );
+          const chunksIndexed = await processIndexFileMessage(message.body, env, db);
+          // Only increment batch counter for full-reindex fan-out batches
+          if (message.body.isFullReindex) {
+            await incrementBatchCounter(db, message.body.repoId, message.body.branch, chunksIndexed);
+          }
         } else if (message.body.type === "full_reindex") {
           await processFullReindex(message.body, env, db);
         }
         message.ack();
       } catch (err) {
         console.error(`Indexing failed (attempt ${message.attempts}):`, err);
-        message.retry();
+        // Mark as failed after max retries (CF Queues default: 3)
+        if (message.attempts >= 3) {
+          const body = message.body;
+          ctx.waitUntil(
+            db.execute(
+              sql`UPDATE semantic_index SET status = 'failed', error = ${String(err)} WHERE repo_id = ${body.repoId} AND branch = ${body.branch}`
+            ).catch(() => {})
+          );
+          message.ack(); // Don't retry — goes to DLQ
+        } else {
+          message.retry();
+        }
       }
     }
   },
