@@ -265,12 +265,15 @@ CREATE TABLE lfs_lock (
 CREATE INDEX lfs_lock_repo_idx ON lfs_lock(repo_id);
 ```
 
-### Storage quotas (добавить в `org_plan` или отдельно)
+### Billing: LFS = общие лимиты
 
-```sql
-ALTER TABLE org_plan ADD COLUMN lfs_storage_limit_bytes BIGINT DEFAULT 1073741824;  -- 1 GB free
-ALTER TABLE org_plan ADD COLUMN lfs_storage_used_bytes BIGINT DEFAULT 0;
-```
+LFS storage и transfer считаются в существующие метры `coregit.storage` и `coregit.git_transfer`. Никаких отдельных LFS-метров или колонок в org_plan.
+
+- Verify callback: `recordUsage(orgId, 'storage_bytes', size)` + `recordUsage(orgId, 'git_transfer_bytes', size)`
+- Download batch: `recordUsage(orgId, 'git_transfer_bytes', totalSize)`
+- Free tier: 1 GB storage / 5 GB transfer — общие для git + LFS
+- Usage tier: $0.10/GB storage, $0.10/GB transfer — одинаково для git и LFS
+- R2 cost: $0.015/GB/month → маржа 85% при $0.10/GB
 
 ---
 
@@ -351,13 +354,15 @@ POST /:org/:repo.git/info/lfs/locks/:id/unlock
 - Batch API: auth проверяет org ownership перед генерацией URL
 - Нет cross-org deduplication — каждый org платит за свой storage
 
-### Quotas (по тарифам)
+### Quotas
 
-| Tier | LFS Storage | Max File Size | Bandwidth |
-|------|------------|---------------|-----------|
-| Free | 1 GB | 100 MB | 5 GB/month |
-| Usage | 50 GB included, $0.02/GB overage | 2 GB | $0.05/GB |
-| Enterprise | Custom | Custom | Custom |
+LFS считается в общие org лимиты (storage + transfer). Единственный LFS-специфичный лимит — max file size:
+
+| Tier | Max File Size |
+|------|---------------|
+| Free | 100 MB |
+| Usage | 2 GB |
+| Enterprise | Custom |
 
 ### Rate Limits
 - Batch API: стандартные per-key limits (600/min)
