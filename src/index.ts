@@ -54,6 +54,7 @@ import { search } from "./routes/search";
 import { audit } from "./routes/audit";
 import { lfs } from "./routes/lfs";
 import { lfsLocks } from "./routes/lfs-locks";
+import { lfsRest } from "./routes/lfs-rest";
 import type { Env, Variables } from "./types";
 
 const app = new Hono<{ Bindings: Env; Variables: Variables }>();
@@ -253,6 +254,7 @@ app.route("/v1/repos", compare);
 app.route("/v1/repos", cherryPick);
 app.route("/v1/repos", refs);
 app.route("/v1/repos", snapshots);
+app.route("/v1/repos", lfsRest);
 app.route("/v1/repos", workspace);
 app.route("/v1/repos", sync);
 app.route("/v1/repos", syncConfig);
