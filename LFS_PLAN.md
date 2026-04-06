@@ -346,34 +346,71 @@ POST /:org/:repo.git/info/lfs/locks/:id/unlock
 
 ---
 
-## 7. Multi-Tenant Security
+## 7. Security
 
-### Isolation
+### Tenant Isolation
 - R2 ключи: `{orgId}/{repoId}/lfs/{oid}` — org не может угадать путь другого org
-- Presigned URLs: привязаны к конкретному ключу, 1 час TTL
+- Presigned URLs: подписаны для конкретного R2 key. Подмена orgId/repoId ломает подпись → 403
 - Batch API: auth проверяет org ownership перед генерацией URL
-- Нет cross-org deduplication — каждый org платит за свой storage
+- Нет cross-org deduplication — каждый org изолирован полностью
+
+### Presigned URL Security
+- **Upload TTL: 15 минут** (минимум для загрузки больших файлов)
+- **Download TTL: 1 час**
+- Presigned URLs — bearer tokens. Правила:
+  - Никогда не логировать в audit log (только oid + repo, не URL)
+  - Никогда не включать в error responses
+  - Не возвращать в API responses (кроме Batch API)
+- Одноразовость upload: verify callback помечает объект. Повторный upload на тот же oid → сервер вернёт response без `actions` (skip)
+
+### Content Integrity
+- **Size verification**: verify callback делает `HEAD` на R2 object → проверяет Content-Length == заявленный size
+- **SHA-256 trust model**: доверяем git lfs клиенту (он вычисляет oid перед upload). R2 key содержит oid → если контент не совпадает, клиент получит ошибку при download
+- **Enterprise option** (future): async SHA-256 verification через background job. Читаем объект из R2, хешируем, сравниваем с заявленным oid. Помечаем как `verified: true` в lfs_object
+
+### Encryption
+- **At rest**: R2 Server-Side Encryption (Cloudflare managed keys) — включено by default для всех объектов
+- **In transit**: TLS 1.3 only (Cloudflare enforced для presigned URLs и API)
+- **Client-Side Encryption (enterprise future)**: per-org AES-256-GCM ключ, шифруем blob перед записью в R2. Ключ хранится зашифрованным в DB (как SYNC_ENCRYPTION_KEY). Добавляет latency — только для клиентов с compliance requirements
+
+### Access Control
+- Download: проверяется read access к repo (через scoped token или master key)
+- Upload: проверяется write access к repo
+- Locking: write access для create/delete, read для list
+- Force unlock: только master key (аналог admin)
+- Scoped tokens (`cgt_*`): LFS наследует repo permissions. `repos:my-app: ["read"]` = может скачивать LFS, не может загружать
 
 ### Quotas
 
 LFS считается в общие org лимиты (storage + transfer). Единственный LFS-специфичный лимит — max file size:
 
-| Tier | Max File Size |
-|------|---------------|
-| Free | 100 MB |
-| Usage | 2 GB |
-| Enterprise | Custom |
+| Tier | Max File Size | Batch Objects |
+|------|---------------|---------------|
+| Free | 100 MB | 20 per request |
+| Usage | 2 GB | 100 per request |
+| Enterprise | Custom | Custom |
+
+Batch API проверяет:
+1. Каждый object.size <= max file size для тарифа
+2. objects.length <= batch limit для тарифа
+3. SUM(sizes) + current usage <= storage quota (для upload)
 
 ### Rate Limits
 - Batch API: стандартные per-key limits (600/min)
-- Uploads/downloads: не через Worker, R2 handle сам
-- Verify callback: 100/min per key (prevent abuse)
+- Verify callback: стандартные limits (не отдельный)
+- Uploads/downloads: не через Worker → R2 handles. R2 не имеет per-key rate limits, но presigned URL TTL ограничивает window
 
 ### Audit
 Все LFS операции логируются в `audit_log`:
-- `lfs.upload` — файл загружен
-- `lfs.download` — файл скачан (batch request)
-- `lfs.lock.create` / `lfs.lock.delete`
+- `lfs.upload` — файл загружен (oid, size, repo) — **без presigned URL**
+- `lfs.download` — batch download requested (oid list, repo)
+- `lfs.lock.create` / `lfs.lock.delete` / `lfs.lock.force_delete`
+
+### Content Scanning (future, enterprise)
+- Не блокирует сейчас. ToS: ответственность клиента
+- Enterprise roadmap: интеграция с ClamAV / VirusTotal через async scan после verify
+- Quarantine bucket: подозрительные объекты перемещаются, клиент получает 423 Locked при download
+- Webhook notification при обнаружении malware
 
 ---
 
