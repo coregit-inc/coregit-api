@@ -23,6 +23,8 @@ export interface ResolvedRepo {
   storage: GitR2Storage;
   /** "namespace/slug" or "slug" — used for scope checks and URLs */
   scopeKey: string;
+  /** R2 storage path suffix — used for queue messages */
+  storageSuffix: string;
 }
 
 /**
@@ -52,7 +54,7 @@ export async function resolveRepo(
   const storage = new GitR2Storage(bucket, orgId, storageSuffix);
   const scopeKey = namespace ? `${namespace}/${slug}` : slug;
 
-  return { repo: found, storage, scopeKey };
+  return { repo: found, storage, scopeKey, storageSuffix };
 }
 
 /**

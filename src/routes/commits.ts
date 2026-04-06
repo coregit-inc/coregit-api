@@ -18,6 +18,7 @@ import { createApiCommit, ConflictError, EditConflictError, InvalidBase64Error, 
 
 import { checkFreeLimits } from "../services/limits";
 import { isValidRefName, validateFilePath } from "../git/validation";
+import type { IndexFileMessage } from "../services/semantic-index";
 import type { Env, Variables } from "../types";
 
 const commits = new Hono<{ Bindings: Env; Variables: Variables }>();
@@ -120,6 +121,28 @@ const createCommitHandler = async (c: any) => {
 
   try {
     const result = await createApiCommit(storage, branch, message, author, changes, parent_sha);
+
+    // Trigger delta indexing if auto_index enabled
+    if (found.autoIndex && c.env.INDEXING_QUEUE) {
+      const indexMsg: IndexFileMessage = {
+        type: "index_files",
+        orgId,
+        repoId: found.id,
+        repoStorageSuffix: resolved.storageSuffix,
+        branch,
+        commitSha: result.sha,
+        files: changes.map((ch) => {
+          const finalPath = ch.action === "rename" ? ch.new_path! : ch.path;
+          return {
+            path: finalPath,
+            action: (ch.action || "create") as "create" | "edit" | "delete" | "rename",
+            blobSha: ch.action === "delete" ? undefined : result.changedBlobs.get(finalPath),
+            oldPath: ch.action === "rename" ? ch.path : undefined,
+          };
+        }),
+      };
+      c.executionCtx.waitUntil(c.env.INDEXING_QUEUE.send(indexMsg));
+    }
 
     return c.json(
       {

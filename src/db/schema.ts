@@ -28,6 +28,7 @@ export const repo = pgTable(
     description: text("description"),
     defaultBranch: text("default_branch").notNull().default("main"),
     visibility: text("visibility").notNull().default("private"), // "public" | "private"
+    autoIndex: boolean("auto_index").default(false),
     createdAt: timestamp("created_at").defaultNow().notNull(),
     updatedAt: timestamp("updated_at")
       .defaultNow()
@@ -308,3 +309,30 @@ export const lfsLock = pgTable(
 );
 
 export type LfsLock = typeof lfsLock.$inferSelect;
+
+// Semantic search index tracking
+export const semanticIndex = pgTable(
+  "semantic_index",
+  {
+    id: text("id").primaryKey(),
+    repoId: text("repo_id")
+      .notNull()
+      .references(() => repo.id, { onDelete: "cascade" }),
+    orgId: text("org_id").notNull(),
+    branch: text("branch").notNull(),
+    lastCommitSha: text("last_commit_sha"),
+    chunksCount: bigint("chunks_count", { mode: "number" }).default(0),
+    totalBatches: bigint("total_batches", { mode: "number" }).default(0),
+    processedBatches: bigint("processed_batches", { mode: "number" }).default(0),
+    status: text("status").notNull().default("pending"), // pending | indexing | ready | failed
+    error: text("error"),
+    indexedAt: timestamp("indexed_at"),
+    createdAt: timestamp("created_at").defaultNow().notNull(),
+  },
+  (table) => [
+    uniqueIndex("semantic_index_repo_branch_idx").on(table.repoId, table.branch),
+    index("semantic_index_org_idx").on(table.orgId),
+  ]
+);
+
+export type SemanticIndex = typeof semanticIndex.$inferSelect;

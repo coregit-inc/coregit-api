@@ -55,6 +55,14 @@ import { audit } from "./routes/audit";
 import { lfs } from "./routes/lfs";
 import { lfsLocks } from "./routes/lfs-locks";
 import { lfsRest } from "./routes/lfs-rest";
+import { semanticSearch } from "./routes/semantic-search";
+import { semanticIndexRoutes } from "./routes/semantic-index";
+import {
+  processIndexFileMessage,
+  processFullReindex,
+  incrementBatchCounter,
+  type IndexingMessage,
+} from "./services/semantic-index";
 import type { Env, Variables } from "./types";
 
 const app = new Hono<{ Bindings: Env; Variables: Variables }>();
@@ -258,6 +266,8 @@ app.route("/v1/repos", lfsRest);
 app.route("/v1/repos", workspace);
 app.route("/v1/repos", sync);
 app.route("/v1/repos", syncConfig);
+app.route("/v1/repos", semanticSearch);
+app.route("/v1/repos", semanticIndexRoutes);
 app.route("/v1/repos", repos);
 app.route("/v1", connections);
 app.route("/v1", tokens);
@@ -300,4 +310,30 @@ app.onError((err, c) => {
   return c.json({ error: "Internal server error", code: "INTERNAL_ERROR", request_id: requestId }, 500);
 });
 
-export default app;
+export default {
+  fetch: app.fetch,
+
+  async queue(batch: MessageBatch<IndexingMessage>, env: Env, ctx: ExecutionContext) {
+    const db = createDb(env.DATABASE_URL);
+    for (const message of batch.messages) {
+      try {
+        if (message.body.type === "index_files") {
+          await processIndexFileMessage(message.body, env, db);
+          // If this is part of a full reindex fan-out, increment batch counter
+          await incrementBatchCounter(
+            db,
+            message.body.repoId,
+            message.body.branch,
+            message.body.files.filter((f) => f.action !== "delete").length
+          );
+        } else if (message.body.type === "full_reindex") {
+          await processFullReindex(message.body, env, db);
+        }
+        message.ack();
+      } catch (err) {
+        console.error(`Indexing failed (attempt ${message.attempts}):`, err);
+        message.retry();
+      }
+    }
+  },
+};

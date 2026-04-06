@@ -272,7 +272,7 @@ export async function createApiCommit(
   author: CommitAuthor,
   changes: FileChange[],
   parentSha?: string
-): Promise<{ sha: string; treeSha: string; parentSha: string }> {
+): Promise<{ sha: string; treeSha: string; parentSha: string; changedBlobs: Map<string, string> }> {
   // 1. Get current branch HEAD
   const currentSha = await storage.getRef(`refs/heads/${branch}`);
   const effectiveParent = parentSha || currentSha;
@@ -291,6 +291,7 @@ export async function createApiCommit(
 
   // 3. Apply changes — collect blobs first, then batch-write to R2
   const pendingBlobs: { sha: string; type: "blob"; data: Uint8Array }[] = [];
+  const changedBlobs = new Map<string, string>(); // path → blobSha for semantic indexing
 
   for (const change of changes) {
     const action = change.action || (change.content !== undefined ? "create" : undefined);
@@ -303,6 +304,7 @@ export async function createApiCommit(
       if (!existing) throw new Error(`File not found for rename: ${change.path}`);
       currentTree.delete(change.path);
       currentTree.set(change.new_path, existing);
+      changedBlobs.set(change.new_path, existing.sha);
     } else if (action === "edit") {
       if (!change.edits || change.edits.length === 0) {
         throw new Error(`edits array required for action "edit": ${change.path}`);
@@ -321,6 +323,7 @@ export async function createApiCommit(
       const blobSha = await hashGitObject("blob", editedBytes);
       pendingBlobs.push({ sha: blobSha, type: "blob", data: editedBytes });
       currentTree.set(change.path, { sha: blobSha, mode: existing.mode });
+      changedBlobs.set(change.path, blobSha);
     } else {
       // create / modify (default) — full content replacement
       if (!change.content && change.content !== "") {
@@ -333,6 +336,7 @@ export async function createApiCommit(
       const blobSha = await hashGitObject("blob", content);
       pendingBlobs.push({ sha: blobSha, type: "blob", data: content });
       currentTree.set(change.path, { sha: blobSha, mode: "100644" });
+      changedBlobs.set(change.path, blobSha);
     }
   }
 
@@ -380,6 +384,7 @@ export async function createApiCommit(
     sha: commitSha,
     treeSha: rootTreeSha,
     parentSha: effectiveParent || "",
+    changedBlobs,
   };
 }
 

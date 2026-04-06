@@ -15,6 +15,11 @@ export interface Env {
   R2_ACCESS_KEY_ID?: string;
   R2_SECRET_ACCESS_KEY?: string;
   R2_ACCOUNT_ID?: string;
+  // Semantic search
+  PINECONE_API_KEY?: string;
+  VOYAGE_API_KEY?: string;
+  PINECONE_INDEX_HOST?: string;
+  INDEXING_QUEUE?: Queue;
 }
 
 export interface Variables {

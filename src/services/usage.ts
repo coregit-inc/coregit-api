@@ -12,7 +12,9 @@ export type UsageEventType =
   | "storage_bytes"
   | "git_transfer_bytes"
   | "repo_created"
-  | "repo_deleted";
+  | "repo_deleted"
+  | "semantic_search_query"
+  | "semantic_index_chunks";
 
 /**
  * Record a usage event to local DB and forward to Dodo if the org has a Dodo customer.

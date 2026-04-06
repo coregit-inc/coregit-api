@@ -31,6 +31,19 @@ enabled = true
 enabled = true
 invocation_logs = true
 
+# Semantic search indexing queue
+[[queues.producers]]
+queue = "coregit-indexing"
+binding = "INDEXING_QUEUE"
+
+[[queues.consumers]]
+queue = "coregit-indexing"
+max_batch_size = 5
+max_batch_timeout = 10
+max_retries = 3
+dead_letter_queue = "coregit-indexing-dlq"
+max_concurrency = 1
+
 # Secrets (set via wrangler secret put):
 # DATABASE_URL           — Neon PostgreSQL (separate project from Strayl)
 # BETTER_AUTH_SECRET     — Better Auth signing secret (min 32 chars)
@@ -43,3 +56,6 @@ invocation_logs = true
 # R2_ACCESS_KEY_ID       — R2 S3-compatible API token ID (for LFS presigned URLs)
 # R2_SECRET_ACCESS_KEY   — R2 S3-compatible API secret (for LFS presigned URLs)
 # R2_ACCOUNT_ID          — Cloudflare Account ID (for LFS presigned URLs)
+# PINECONE_API_KEY       — Pinecone API key for vector search
+# VOYAGE_API_KEY         — Voyage AI API key for code embeddings & reranking
+# PINECONE_INDEX_HOST    — Pinecone serverless index host URL

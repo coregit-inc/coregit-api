@@ -12,11 +12,12 @@ import { Hono } from "hono";
 import { nanoid } from "nanoid";
 import { eq, and, or, isNull, sql, desc } from "drizzle-orm";
 import { apiKeyAuth } from "../auth/middleware";
-import { repo, organization } from "../db/schema";
+import { repo, organization, semanticIndex } from "../db/schema";
 import { GitR2Storage } from "../git/storage";
 import { createTree, createCommit, hashGitObject, parseGitObject, parseCommit } from "../git/objects";
 import { recordUsage } from "../services/usage";
 import { recordAudit } from "../services/audit";
+import { deleteNamespace } from "../services/pinecone";
 import { checkFreeLimits } from "../services/limits";
 import { isMasterKey, hasRepoAccess, getAccessibleRepoKeys } from "../auth/scopes";
 import { resolveRepo, buildGitUrl, buildApiUrl } from "../services/repo-resolver";
@@ -439,7 +440,24 @@ const deleteRepoHandler = async (c: any) => {
       await bucket.delete(keysToDelete.slice(i, i + 1000));
     }
 
-    // Delete DB record (cascades to snapshots)
+    // Delete Pinecone namespaces for all indexed branches (fire-and-forget)
+    if (c.env.PINECONE_API_KEY && c.env.PINECONE_INDEX_HOST) {
+      const indexes = await db.select().from(semanticIndex).where(eq(semanticIndex.repoId, found.id));
+      if (indexes.length > 0) {
+        c.executionCtx.waitUntil(
+          Promise.all(
+            indexes.map((idx: { branch: string }) =>
+              deleteNamespace(
+                c.env.PINECONE_INDEX_HOST!, c.env.PINECONE_API_KEY!,
+                `${orgId}/${found.id}/${idx.branch}`
+              ).catch((err) => console.error(`Failed to delete namespace ${idx.branch}:`, err))
+            )
+          )
+        );
+      }
+    }
+
+    // Delete DB record (cascades to snapshots + semantic_index)
     await db.delete(repo).where(eq(repo.id, found.id));
 
     recordUsage(c.executionCtx, db, orgId, "repo_deleted", 1, { repo_id: found.id }, c.env.DODO_PAYMENTS_API_KEY, c.get("dodoCustomerId"));
