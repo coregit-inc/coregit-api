@@ -56,7 +56,7 @@ async function getRemoteHeadSha(
     `${GH_API}/repos/${owner}/${repo}/git/refs/heads/${encodeURIComponent(branch)}`,
     { headers: githubHeaders(token) }
   );
-  if (res.status === 404) return null;
+  if (res.status === 404 || res.status === 409) return null;
   if (!res.ok) {
     const text = await res.text();
     throw new Error(`GitHub ref lookup failed: ${res.status} ${text}`);
