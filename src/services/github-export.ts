@@ -168,6 +168,31 @@ async function updateRef(
   }
 }
 
+/** Initialize an empty GitHub repo by creating a dummy file via Contents API. */
+async function initializeEmptyRepo(
+  token: string,
+  owner: string,
+  repo: string,
+  branch: string
+): Promise<void> {
+  const res = await fetch(
+    `${GH_API}/repos/${owner}/${repo}/contents/.coregit-init`,
+    {
+      method: "PUT",
+      headers: githubHeaders(token),
+      body: JSON.stringify({
+        message: "Initialize repository for CoreGit sync",
+        content: btoa(""),
+        branch,
+      }),
+    }
+  );
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`Failed to initialize GitHub repo: ${res.status} ${text}`);
+  }
+}
+
 /** Read a blob from CoreGit storage and return base64 content. */
 async function readBlobAsBase64(storage: GitR2Storage, sha: string): Promise<string> {
   const raw = await storage.getObject(sha);
@@ -223,7 +248,16 @@ export async function exportToGithub(params: GithubExportParams): Promise<Github
     return { githubSha: "", filesChanged: 0, skipped: true };
   }
 
-  // 4. Create blobs on GitHub in parallel batches
+  // 4. Get remote HEAD (needed before blob creation — Git Data API requires ≥1 commit)
+  let remoteHead = await getRemoteHeadSha(token, owner, repo, branch);
+
+  // If repo is empty, initialize it first
+  if (remoteHead === null) {
+    await initializeEmptyRepo(token, owner, repo, branch);
+    remoteHead = await getRemoteHeadSha(token, owner, repo, branch);
+  }
+
+  // 5. Create blobs on GitHub in parallel batches
   const blobMap = new Map<string, string>(); // CoreGit SHA → GitHub blob SHA
 
   for (let i = 0; i < changedFiles.length; i += BLOB_BATCH_SIZE) {
@@ -242,7 +276,7 @@ export async function exportToGithub(params: GithubExportParams): Promise<Github
     }
   }
 
-  // 5. Build tree entries for GitHub
+  // 6. Build tree entries for GitHub
   const treeEntries: Array<{ path: string; mode: string; type: string; sha: string | null }> = [];
 
   for (const file of changedFiles) {
@@ -264,15 +298,13 @@ export async function exportToGithub(params: GithubExportParams): Promise<Github
     });
   }
 
-  // 6. Get remote HEAD for parent commit
-  const remoteHead = await getRemoteHeadSha(token, owner, repo, branch);
-
-  // 7. Create tree (use base_tree from remote HEAD if available for efficiency)
+  // 7. Create tree (use base_tree only for incremental exports, not first export)
+  const baseTree = lastSyncedSha ? remoteHead : null;
   const ghTreeSha = await createTree(
     token,
     owner,
     repo,
-    remoteHead,
+    baseTree,
     treeEntries
   );
 
