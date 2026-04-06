@@ -16,11 +16,26 @@ import {
   type TreeEntry,
 } from "../git/objects";
 
+export interface EditOperation {
+  /** Replace lines [start, end] (1-based, inclusive). Use same start/end to insert before that line. */
+  range?: [number, number];
+  /** Find this exact string and replace it. Must be unique in the file. */
+  old_string?: string;
+  /** The replacement content. Omit with old_string to delete the match. */
+  new_string?: string;
+  /** New content for range-based edits. */
+  content?: string;
+}
+
 export interface FileChange {
   path: string;
   content?: string;
   encoding?: "utf-8" | "base64";
-  action?: "delete";
+  action?: "create" | "edit" | "delete" | "rename";
+  /** For action: "edit" — array of surgical edits applied in order. */
+  edits?: EditOperation[];
+  /** For action: "rename" — new path for the file. */
+  new_path?: string;
 }
 
 export interface CommitAuthor {
@@ -136,6 +151,88 @@ async function buildTreeFromFlat(
   return rootSha;
 }
 
+/**
+ * Apply surgical edits to file content.
+ * Supports two modes:
+ *   1. Range-based:  { range: [start, end], content: "..." }
+ *   2. String match: { old_string: "...", new_string: "..." }
+ *
+ * Edits are applied bottom-to-top for range-based (so line numbers stay stable)
+ * and sequentially for string-based.
+ */
+export function applyEdits(original: string, edits: EditOperation[]): string {
+  let result = original;
+
+  // Separate range edits and string edits
+  const rangeEdits: (EditOperation & { range: [number, number] })[] = [];
+  const stringEdits: EditOperation[] = [];
+
+  for (const edit of edits) {
+    if (edit.range) {
+      rangeEdits.push(edit as EditOperation & { range: [number, number] });
+    } else if (edit.old_string !== undefined) {
+      stringEdits.push(edit);
+    }
+  }
+
+  // Apply string-based edits first (sequential, order matters)
+  for (const edit of stringEdits) {
+    const idx = result.indexOf(edit.old_string!);
+    if (idx === -1) {
+      throw new EditConflictError(
+        `String not found in file. Ensure old_string is unique and exact.`,
+        edit.old_string!.slice(0, 80)
+      );
+    }
+    // Check uniqueness
+    const secondIdx = result.indexOf(edit.old_string!, idx + 1);
+    if (secondIdx !== -1) {
+      throw new EditConflictError(
+        `old_string matches multiple locations. Provide more context to make it unique.`,
+        edit.old_string!.slice(0, 80)
+      );
+    }
+    result =
+      result.slice(0, idx) +
+      (edit.new_string ?? "") +
+      result.slice(idx + edit.old_string!.length);
+  }
+
+  // Apply range-based edits bottom-to-top (so line numbers stay stable)
+  if (rangeEdits.length > 0) {
+    const sorted = [...rangeEdits].sort((a, b) => b.range[0] - a.range[0]);
+    const lines = result.split("\n");
+
+    for (const edit of sorted) {
+      const [start, end] = edit.range;
+      if (start < 1 || end < start || start > lines.length + 1) {
+        throw new EditConflictError(
+          `Invalid range [${start}, ${end}]. File has ${lines.length} lines.`,
+          ""
+        );
+      }
+      const newContent = edit.content ?? "";
+      const newLines = newContent === "" ? [] : newContent.split("\n");
+      // start-1 because lines array is 0-indexed, end-start+1 lines to replace
+      const deleteCount = Math.min(end - start + 1, lines.length - start + 1);
+      lines.splice(start - 1, deleteCount, ...newLines);
+    }
+
+    result = lines.join("\n");
+  }
+
+  return result;
+}
+
+export class EditConflictError extends Error {
+  public context: string;
+  constructor(message: string, context: string) {
+    super(message);
+    this.name = "EditConflictError";
+    this.context = context;
+  }
+}
+
 const encoder = new TextEncoder();
 
 export class InvalidBase64Error extends Error {
@@ -196,9 +293,36 @@ export async function createApiCommit(
   const pendingBlobs: { sha: string; type: "blob"; data: Uint8Array }[] = [];
 
   for (const change of changes) {
-    if (change.action === "delete") {
+    const action = change.action || (change.content !== undefined ? "create" : undefined);
+
+    if (action === "delete") {
       currentTree.delete(change.path);
+    } else if (action === "rename") {
+      if (!change.new_path) throw new Error(`new_path required for rename: ${change.path}`);
+      const existing = currentTree.get(change.path);
+      if (!existing) throw new Error(`File not found for rename: ${change.path}`);
+      currentTree.delete(change.path);
+      currentTree.set(change.new_path, existing);
+    } else if (action === "edit") {
+      if (!change.edits || change.edits.length === 0) {
+        throw new Error(`edits array required for action "edit": ${change.path}`);
+      }
+      // Read current file content from R2
+      const existing = currentTree.get(change.path);
+      if (!existing) throw new Error(`File not found for edit: ${change.path}`);
+      const blobRaw = await storage.getObject(existing.sha);
+      if (!blobRaw) throw new Error(`Blob not found: ${existing.sha}`);
+      const blobObj = parseGitObject(blobRaw);
+      const decoder = new TextDecoder();
+      const originalContent = decoder.decode(blobObj.content);
+      // Apply edits
+      const edited = applyEdits(originalContent, change.edits);
+      const editedBytes = encoder.encode(edited);
+      const blobSha = await hashGitObject("blob", editedBytes);
+      pendingBlobs.push({ sha: blobSha, type: "blob", data: editedBytes });
+      currentTree.set(change.path, { sha: blobSha, mode: existing.mode });
     } else {
+      // create / modify (default) — full content replacement
       if (!change.content && change.content !== "") {
         throw new Error(`Missing content for file: ${change.path}`);
       }

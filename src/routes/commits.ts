@@ -14,7 +14,7 @@ import { extractRepoParams } from "./helpers";
 import { repo } from "../db/schema";
 import { GitR2Storage } from "../git/storage";
 import { parseGitObject, parseCommit } from "../git/objects";
-import { createApiCommit, ConflictError, InvalidBase64Error, type FileChange, type CommitAuthor } from "../services/commit-builder";
+import { createApiCommit, ConflictError, EditConflictError, InvalidBase64Error, type FileChange, type CommitAuthor } from "../services/commit-builder";
 
 import { checkFreeLimits } from "../services/limits";
 import { isValidRefName, validateFilePath } from "../git/validation";
@@ -94,6 +94,22 @@ const createCommitHandler = async (c: any) => {
     if (pathError) {
       return c.json({ error: pathError }, 400);
     }
+    if (change.action === "rename" && change.new_path) {
+      const newPathError = validateFilePath(change.new_path);
+      if (newPathError) {
+        return c.json({ error: newPathError }, 400);
+      }
+    }
+    if (change.action === "edit") {
+      if (!change.edits || !Array.isArray(change.edits) || change.edits.length === 0) {
+        return c.json({ error: `edits array required for action "edit": ${change.path}` }, 400);
+      }
+      for (const edit of change.edits) {
+        if (!edit.range && edit.old_string === undefined) {
+          return c.json({ error: `Each edit must have either "range" or "old_string": ${change.path}` }, 400);
+        }
+      }
+    }
     // Validate base64 content
     if (change.encoding === "base64" && change.content) {
       if (!/^[A-Za-z0-9+/]*={0,2}$/.test(change.content)) {
@@ -117,6 +133,9 @@ const createCommitHandler = async (c: any) => {
   } catch (error) {
     if (error instanceof ConflictError) {
       return c.json({ error: error.message }, 409);
+    }
+    if (error instanceof EditConflictError) {
+      return c.json({ error: error.message, context: error.context }, 422);
     }
     if (error instanceof InvalidBase64Error) {
       return c.json({ error: error.message }, 400);
