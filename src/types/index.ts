@@ -5,12 +5,16 @@ export interface Env {
   CORS_ORIGIN: string;
   ENVIRONMENT?: string;
   REPOS_BUCKET: R2Bucket;
+  LFS_BUCKET: R2Bucket;
   DODO_PAYMENTS_API_KEY: string;
   CF_ZONE_ID?: string;
   CF_API_TOKEN?: string;
   SYNC_ENCRYPTION_KEY: string;
   WEBHOOK_ENCRYPTION_KEY?: string;
   INTERNAL_SYNC_TOKEN?: string;
+  R2_ACCESS_KEY_ID?: string;
+  R2_SECRET_ACCESS_KEY?: string;
+  R2_ACCOUNT_ID?: string;
 }
 
 export interface Variables {

@@ -263,3 +263,48 @@ export const auditLog = pgTable(
 
 export type AuditLog = typeof auditLog.$inferSelect;
 export type NewAuditLog = typeof auditLog.$inferInsert;
+
+// LFS objects
+export const lfsObject = pgTable(
+  "lfs_object",
+  {
+    id: text("id").primaryKey(),
+    orgId: text("org_id").notNull(),
+    repoId: text("repo_id")
+      .notNull()
+      .references(() => repo.id, { onDelete: "cascade" }),
+    oid: text("oid").notNull(),
+    size: bigint("size", { mode: "number" }).notNull(),
+    uploadedAt: timestamp("uploaded_at").defaultNow().notNull(),
+  },
+  (table) => [
+    index("lfs_object_repo_idx").on(table.repoId),
+    index("lfs_object_org_idx").on(table.orgId),
+    uniqueIndex("lfs_object_repo_oid_idx").on(table.repoId, table.oid),
+  ]
+);
+
+export type LfsObject = typeof lfsObject.$inferSelect;
+
+// LFS file locks
+export const lfsLock = pgTable(
+  "lfs_lock",
+  {
+    id: text("id").primaryKey(),
+    orgId: text("org_id").notNull(),
+    repoId: text("repo_id")
+      .notNull()
+      .references(() => repo.id, { onDelete: "cascade" }),
+    path: text("path").notNull(),
+    ownerId: text("owner_id").notNull(),
+    ownerName: text("owner_name").notNull(),
+    lockedAt: timestamp("locked_at").defaultNow().notNull(),
+    ref: text("ref"),
+  },
+  (table) => [
+    index("lfs_lock_repo_idx").on(table.repoId),
+    uniqueIndex("lfs_lock_repo_path_idx").on(table.repoId, table.path),
+  ]
+);
+
+export type LfsLock = typeof lfsLock.$inferSelect;

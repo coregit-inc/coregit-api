@@ -11,6 +11,10 @@ zone_name = "coregit.dev"
 binding = "REPOS_BUCKET"
 bucket_name = "coregit-repos"
 
+[[r2_buckets]]
+binding = "LFS_BUCKET"
+bucket_name = "coregit-lfs"
+
 [vars]
 CORS_ORIGIN = "https://coregit.dev"
 
@@ -36,3 +40,6 @@ invocation_logs = true
 # GITHUB_CLIENT_SECRET
 # DODO_PAYMENTS_API_KEY  — Dodo Payments API key for usage event ingestion
 # SYNC_ENCRYPTION_KEY    — 32-byte hex key for encrypting external connection tokens & webhook secrets
+# R2_ACCESS_KEY_ID       — R2 S3-compatible API token ID (for LFS presigned URLs)
+# R2_SECRET_ACCESS_KEY   — R2 S3-compatible API secret (for LFS presigned URLs)
+# R2_ACCOUNT_ID          — Cloudflare Account ID (for LFS presigned URLs)

@@ -52,6 +52,8 @@ import { tokens } from "./routes/tokens";
 import { webhooks } from "./routes/webhooks";
 import { search } from "./routes/search";
 import { audit } from "./routes/audit";
+import { lfs } from "./routes/lfs";
+import { lfsLocks } from "./routes/lfs-locks";
 import type { Env, Variables } from "./types";
 
 const app = new Hono<{ Bindings: Env; Variables: Variables }>();
@@ -270,6 +272,11 @@ app.route("/v1/usage", usage);
 // ── Public read-only routes (no auth required) ──
 
 app.route("/v1", publicRoutes);
+
+// ── Git LFS (must be before git Smart HTTP) ──
+
+app.route("/", lfs);
+app.route("/", lfsLocks);
 
 // ── Git Smart HTTP (standard: /:org/:repo.git/*) ──
 
