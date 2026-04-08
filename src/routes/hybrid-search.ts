@@ -271,11 +271,11 @@ const hybridSearchHandler = async (c: any) => {
         // Search by name contains
         // Escape ILIKE wildcards to prevent % and _ from matching everything
         const escaped = body.q.replace(/[%_]/g, '\\$&');
-        const blobs = [...blobShasSet];
+        const blobs = [...blobShasSet].join(',');
         const rows = await db.execute(sql`
           SELECT n.file_path, n.name, n.type, n.start_line, n.end_line, n.language
           FROM code_node n
-          JOIN unnest(${blobs}::text[]) AS b(sha) ON n.blob_sha = b.sha
+          JOIN unnest(string_to_array(${blobs}, ',')) AS b(sha) ON n.blob_sha = b.sha
           WHERE n.repo_id = ${resolved.repo.id}
             AND (n.name ILIKE ${'%' + escaped + '%'} OR n.file_path ILIKE ${'%' + escaped + '%'})
           ORDER BY

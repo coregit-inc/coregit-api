@@ -26,14 +26,14 @@ const RESULT_LIMIT = 200;
 export async function queryCallers(
   db: Database, repoId: string, targetName: string, blobShas: Set<string>
 ): Promise<GraphQueryResult> {
-  const blobs = [...blobShas];
+  const blobs = [...blobShas].join(',');
   const rows = await db.execute(sql`
     SELECT DISTINCT n.*
     FROM code_node n
-    JOIN unnest(${blobs}::text[]) AS b(sha) ON n.blob_sha = b.sha
+    JOIN unnest(string_to_array(${blobs}, ',')) AS b(sha) ON n.blob_sha = b.sha
     JOIN code_edge e ON e.source_id = n.id
     JOIN code_node t ON e.target_id = t.id
-    JOIN unnest(${blobs}::text[]) AS b2(sha) ON t.blob_sha = b2.sha
+    JOIN unnest(string_to_array(${blobs}, ',')) AS b2(sha) ON t.blob_sha = b2.sha
     WHERE e.type = 'CALLS' AND e.repo_id = ${repoId}
       AND t.name = ${targetName} AND t.repo_id = ${repoId}
     LIMIT ${RESULT_LIMIT}
@@ -44,14 +44,14 @@ export async function queryCallers(
 export async function queryCallees(
   db: Database, repoId: string, sourceName: string, blobShas: Set<string>
 ): Promise<GraphQueryResult> {
-  const blobs = [...blobShas];
+  const blobs = [...blobShas].join(',');
   const rows = await db.execute(sql`
     SELECT DISTINCT n.*
     FROM code_node n
-    JOIN unnest(${blobs}::text[]) AS b(sha) ON n.blob_sha = b.sha
+    JOIN unnest(string_to_array(${blobs}, ',')) AS b(sha) ON n.blob_sha = b.sha
     JOIN code_edge e ON e.target_id = n.id
     JOIN code_node s ON e.source_id = s.id
-    JOIN unnest(${blobs}::text[]) AS b2(sha) ON s.blob_sha = b2.sha
+    JOIN unnest(string_to_array(${blobs}, ',')) AS b2(sha) ON s.blob_sha = b2.sha
     WHERE e.type = 'CALLS' AND e.repo_id = ${repoId}
       AND s.name = ${sourceName} AND s.repo_id = ${repoId}
     LIMIT ${RESULT_LIMIT}
@@ -62,13 +62,13 @@ export async function queryCallees(
 export async function queryDependencies(
   db: Database, repoId: string, name: string, blobShas: Set<string>, maxDepth: number = 3
 ): Promise<GraphQueryResult> {
-  const blobs = [...blobShas];
+  const blobs = [...blobShas].join(',');
   const rows = await db.execute(sql`
     WITH RECURSIVE deps AS (
       SELECT e.target_id AS id, 1 AS depth
       FROM code_edge e
       JOIN code_node s ON e.source_id = s.id
-      JOIN unnest(${blobs}::text[]) AS b(sha) ON s.blob_sha = b.sha
+      JOIN unnest(string_to_array(${blobs}, ',')) AS b(sha) ON s.blob_sha = b.sha
       WHERE e.type IN ('CALLS', 'IMPORTS', 'USES_TYPE')
         AND e.repo_id = ${repoId}
         AND s.name = ${name} AND s.repo_id = ${repoId}
@@ -80,7 +80,7 @@ export async function queryDependencies(
     )
     SELECT DISTINCT n.*
     FROM code_node n JOIN deps d ON n.id = d.id
-    JOIN unnest(${blobs}::text[]) AS b(sha) ON n.blob_sha = b.sha
+    JOIN unnest(string_to_array(${blobs}, ',')) AS b(sha) ON n.blob_sha = b.sha
     LIMIT ${RESULT_LIMIT}
   `);
   return { nodes: rows.rows as unknown as CodeNode[] };
@@ -89,13 +89,13 @@ export async function queryDependencies(
 export async function queryDependents(
   db: Database, repoId: string, name: string, blobShas: Set<string>, maxDepth: number = 3
 ): Promise<GraphQueryResult> {
-  const blobs = [...blobShas];
+  const blobs = [...blobShas].join(',');
   const rows = await db.execute(sql`
     WITH RECURSIVE deps AS (
       SELECT e.source_id AS id, 1 AS depth
       FROM code_edge e
       JOIN code_node t ON e.target_id = t.id
-      JOIN unnest(${blobs}::text[]) AS b(sha) ON t.blob_sha = b.sha
+      JOIN unnest(string_to_array(${blobs}, ',')) AS b(sha) ON t.blob_sha = b.sha
       WHERE e.type IN ('CALLS', 'IMPORTS', 'USES_TYPE')
         AND e.repo_id = ${repoId}
         AND t.name = ${name} AND t.repo_id = ${repoId}
@@ -107,7 +107,7 @@ export async function queryDependents(
     )
     SELECT DISTINCT n.*
     FROM code_node n JOIN deps d ON n.id = d.id
-    JOIN unnest(${blobs}::text[]) AS b(sha) ON n.blob_sha = b.sha
+    JOIN unnest(string_to_array(${blobs}, ',')) AS b(sha) ON n.blob_sha = b.sha
     LIMIT ${RESULT_LIMIT}
   `);
   return { nodes: rows.rows as unknown as CodeNode[] };
@@ -119,12 +119,12 @@ export async function queryDependents(
 export async function queryTypeHierarchy(
   db: Database, repoId: string, name: string, blobShas: Set<string>, maxDepth: number = 3
 ): Promise<GraphQueryResult> {
-  const blobs = [...blobShas];
+  const blobs = [...blobShas].join(',');
   const rows = await db.execute(sql`
     WITH RECURSIVE hierarchy AS (
       SELECT n.id, 0 AS depth, ARRAY[n.id] AS path
       FROM code_node n
-      JOIN unnest(${blobs}::text[]) AS b(sha) ON n.blob_sha = b.sha
+      JOIN unnest(string_to_array(${blobs}, ',')) AS b(sha) ON n.blob_sha = b.sha
       WHERE n.name = ${name} AND n.repo_id = ${repoId}
       UNION
       SELECT
@@ -139,7 +139,7 @@ export async function queryTypeHierarchy(
     )
     SELECT DISTINCT n.*
     FROM code_node n JOIN hierarchy h ON n.id = h.id
-    JOIN unnest(${blobs}::text[]) AS b(sha) ON n.blob_sha = b.sha
+    JOIN unnest(string_to_array(${blobs}, ',')) AS b(sha) ON n.blob_sha = b.sha
     LIMIT ${RESULT_LIMIT}
   `);
   return { nodes: rows.rows as unknown as CodeNode[] };
@@ -151,13 +151,13 @@ export async function queryTypeHierarchy(
 export async function queryImpactAnalysis(
   db: Database, repoId: string, name: string, blobShas: Set<string>, maxDepth: number = 3
 ): Promise<GraphQueryResult> {
-  const blobs = [...blobShas];
+  const blobs = [...blobShas].join(',');
   const rows = await db.execute(sql`
     WITH RECURSIVE impact AS (
       SELECT e.source_id AS id, e.source_id, e.target_id, e.type AS edge_type, 1 AS depth
       FROM code_edge e
       JOIN code_node t ON e.target_id = t.id
-      JOIN unnest(${blobs}::text[]) AS b(sha) ON t.blob_sha = b.sha
+      JOIN unnest(string_to_array(${blobs}, ',')) AS b(sha) ON t.blob_sha = b.sha
       WHERE e.type IN ('CALLS', 'IMPORTS', 'USES_TYPE', 'EXTENDS', 'IMPLEMENTS')
         AND e.repo_id = ${repoId}
         AND t.name = ${name} AND t.repo_id = ${repoId}
@@ -169,7 +169,7 @@ export async function queryImpactAnalysis(
     )
     SELECT DISTINCT n.*, i.source_id AS edge_source, i.target_id AS edge_target, i.edge_type
     FROM code_node n JOIN impact i ON n.id = i.id
-    JOIN unnest(${blobs}::text[]) AS b(sha) ON n.blob_sha = b.sha
+    JOIN unnest(string_to_array(${blobs}, ',')) AS b(sha) ON n.blob_sha = b.sha
     LIMIT ${RESULT_LIMIT}
   `);
 
@@ -197,11 +197,11 @@ export async function queryImpactAnalysis(
 export async function queryFileStructure(
   db: Database, repoId: string, filePath: string, blobShas: Set<string>
 ): Promise<GraphQueryResult> {
-  const blobs = [...blobShas];
+  const blobs = [...blobShas].join(',');
   const rows = await db.execute(sql`
     SELECT n.*
     FROM code_node n
-    JOIN unnest(${blobs}::text[]) AS b(sha) ON n.blob_sha = b.sha
+    JOIN unnest(string_to_array(${blobs}, ',')) AS b(sha) ON n.blob_sha = b.sha
     WHERE n.file_path = ${filePath} AND n.repo_id = ${repoId}
     ORDER BY n.start_line ASC NULLS LAST
     LIMIT ${RESULT_LIMIT}
@@ -212,11 +212,11 @@ export async function queryFileStructure(
 export async function querySymbolLookup(
   db: Database, repoId: string, name: string, blobShas: Set<string>
 ): Promise<GraphQueryResult> {
-  const blobs = [...blobShas];
+  const blobs = [...blobShas].join(',');
   const rows = await db.execute(sql`
     SELECT n.*
     FROM code_node n
-    JOIN unnest(${blobs}::text[]) AS b(sha) ON n.blob_sha = b.sha
+    JOIN unnest(string_to_array(${blobs}, ',')) AS b(sha) ON n.blob_sha = b.sha
     WHERE n.name ILIKE ${name} AND n.repo_id = ${repoId}
     ORDER BY CASE WHEN n.name = ${name} THEN 0 ELSE 1 END, n.type ASC
     LIMIT 50
@@ -227,11 +227,11 @@ export async function querySymbolLookup(
 export async function queryCommunity(
   db: Database, repoId: string, communityId: string, blobShas: Set<string>
 ): Promise<GraphQueryResult> {
-  const blobs = [...blobShas];
+  const blobs = [...blobShas].join(',');
   const rows = await db.execute(sql`
     SELECT n.*
     FROM code_node n
-    JOIN unnest(${blobs}::text[]) AS b(sha) ON n.blob_sha = b.sha
+    JOIN unnest(string_to_array(${blobs}, ',')) AS b(sha) ON n.blob_sha = b.sha
     WHERE n.community_id = ${communityId} AND n.repo_id = ${repoId}
     ORDER BY n.type ASC, n.name ASC
     LIMIT ${RESULT_LIMIT}
@@ -242,14 +242,14 @@ export async function queryCommunity(
 export async function queryTestsFor(
   db: Database, repoId: string, targetName: string, blobShas: Set<string>
 ): Promise<GraphQueryResult> {
-  const blobs = [...blobShas];
+  const blobs = [...blobShas].join(',');
   const rows = await db.execute(sql`
     SELECT DISTINCT n.*
     FROM code_node n
-    JOIN unnest(${blobs}::text[]) AS b1(sha) ON n.blob_sha = b1.sha
+    JOIN unnest(string_to_array(${blobs}, ',')) AS b1(sha) ON n.blob_sha = b1.sha
     JOIN code_edge e ON e.source_id = n.id
     JOIN code_node t ON e.target_id = t.id
-    JOIN unnest(${blobs}::text[]) AS b2(sha) ON t.blob_sha = b2.sha
+    JOIN unnest(string_to_array(${blobs}, ',')) AS b2(sha) ON t.blob_sha = b2.sha
     WHERE e.type = 'TESTS' AND e.repo_id = ${repoId}
       AND t.name = ${targetName} AND t.repo_id = ${repoId}
     LIMIT ${RESULT_LIMIT}
@@ -263,11 +263,11 @@ export async function queryTestsFor(
 export async function queryUnusedExports(
   db: Database, repoId: string, blobShas: Set<string>
 ): Promise<GraphQueryResult> {
-  const blobs = [...blobShas];
+  const blobs = [...blobShas].join(',');
   const rows = await db.execute(sql`
     SELECT n.*
     FROM code_node n
-    JOIN unnest(${blobs}::text[]) AS b(sha) ON n.blob_sha = b.sha
+    JOIN unnest(string_to_array(${blobs}, ',')) AS b(sha) ON n.blob_sha = b.sha
     LEFT JOIN code_edge e ON e.target_id = n.id
       AND e.type IN ('IMPORTS', 'CALLS', 'USES_TYPE')
       AND e.repo_id = ${repoId}
@@ -285,7 +285,7 @@ export async function queryUnusedExports(
 export async function queryCircularDeps(
   db: Database, repoId: string, blobShas: Set<string>
 ): Promise<GraphQueryResult> {
-  const blobs = [...blobShas];
+  const blobs = [...blobShas].join(',');
   const rows = await db.execute(sql`
     WITH RECURSIVE cycle_detect AS (
       SELECT e.source_id, e.target_id, ARRAY[e.source_id] AS path, false AS is_cycle
@@ -293,7 +293,7 @@ export async function queryCircularDeps(
       WHERE e.type = 'IMPORTS' AND e.repo_id = ${repoId}
         AND EXISTS (
           SELECT 1 FROM code_node cn
-          JOIN unnest(${blobs}::text[]) AS b(sha) ON cn.blob_sha = b.sha
+          JOIN unnest(string_to_array(${blobs}, ',')) AS b(sha) ON cn.blob_sha = b.sha
           WHERE cn.id = e.source_id
         )
       UNION ALL
@@ -307,7 +307,7 @@ export async function queryCircularDeps(
     )
     SELECT DISTINCT n.*
     FROM code_node n
-    JOIN unnest(${blobs}::text[]) AS b(sha) ON n.blob_sha = b.sha
+    JOIN unnest(string_to_array(${blobs}, ',')) AS b(sha) ON n.blob_sha = b.sha
     JOIN cycle_detect cd ON n.id = ANY(cd.path || cd.target_id)
     WHERE cd.is_cycle = true AND n.repo_id = ${repoId}
     LIMIT 50
@@ -318,11 +318,11 @@ export async function queryCircularDeps(
 export async function queryApiRoutes(
   db: Database, repoId: string, blobShas: Set<string>
 ): Promise<GraphQueryResult> {
-  const blobs = [...blobShas];
+  const blobs = [...blobShas].join(',');
   const rows = await db.execute(sql`
     SELECT n.*
     FROM code_node n
-    JOIN unnest(${blobs}::text[]) AS b(sha) ON n.blob_sha = b.sha
+    JOIN unnest(string_to_array(${blobs}, ',')) AS b(sha) ON n.blob_sha = b.sha
     WHERE n.type = 'Route' AND n.repo_id = ${repoId}
     ORDER BY n.file_path ASC, n.start_line ASC
     LIMIT ${RESULT_LIMIT}
@@ -333,13 +333,13 @@ export async function queryApiRoutes(
 export async function queryDataFlow(
   db: Database, repoId: string, name: string, blobShas: Set<string>, maxDepth: number = 3
 ): Promise<GraphQueryResult> {
-  const blobs = [...blobShas];
+  const blobs = [...blobShas].join(',');
   const rows = await db.execute(sql`
     WITH RECURSIVE flow AS (
       SELECT e.source_id AS id, 1 AS depth
       FROM code_edge e
       JOIN code_node t ON e.target_id = t.id
-      JOIN unnest(${blobs}::text[]) AS b(sha) ON t.blob_sha = b.sha
+      JOIN unnest(string_to_array(${blobs}, ',')) AS b(sha) ON t.blob_sha = b.sha
       WHERE e.type IN ('READS', 'WRITES')
         AND e.repo_id = ${repoId}
         AND t.name = ${name} AND t.repo_id = ${repoId}
@@ -352,7 +352,7 @@ export async function queryDataFlow(
     )
     SELECT DISTINCT n.*
     FROM code_node n JOIN flow f ON n.id = f.id
-    JOIN unnest(${blobs}::text[]) AS b(sha) ON n.blob_sha = b.sha
+    JOIN unnest(string_to_array(${blobs}, ',')) AS b(sha) ON n.blob_sha = b.sha
     LIMIT ${RESULT_LIMIT}
   `);
   return { nodes: rows.rows as unknown as CodeNode[] };
