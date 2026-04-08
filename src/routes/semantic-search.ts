@@ -5,7 +5,14 @@
  * POST /v1/repos/:namespace/:slug/semantic-search
  *
  * Version-aware: accepts `ref` (branch name or commit SHA).
- * Two-stage retrieval: embed query → Pinecone top-200 → post-filter by tree → R2 blob fetch → rerank → top-k
+ * Two-stage retrieval: embed query → Pinecone top-N → post-filter by tree → R2 blob fetch → rerank → MMR → top-k
+ *
+ * Optimisations:
+ *   - Parallel tree-fetch + query embedding (P0.1)
+ *   - KV result cache keyed by commitSha (P0.2)
+ *   - MMR diversification across files (P0.3)
+ *   - Neighbour-chunk context expansion (P1.2)
+ *   - Tuned over-fetch / rerank candidates (P1.3)
  */
 
 import { Hono } from "hono";
@@ -32,10 +39,14 @@ interface SemanticSearchRequest {
   path_pattern?: string;
   language?: string;
   top_k?: number;
+  expand_context?: boolean;
 }
 
-const PINECONE_OVER_FETCH = 200; // over-fetch to compensate for post-filtering
-const RERANK_CANDIDATES = 50;
+// ── Tuned constants (P1.3) ──
+const PINECONE_OVER_FETCH = 150;
+const RERANK_CANDIDATES = 30;
+const MMR_LAMBDA = 0.3;
+const SEARCH_CACHE_TTL = 600; // 10 minutes
 
 function globToRegex(glob: string): RegExp {
   const escaped = glob
@@ -108,6 +119,56 @@ async function getTreeBlobShas(
   return blobMap;
 }
 
+// ── Search result cache helpers (P0.2) ──
+
+async function hashCacheKey(parts: string[]): Promise<string> {
+  const data = new TextEncoder().encode(parts.join("|"));
+  const hash = await crypto.subtle.digest("SHA-256", data);
+  return Array.from(new Uint8Array(hash))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+// ── MMR diversification (P0.3) ──
+
+function mmrSelect(
+  reranked: Array<{ index: number; score: number }>,
+  validMatches: Array<{ resolvedPath: string }>,
+  topK: number,
+  lambda: number = MMR_LAMBDA
+): Array<{ index: number; score: number }> {
+  if (reranked.length <= topK) return reranked;
+
+  const selected: Array<{ index: number; score: number }> = [];
+  const remaining = [...reranked];
+  const selectedPaths = new Map<string, number>(); // path → count
+
+  while (selected.length < topK && remaining.length > 0) {
+    let bestIdx = 0;
+    let bestScore = -Infinity;
+
+    for (let i = 0; i < remaining.length; i++) {
+      const candidate = remaining[i];
+      const filePath = validMatches[candidate.index].resolvedPath;
+      const duplicates = selectedPaths.get(filePath) || 0;
+      // Graduated penalty: first dupe penalised lightly, subsequent ones harder
+      const penalty = duplicates > 0 ? 0.3 + 0.2 * Math.min(duplicates - 1, 3) : 0;
+      const mmrScore = (1 - lambda) * candidate.score - lambda * penalty;
+      if (mmrScore > bestScore) {
+        bestScore = mmrScore;
+        bestIdx = i;
+      }
+    }
+
+    const winner = remaining.splice(bestIdx, 1)[0];
+    selected.push(winner);
+    const winPath = validMatches[winner.index].resolvedPath;
+    selectedPaths.set(winPath, (selectedPaths.get(winPath) || 0) + 1);
+  }
+
+  return selected;
+}
+
 const semanticSearchHandler = async (c: any) => {
   const orgId = c.get("orgId");
   const db = c.get("db");
@@ -146,6 +207,7 @@ const semanticSearchHandler = async (c: any) => {
 
   const ref = body.ref || resolved.repo.defaultBranch;
   const topK = Math.min(body.top_k ?? 10, 50);
+  const expandContext = body.expand_context === true;
   const storage = resolved.storage;
 
   // 1. Resolve ref → commit SHA
@@ -154,12 +216,40 @@ const semanticSearchHandler = async (c: any) => {
     return c.json({ error: `Ref not found: ${ref}` }, 404);
   }
 
-  // 2. Get tree blob SHAs (cached in KV)
+  // ── P0.2: Check search result cache ──
+  const searchCache = c.env.SEARCH_CACHE as KVNamespace | undefined;
+  let cacheKey: string | null = null;
+  if (searchCache) {
+    cacheKey = `search:${orgId}/${resolved.repo.id}:${commitSha}:` + await hashCacheKey([
+      body.q,
+      body.language || "",
+      body.path_pattern || "",
+      String(topK),
+      String(expandContext),
+    ]);
+    const cached = await searchCache.get(cacheKey, "json");
+    if (cached) {
+      recordUsage(
+        c.executionCtx, db, orgId, "semantic_search_query", 1,
+        { repo_id: resolved.repo.id, results_count: (cached as any).results?.length || 0, cache: "hit" },
+        c.env.DODO_PAYMENTS_API_KEY, c.get("dodoCustomerId")
+      );
+      return c.json(cached, 200, { "X-Cache": "HIT" });
+    }
+  }
+
+  // 2+3. Parallel: get tree blob SHAs + embed query (P0.1)
   let treeBlobMap: Map<string, string>;
+  let queryVector: number[];
   try {
-    treeBlobMap = await getTreeBlobShas(storage, commitSha, c.env.TREE_CACHE);
+    const [treeResult, embedResult] = await Promise.all([
+      getTreeBlobShas(storage, commitSha, c.env.TREE_CACHE),
+      embedCode([body.q], "query", c.env.VOYAGE_API_KEY!),
+    ]);
+    treeBlobMap = treeResult;
+    queryVector = embedResult[0];
   } catch (err) {
-    return c.json({ error: `Failed to resolve tree for ref: ${ref}` }, 500);
+    return c.json({ error: `Failed to prepare search: ${(err as Error).message}` }, 500);
   }
 
   const treeBlobShas = new Set(treeBlobMap.keys());
@@ -167,9 +257,6 @@ const semanticSearchHandler = async (c: any) => {
   if (treeBlobShas.size === 0) {
     return c.json({ results: [], query: body.q, repo_slug: slug, ref });
   }
-
-  // 3. Embed query
-  const [queryVector] = await embedCode([body.q], "query", c.env.VOYAGE_API_KEY!);
 
   // 4. Query Pinecone (over-fetch to compensate for post-filtering)
   const pineconeNs = `${orgId}/${resolved.repo.id}`;
@@ -228,7 +315,7 @@ const semanticSearchHandler = async (c: any) => {
 
   // Extract text snippets
   const matchTexts: string[] = [];
-  const validMatches: Array<QueryMatch & { resolvedPath: string }> = [];
+  const validMatches: Array<QueryMatch & { resolvedPath: string; fullLines: string[] }> = [];
 
   for (const match of candidates) {
     const blobRaw = blobMap.get(match.metadata.blob_sha);
@@ -246,7 +333,7 @@ const semanticSearchHandler = async (c: any) => {
     matchTexts.push(snippet);
     // Use file path from tree (authoritative for this version)
     const resolvedPath = treeBlobMap.get(match.metadata.blob_sha) || match.metadata.file_path;
-    validMatches.push({ ...match, resolvedPath });
+    validMatches.push({ ...match, resolvedPath, fullLines: lines });
   }
 
   if (validMatches.length === 0) {
@@ -254,12 +341,15 @@ const semanticSearchHandler = async (c: any) => {
   }
 
   // 7. Rerank
-  const reranked = await rerankCode(body.q, matchTexts, topK, c.env.VOYAGE_API_KEY!);
+  const reranked = await rerankCode(body.q, matchTexts, Math.min(topK * 3, matchTexts.length), c.env.VOYAGE_API_KEY!);
 
-  // 8. Build response
-  const results = reranked.map((r) => {
+  // 8. MMR diversification (P0.3)
+  const diversified = mmrSelect(reranked, validMatches, topK);
+
+  // 9. Build response
+  const results = diversified.map((r) => {
     const match = validMatches[r.index];
-    return {
+    const result: Record<string, unknown> = {
       file_path: match.resolvedPath,
       score: r.score,
       language: match.metadata.language,
@@ -267,15 +357,48 @@ const semanticSearchHandler = async (c: any) => {
       end_line: match.metadata.end_line,
       snippet: matchTexts[r.index],
     };
+
+    // P1.2: Neighbour chunk context expansion
+    if (expandContext) {
+      const chunkIdx = match.metadata.chunk_index;
+      const lines = match.fullLines;
+
+      if (chunkIdx > 0) {
+        // Show lines before this chunk's start
+        const ctxStart = Math.max(0, match.metadata.start_line - 1 - 20);
+        const ctxEnd = Math.max(0, match.metadata.start_line - 1);
+        if (ctxEnd > ctxStart) {
+          result.context_before = lines.slice(ctxStart, ctxEnd).join("\n");
+        }
+      }
+
+      // Show lines after this chunk's end
+      const ctxStart = Math.min(lines.length, match.metadata.end_line);
+      const ctxEnd = Math.min(lines.length, match.metadata.end_line + 20);
+      if (ctxEnd > ctxStart) {
+        result.context_after = lines.slice(ctxStart, ctxEnd).join("\n");
+      }
+    }
+
+    return result;
   });
+
+  const responseBody = { results, query: body.q, repo_slug: slug, ref };
+
+  // ── P0.2: Write to search cache ──
+  if (searchCache && cacheKey) {
+    c.executionCtx.waitUntil(
+      searchCache.put(cacheKey, JSON.stringify(responseBody), { expirationTtl: SEARCH_CACHE_TTL }).catch(() => {})
+    );
+  }
 
   recordUsage(
     c.executionCtx, db, orgId, "semantic_search_query", 1,
-    { repo_id: resolved.repo.id, results_count: results.length },
+    { repo_id: resolved.repo.id, results_count: results.length, cache: "miss" },
     c.env.DODO_PAYMENTS_API_KEY, c.get("dodoCustomerId")
   );
 
-  return c.json({ results, query: body.q, repo_slug: slug, ref });
+  return c.json(responseBody, 200, { "X-Cache": "MISS" });
 };
 
 semanticSearch.post("/:slug/semantic-search", apiKeyAuth, semanticSearchHandler);

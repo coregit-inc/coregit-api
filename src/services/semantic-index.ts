@@ -2,6 +2,9 @@
  * Semantic search indexing service.
  * Content-addressed: vectors keyed by blob SHA (like git itself).
  * Same content = same vector, no duplication across branches/commits.
+ *
+ * P0.4: Uses embedding cache (KV) to avoid redundant Voyage API calls.
+ * P1.1: Chunk ID format v2 — `{blobSha}:v2:{chunkIndex}` (contextual prefix).
  */
 
 import { eq, and, sql } from "drizzle-orm";
@@ -10,7 +13,7 @@ import { GitR2Storage } from "../git/storage";
 import { parseGitObject, parseCommit } from "../git/objects";
 import { flattenTree } from "../git/cherry-pick";
 import { chunkFile } from "./chunker";
-import { embedCode } from "./voyage";
+import { embedCodeCached } from "./voyage";
 import {
   upsertVectors,
   vectorsExist,
@@ -19,6 +22,9 @@ import {
 import { semanticIndex } from "../db/schema";
 import type { Database } from "../db";
 import type { Env } from "../types";
+
+// Chunk ID version — bump when chunk format changes to avoid dedup collisions
+const CHUNK_VERSION = "v2";
 
 // ── Queue message types ──
 
@@ -52,6 +58,11 @@ export type IndexingMessage = IndexFileMessage | FullReindexMessage;
 /** One namespace per repo — all versions live together. */
 function pineconeNamespace(orgId: string, repoId: string): string {
   return `${orgId}/${repoId}`;
+}
+
+/** Content-addressed vector ID with version tag. */
+function vectorId(blobSha: string, chunkIndex: number): string {
+  return `${blobSha}:${CHUNK_VERSION}:${chunkIndex}`;
 }
 
 // ── Delta indexing (per-commit) ──
@@ -102,11 +113,12 @@ export async function processIndexFileMessage(
   if (blobsToProcess.length === 0) return 0;
 
   // Check which blob SHAs already have vectors (content-addressed dedup)
-  const checkIds = blobsToProcess.map((b) => `${b.blobSha}:0`);
+  // Use versioned ID format for dedup check
+  const checkIds = blobsToProcess.map((b) => vectorId(b.blobSha, 0));
   const existingIds = await vectorsExist(host, pineconeKey, namespace, checkIds);
 
   // Filter to only new blobs
-  const newBlobs = blobsToProcess.filter((b) => !existingIds.has(`${b.blobSha}:0`));
+  const newBlobs = blobsToProcess.filter((b) => !existingIds.has(vectorId(b.blobSha, 0)));
 
   if (newBlobs.length === 0) {
     // All blobs already embedded — just update DB tracking
@@ -150,15 +162,17 @@ export async function processIndexFileMessage(
   }
 
   if (allChunks.length > 0) {
-    const embeddings = await embedCode(
+    // P0.4: Use cached embeddings
+    const embeddings = await embedCodeCached(
       allChunks.map((c) => c.text),
       "document",
-      voyageKey
+      voyageKey,
+      env.EMBEDDING_CACHE
     );
 
-    // Content-addressed vector IDs: {blob_sha}:{chunk_index}
+    // Content-addressed vector IDs with version: {blob_sha}:v2:{chunk_index}
     const vectors: VectorRecord[] = allChunks.map((chunk, i) => ({
-      id: `${chunk.blobSha}:${chunk.chunkIndex}`,
+      id: vectorId(chunk.blobSha, chunk.chunkIndex),
       values: embeddings[i],
       metadata: {
         file_path: chunk.filePath,

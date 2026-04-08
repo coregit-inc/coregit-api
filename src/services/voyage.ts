@@ -1,6 +1,8 @@
 /**
  * Voyage AI client for code embeddings and reranking.
  * Pure fetch() — no SDK dependency.
+ *
+ * P0.4: embedCodeCached() adds a KV-backed content-addressed embedding cache.
  */
 
 const VOYAGE_API_URL = "https://api.voyageai.com/v1";
@@ -80,6 +82,77 @@ export async function embedCode(
   }
 
   return allEmbeddings;
+}
+
+/**
+ * Content-addressed embedding cache (P0.4).
+ *
+ * Checks KV for cached embeddings keyed by SHA-256 of the text.
+ * Only sends cache-miss texts to the Voyage API.
+ * Stores new embeddings in KV (no TTL — content is immutable).
+ */
+export async function embedCodeCached(
+  texts: string[],
+  inputType: "query" | "document",
+  apiKey: string,
+  kv?: KVNamespace
+): Promise<number[][]> {
+  if (texts.length === 0) return [];
+  if (!kv) return embedCode(texts, inputType, apiKey);
+
+  // Hash all texts in parallel
+  const hashes = await Promise.all(
+    texts.map(async (text) => {
+      const data = new TextEncoder().encode(text);
+      const hash = await crypto.subtle.digest("SHA-256", data);
+      return Array.from(new Uint8Array(hash))
+        .map((b) => b.toString(16).padStart(2, "0"))
+        .join("");
+    })
+  );
+
+  // Check KV for cached embeddings (parallel, batched by 50 to avoid overwhelming KV)
+  const KV_BATCH = 50;
+  const cachedEmbeddings: (number[] | null)[] = new Array(texts.length).fill(null);
+
+  for (let i = 0; i < hashes.length; i += KV_BATCH) {
+    const batch = hashes.slice(i, i + KV_BATCH);
+    const results = await Promise.all(
+      batch.map((h) => kv.get(`emb:${h}`, "json") as Promise<number[] | null>)
+    );
+    for (let j = 0; j < results.length; j++) {
+      cachedEmbeddings[i + j] = results[j];
+    }
+  }
+
+  // Collect cache misses
+  const missIndices: number[] = [];
+  const missTexts: string[] = [];
+  for (let i = 0; i < texts.length; i++) {
+    if (!cachedEmbeddings[i]) {
+      missIndices.push(i);
+      missTexts.push(texts[i]);
+    }
+  }
+
+  // Embed only misses
+  if (missTexts.length > 0) {
+    const newEmbeddings = await embedCode(missTexts, inputType, apiKey);
+
+    // Store new embeddings in KV (fire-and-forget)
+    const writePromises: Promise<void>[] = [];
+    for (let i = 0; i < missIndices.length; i++) {
+      cachedEmbeddings[missIndices[i]] = newEmbeddings[i];
+      writePromises.push(
+        kv.put(`emb:${hashes[missIndices[i]]}`, JSON.stringify(newEmbeddings[i])).catch(() => {})
+      );
+    }
+    // Don't await writes — they can complete in the background
+    // (In Workers, use ctx.waitUntil if available; here we just fire and forget)
+    await Promise.all(writePromises);
+  }
+
+  return cachedEmbeddings as number[][];
 }
 
 /**

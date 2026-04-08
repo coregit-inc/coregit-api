@@ -1,6 +1,8 @@
 /**
  * Code chunking for semantic search indexing.
  * Splits files into chunks suitable for embedding with voyage-code-3.
+ *
+ * P1.1: CAST-style contextual prefix — language + top-level declarations.
  */
 
 export interface CodeChunk {
@@ -53,6 +55,9 @@ const SKIP_FILENAMES = new Set([
   "poetry.lock", "Pipfile.lock",
 ]);
 
+// Regex to extract top-level declarations across languages
+const DECLARATION_RE = /(?:export\s+)?(?:default\s+)?(?:async\s+)?(?:function|class|const|let|var|interface|type|enum|def|func|fn|pub\s+fn|pub\s+struct|struct|impl|trait|module|object)\s+(\w+)/;
+
 function getExtension(filePath: string): string {
   const basename = filePath.split("/").pop() || "";
   // Handle dotfiles like Dockerfile
@@ -88,6 +93,34 @@ function isBinaryContent(content: string): boolean {
 }
 
 /**
+ * Build a contextual prefix for a chunk (P1.1 — CAST-style).
+ * Includes file path, language, and top-level declarations from the file head.
+ * Cap at ~200 chars to avoid wasting embedding tokens.
+ */
+function buildPrefix(filePath: string, content: string, language: string): string {
+  const parts = [`// File: ${filePath}`, `// Language: ${language}`];
+
+  // Scan first 50 lines for top-level declarations
+  const headLines = content.split("\n").slice(0, 50);
+  const declarations: string[] = [];
+  for (const line of headLines) {
+    const m = line.match(DECLARATION_RE);
+    if (m && m[1]) {
+      declarations.push(m[1]);
+      if (declarations.length >= 5) break;
+    }
+  }
+
+  if (declarations.length > 0) {
+    parts.push(`// Defines: ${declarations.join(", ")}`);
+  }
+
+  const prefix = parts.join("\n") + "\n";
+  // Hard cap to avoid bloating chunk text
+  return prefix.length > 300 ? prefix.slice(0, 300) + "\n" : prefix;
+}
+
+/**
  * Chunk a file into pieces suitable for embedding.
  * Returns empty array for files that should be skipped.
  */
@@ -97,7 +130,7 @@ export function chunkFile(filePath: string, content: string): CodeChunk[] {
   if (content.trim().length === 0) return [];
 
   const language = getLanguage(filePath);
-  const prefix = `// File: ${filePath}\n`;
+  const prefix = buildPrefix(filePath, content, language);
 
   // Small file: single chunk
   if (content.length <= MAX_CHUNK_CHARS) {

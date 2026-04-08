@@ -21,6 +21,8 @@ export interface Env {
   PINECONE_INDEX_HOST?: string;
   INDEXING_QUEUE?: Queue;
   TREE_CACHE?: KVNamespace;
+  SEARCH_CACHE?: KVNamespace;
+  EMBEDDING_CACHE?: KVNamespace;
 }
 
 export interface Variables {
