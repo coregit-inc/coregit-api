@@ -76,7 +76,7 @@ export function isBinaryContent(content: Uint8Array): boolean {
   return false;
 }
 
-async function flattenTreeRecursive(
+export async function flattenTreeRecursive(
   storage: GitR2Storage,
   entries: TreeEntry[],
   basePath: string,
