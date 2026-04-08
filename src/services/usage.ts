@@ -14,7 +14,9 @@ export type UsageEventType =
   | "repo_created"
   | "repo_deleted"
   | "semantic_search_query"
-  | "semantic_index_chunks";
+  | "semantic_index_chunks"
+  | "graph_query"
+  | "hybrid_search";
 
 /**
  * Record a usage event to local DB and forward to Dodo if the org has a Dodo customer.

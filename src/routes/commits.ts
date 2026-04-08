@@ -19,6 +19,7 @@ import { createApiCommit, ConflictError, EditConflictError, InvalidBase64Error, 
 import { checkFreeLimits } from "../services/limits";
 import { isValidRefName, validateFilePath } from "../git/validation";
 import type { IndexFileMessage } from "../services/semantic-index";
+import type { GraphIndexFileMessage } from "../services/graph-index";
 import type { Env, Variables } from "../types";
 
 const commits = new Hono<{ Bindings: Env; Variables: Variables }>();
@@ -142,6 +143,18 @@ const createCommitHandler = async (c: any) => {
         }),
       };
       c.executionCtx.waitUntil(c.env.INDEXING_QUEUE.send(indexMsg));
+
+      // Also trigger code graph indexing
+      const graphMsg: GraphIndexFileMessage = {
+        type: "graph_index_files",
+        orgId,
+        repoId: found.id,
+        repoStorageSuffix: resolved.storageSuffix,
+        branch,
+        commitSha: result.sha,
+        files: indexMsg.files,
+      };
+      c.executionCtx.waitUntil(c.env.INDEXING_QUEUE.send(graphMsg));
     }
 
     return c.json(

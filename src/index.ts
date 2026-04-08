@@ -57,12 +57,20 @@ import { lfsLocks } from "./routes/lfs-locks";
 import { lfsRest } from "./routes/lfs-rest";
 import { semanticSearch } from "./routes/semantic-search";
 import { semanticIndexRoutes } from "./routes/semantic-index";
+import { graphRoutes } from "./routes/graph";
+import { hybridSearchRoutes } from "./routes/hybrid-search";
 import {
   processIndexFileMessage,
   processFullReindex,
   incrementBatchCounter,
   type IndexingMessage,
 } from "./services/semantic-index";
+import {
+  processGraphIndexFileMessage,
+  processGraphFullReindex,
+  incrementGraphBatchCounter,
+  type GraphIndexingMessage,
+} from "./services/graph-index";
 import type { Env, Variables } from "./types";
 
 const app = new Hono<{ Bindings: Env; Variables: Variables }>();
@@ -268,6 +276,8 @@ app.route("/v1/repos", sync);
 app.route("/v1/repos", syncConfig);
 app.route("/v1/repos", semanticSearch);
 app.route("/v1/repos", semanticIndexRoutes);
+app.route("/v1/repos", graphRoutes);
+app.route("/v1/repos", hybridSearchRoutes);
 app.route("/v1/repos", repos);
 app.route("/v1", connections);
 app.route("/v1", tokens);
@@ -313,31 +323,46 @@ app.onError((err, c) => {
 export default {
   fetch: app.fetch,
 
-  async queue(batch: MessageBatch<IndexingMessage>, env: Env, ctx: ExecutionContext) {
+  async queue(batch: MessageBatch<IndexingMessage | GraphIndexingMessage>, env: Env, ctx: ExecutionContext) {
     const db = createDb(env.DATABASE_URL);
     for (const message of batch.messages) {
       try {
-        if (message.body.type === "index_files") {
-          const chunksIndexed = await processIndexFileMessage(message.body, env, db);
-          // Only increment batch counter for full-reindex fan-out batches
-          if (message.body.isFullReindex) {
-            await incrementBatchCounter(db, message.body.repoId, message.body.branch, chunksIndexed);
+        const { type } = message.body;
+
+        // Semantic search indexing
+        if (type === "index_files") {
+          const body = message.body as IndexingMessage & { type: "index_files" };
+          const chunksIndexed = await processIndexFileMessage(body, env, db);
+          if (body.isFullReindex) {
+            await incrementBatchCounter(db, body.repoId, body.branch, chunksIndexed);
           }
-        } else if (message.body.type === "full_reindex") {
-          await processFullReindex(message.body, env, db);
+        } else if (type === "full_reindex") {
+          await processFullReindex(message.body as IndexingMessage & { type: "full_reindex" }, env, db);
         }
+
+        // Code graph indexing
+        else if (type === "graph_index_files") {
+          const body = message.body as GraphIndexingMessage & { type: "graph_index_files" };
+          const result = await processGraphIndexFileMessage(body, env, db);
+          if (body.isFullReindex) {
+            await incrementGraphBatchCounter(db, body.repoId, body.branch, result.nodesCount, result.edgesCount);
+          }
+        } else if (type === "graph_full_reindex") {
+          await processGraphFullReindex(message.body as GraphIndexingMessage & { type: "graph_full_reindex" }, env, db);
+        }
+
         message.ack();
       } catch (err) {
         console.error(`Indexing failed (attempt ${message.attempts}):`, err);
-        // Mark as failed after max retries (CF Queues default: 3)
         if (message.attempts >= 3) {
           const body = message.body;
+          const table = body.type.startsWith("graph_") ? "code_graph_index" : "semantic_index";
           ctx.waitUntil(
             db.execute(
-              sql`UPDATE semantic_index SET status = 'failed', error = ${String(err)} WHERE repo_id = ${body.repoId} AND branch = ${body.branch}`
+              sql`UPDATE ${sql.raw(table)} SET status = 'failed', error = ${String(err)} WHERE repo_id = ${body.repoId} AND branch = ${body.branch}`
             ).catch(() => {})
           );
-          message.ack(); // Don't retry — goes to DLQ
+          message.ack();
         } else {
           message.retry();
         }

@@ -1,4 +1,4 @@
-import { pgTable, text, timestamp, index, uniqueIndex, jsonb, bigint, boolean } from "drizzle-orm/pg-core";
+import { pgTable, text, timestamp, index, uniqueIndex, jsonb, bigint, boolean, integer } from "drizzle-orm/pg-core";
 
 // ============================================================
 // Better Auth managed table (read-only reference for queries)
@@ -336,3 +336,86 @@ export const semanticIndex = pgTable(
 );
 
 export type SemanticIndex = typeof semanticIndex.$inferSelect;
+
+// Code graph nodes (structural code intelligence)
+export const codeNode = pgTable(
+  "code_node",
+  {
+    id: text("id").primaryKey(),                    // {blobSha}:{type}:{name}
+    type: text("type").notNull(),                   // Function, Class, Interface, Enum, Type, Variable, Module, Decorator, Test, Route, Comment, File
+    name: text("name").notNull(),
+    filePath: text("file_path").notNull(),
+    blobSha: text("blob_sha").notNull(),
+    repoId: text("repo_id")
+      .notNull()
+      .references(() => repo.id, { onDelete: "cascade" }),
+    orgId: text("org_id").notNull(),
+    startLine: integer("start_line"),
+    endLine: integer("end_line"),
+    signature: text("signature"),
+    language: text("language"),
+    exported: boolean("exported").default(false),
+    complexity: integer("complexity"),
+    communityId: text("community_id"),
+  },
+  (table) => [
+    index("code_node_repo_blob_idx").on(table.repoId, table.blobSha),
+    index("code_node_repo_name_idx").on(table.repoId, table.name),
+    index("code_node_repo_type_idx").on(table.repoId, table.type),
+    index("code_node_community_idx").on(table.repoId, table.communityId),
+    index("code_node_repo_filepath_idx").on(table.repoId, table.filePath),
+  ]
+);
+
+export type CodeNode = typeof codeNode.$inferSelect;
+export type NewCodeNode = typeof codeNode.$inferInsert;
+
+// Code graph edges (relationships between nodes)
+export const codeEdge = pgTable(
+  "code_edge",
+  {
+    id: text("id").primaryKey(),
+    sourceId: text("source_id").notNull(),
+    targetId: text("target_id").notNull(),
+    type: text("type").notNull(),                   // CALLS, IMPORTS, EXTENDS, IMPLEMENTS, EXPORTS, CONTAINS, USES_TYPE, RETURNS_TYPE, OVERRIDES, DECORATES, TESTS, MEMBER_OF, READS, WRITES, THROWS, DOCUMENTS
+    repoId: text("repo_id")
+      .notNull()
+      .references(() => repo.id, { onDelete: "cascade" }),
+  },
+  (table) => [
+    index("code_edge_source_idx").on(table.sourceId),
+    index("code_edge_target_idx").on(table.targetId),
+    index("code_edge_repo_type_idx").on(table.repoId, table.type),
+  ]
+);
+
+export type CodeEdge = typeof codeEdge.$inferSelect;
+export type NewCodeEdge = typeof codeEdge.$inferInsert;
+
+// Code graph index tracking (mirrors semanticIndex)
+export const codeGraphIndex = pgTable(
+  "code_graph_index",
+  {
+    id: text("id").primaryKey(),
+    repoId: text("repo_id")
+      .notNull()
+      .references(() => repo.id, { onDelete: "cascade" }),
+    orgId: text("org_id").notNull(),
+    branch: text("branch").notNull(),
+    lastCommitSha: text("last_commit_sha"),
+    nodesCount: bigint("nodes_count", { mode: "number" }).default(0),
+    edgesCount: bigint("edges_count", { mode: "number" }).default(0),
+    totalBatches: bigint("total_batches", { mode: "number" }).default(0),
+    processedBatches: bigint("processed_batches", { mode: "number" }).default(0),
+    status: text("status").notNull().default("pending"), // pending | indexing | ready | failed
+    error: text("error"),
+    indexedAt: timestamp("indexed_at"),
+    createdAt: timestamp("created_at").defaultNow().notNull(),
+  },
+  (table) => [
+    uniqueIndex("code_graph_index_repo_branch_idx").on(table.repoId, table.branch),
+    index("code_graph_index_org_idx").on(table.orgId),
+  ]
+);
+
+export type CodeGraphIndex = typeof codeGraphIndex.$inferSelect;

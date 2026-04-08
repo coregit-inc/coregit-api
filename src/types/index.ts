@@ -23,6 +23,9 @@ export interface Env {
   TREE_CACHE?: KVNamespace;
   SEARCH_CACHE?: KVNamespace;
   EMBEDDING_CACHE?: KVNamespace;
+  // Code graph
+  GRAPH_CACHE?: KVNamespace;
+  HYBRID_CACHE?: KVNamespace;
 }
 
 export interface Variables {

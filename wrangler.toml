@@ -46,6 +46,16 @@ id = "9c1e4b496923414ba6cf6d988e6a8bc7"
 binding = "EMBEDDING_CACHE"
 id = "f81718abb3c34b7799582ae964de32e5"
 
+# Code graph query result cache
+[[kv_namespaces]]
+binding = "GRAPH_CACHE"
+id = "728b507d5aac4961b6324622c7ae34d8"
+
+# Hybrid search result cache
+[[kv_namespaces]]
+binding = "HYBRID_CACHE"
+id = "b1ab293bd0934871bf9369b024ed9b74"
+
 # Semantic search indexing queue
 [[queues.producers]]
 queue = "coregit-indexing"

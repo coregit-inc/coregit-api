@@ -21,7 +21,8 @@
     "just-bash": "^2.14.0",
     "nanoid": "^5.1.6",
     "node-diff3": "^3.2.0",
-    "pako": "^2.1.0"
+    "pako": "^2.1.0",
+    "web-tree-sitter": "^0.26.8"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20250519.0",
