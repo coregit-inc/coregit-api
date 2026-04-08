@@ -364,9 +364,11 @@ export async function nodesExistForBlob(
   db: Database, repoId: string, blobShas: string[]
 ): Promise<Set<string>> {
   if (blobShas.length === 0) return new Set();
+  const blobs = blobShas.join(',');
   const rows = await db.execute(sql`
-    SELECT DISTINCT blob_sha FROM code_node
-    WHERE repo_id = ${repoId} AND blob_sha = ANY(${blobShas})
+    SELECT DISTINCT n.blob_sha FROM code_node n
+    JOIN unnest(string_to_array(${blobs}, ',')) AS b(sha) ON n.blob_sha = b.sha
+    WHERE n.repo_id = ${repoId}
   `);
   return new Set((rows.rows as any[]).map((r) => r.blob_sha));
 }
@@ -375,17 +377,24 @@ export async function deleteByBlobSha(
   db: Database, repoId: string, blobShas: string[]
 ): Promise<void> {
   if (blobShas.length === 0) return;
+  const blobs = blobShas.join(',');
   const nodeRows = await db.execute(sql`
-    SELECT id FROM code_node WHERE repo_id = ${repoId} AND blob_sha = ANY(${blobShas})
+    SELECT n.id FROM code_node n
+    JOIN unnest(string_to_array(${blobs}, ',')) AS b(sha) ON n.blob_sha = b.sha
+    WHERE n.repo_id = ${repoId}
   `);
   const nodeIds = (nodeRows.rows as any[]).map((r) => r.id);
   if (nodeIds.length > 0) {
+    const ids = nodeIds.join(',');
     await db.execute(sql`
       DELETE FROM code_edge WHERE repo_id = ${repoId}
-        AND (source_id = ANY(${nodeIds}) OR target_id = ANY(${nodeIds}))
+        AND (source_id IN (SELECT unnest(string_to_array(${ids}, ',')))
+          OR target_id IN (SELECT unnest(string_to_array(${ids}, ','))))
     `);
     await db.execute(sql`
-      DELETE FROM code_node WHERE repo_id = ${repoId} AND blob_sha = ANY(${blobShas})
+      DELETE FROM code_node n
+      USING unnest(string_to_array(${blobs}, ',')) AS b(sha)
+      WHERE n.repo_id = ${repoId} AND n.blob_sha = b.sha
     `);
   }
 }
