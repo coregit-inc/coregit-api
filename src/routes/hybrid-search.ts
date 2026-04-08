@@ -275,8 +275,8 @@ const hybridSearchHandler = async (c: any) => {
         const rows = await db.execute(sql`
           SELECT n.file_path, n.name, n.type, n.start_line, n.end_line, n.language
           FROM code_node n
+          JOIN unnest(${blobs}::text[]) AS b(sha) ON n.blob_sha = b.sha
           WHERE n.repo_id = ${resolved.repo.id}
-            AND n.blob_sha = ANY(${blobs})
             AND (n.name ILIKE ${'%' + escaped + '%'} OR n.file_path ILIKE ${'%' + escaped + '%'})
           ORDER BY
             CASE WHEN n.name ILIKE ${escaped} THEN 0

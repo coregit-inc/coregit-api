@@ -2,18 +2,17 @@
  * Graph query functions for code intelligence.
  *
  * All queries accept a Set<blobSha> for version-aware filtering.
- * Uses ANY() for blob SHA filtering (same pattern as semantic search).
+ * Uses JOIN unnest()::text[] for blob SHA filtering — gives Postgres accurate
+ * cardinality estimates and enables Hash Join for large arrays (10K+).
  * All recursive CTEs have LIMIT on final SELECT (DoS protection).
  *
- * Uses Drizzle ORM + Neon serverless (HTTP).
+ * Sources: pganalyze, Hasura #10463, Datadog — ANY(array) degrades at 10K+
+ * because planner can't see array contents in prepared statements.
  */
 
 import { sql } from "drizzle-orm";
-import { codeNode, codeEdge } from "../db/schema";
 import type { Database } from "../db";
 import type { CodeNode } from "../db/schema";
-
-// ── Types ──
 
 export interface GraphQueryResult {
   nodes: CodeNode[];
@@ -31,11 +30,12 @@ export async function queryCallers(
   const rows = await db.execute(sql`
     SELECT DISTINCT n.*
     FROM code_node n
+    JOIN unnest(${blobs}::text[]) AS b(sha) ON n.blob_sha = b.sha
     JOIN code_edge e ON e.source_id = n.id
     JOIN code_node t ON e.target_id = t.id
+    JOIN unnest(${blobs}::text[]) AS b2(sha) ON t.blob_sha = b2.sha
     WHERE e.type = 'CALLS' AND e.repo_id = ${repoId}
       AND t.name = ${targetName} AND t.repo_id = ${repoId}
-      AND n.blob_sha = ANY(${blobs}) AND t.blob_sha = ANY(${blobs})
     LIMIT ${RESULT_LIMIT}
   `);
   return { nodes: rows.rows as unknown as CodeNode[] };
@@ -48,11 +48,12 @@ export async function queryCallees(
   const rows = await db.execute(sql`
     SELECT DISTINCT n.*
     FROM code_node n
+    JOIN unnest(${blobs}::text[]) AS b(sha) ON n.blob_sha = b.sha
     JOIN code_edge e ON e.target_id = n.id
     JOIN code_node s ON e.source_id = s.id
+    JOIN unnest(${blobs}::text[]) AS b2(sha) ON s.blob_sha = b2.sha
     WHERE e.type = 'CALLS' AND e.repo_id = ${repoId}
       AND s.name = ${sourceName} AND s.repo_id = ${repoId}
-      AND n.blob_sha = ANY(${blobs}) AND s.blob_sha = ANY(${blobs})
     LIMIT ${RESULT_LIMIT}
   `);
   return { nodes: rows.rows as unknown as CodeNode[] };
@@ -67,10 +68,10 @@ export async function queryDependencies(
       SELECT e.target_id AS id, 1 AS depth
       FROM code_edge e
       JOIN code_node s ON e.source_id = s.id
+      JOIN unnest(${blobs}::text[]) AS b(sha) ON s.blob_sha = b.sha
       WHERE e.type IN ('CALLS', 'IMPORTS', 'USES_TYPE')
         AND e.repo_id = ${repoId}
         AND s.name = ${name} AND s.repo_id = ${repoId}
-        AND s.blob_sha = ANY(${blobs})
       UNION
       SELECT e.target_id, d.depth + 1
       FROM code_edge e JOIN deps d ON e.source_id = d.id
@@ -79,7 +80,7 @@ export async function queryDependencies(
     )
     SELECT DISTINCT n.*
     FROM code_node n JOIN deps d ON n.id = d.id
-    WHERE n.blob_sha = ANY(${blobs})
+    JOIN unnest(${blobs}::text[]) AS b(sha) ON n.blob_sha = b.sha
     LIMIT ${RESULT_LIMIT}
   `);
   return { nodes: rows.rows as unknown as CodeNode[] };
@@ -94,10 +95,10 @@ export async function queryDependents(
       SELECT e.source_id AS id, 1 AS depth
       FROM code_edge e
       JOIN code_node t ON e.target_id = t.id
+      JOIN unnest(${blobs}::text[]) AS b(sha) ON t.blob_sha = b.sha
       WHERE e.type IN ('CALLS', 'IMPORTS', 'USES_TYPE')
         AND e.repo_id = ${repoId}
         AND t.name = ${name} AND t.repo_id = ${repoId}
-        AND t.blob_sha = ANY(${blobs})
       UNION
       SELECT e.source_id, d.depth + 1
       FROM code_edge e JOIN deps d ON e.target_id = d.id
@@ -106,7 +107,7 @@ export async function queryDependents(
     )
     SELECT DISTINCT n.*
     FROM code_node n JOIN deps d ON n.id = d.id
-    WHERE n.blob_sha = ANY(${blobs})
+    JOIN unnest(${blobs}::text[]) AS b(sha) ON n.blob_sha = b.sha
     LIMIT ${RESULT_LIMIT}
   `);
   return { nodes: rows.rows as unknown as CodeNode[] };
@@ -123,8 +124,8 @@ export async function queryTypeHierarchy(
     WITH RECURSIVE hierarchy AS (
       SELECT n.id, 0 AS depth, ARRAY[n.id] AS path
       FROM code_node n
+      JOIN unnest(${blobs}::text[]) AS b(sha) ON n.blob_sha = b.sha
       WHERE n.name = ${name} AND n.repo_id = ${repoId}
-        AND n.blob_sha = ANY(${blobs})
       UNION
       SELECT
         CASE WHEN e.source_id = h.id THEN e.target_id ELSE e.source_id END,
@@ -138,7 +139,7 @@ export async function queryTypeHierarchy(
     )
     SELECT DISTINCT n.*
     FROM code_node n JOIN hierarchy h ON n.id = h.id
-    WHERE n.blob_sha = ANY(${blobs})
+    JOIN unnest(${blobs}::text[]) AS b(sha) ON n.blob_sha = b.sha
     LIMIT ${RESULT_LIMIT}
   `);
   return { nodes: rows.rows as unknown as CodeNode[] };
@@ -156,10 +157,10 @@ export async function queryImpactAnalysis(
       SELECT e.source_id AS id, e.source_id, e.target_id, e.type AS edge_type, 1 AS depth
       FROM code_edge e
       JOIN code_node t ON e.target_id = t.id
+      JOIN unnest(${blobs}::text[]) AS b(sha) ON t.blob_sha = b.sha
       WHERE e.type IN ('CALLS', 'IMPORTS', 'USES_TYPE', 'EXTENDS', 'IMPLEMENTS')
         AND e.repo_id = ${repoId}
         AND t.name = ${name} AND t.repo_id = ${repoId}
-        AND t.blob_sha = ANY(${blobs})
       UNION
       SELECT e.source_id, e.source_id, e.target_id, e.type, i.depth + 1
       FROM code_edge e JOIN impact i ON e.target_id = i.id
@@ -168,7 +169,7 @@ export async function queryImpactAnalysis(
     )
     SELECT DISTINCT n.*, i.source_id AS edge_source, i.target_id AS edge_target, i.edge_type
     FROM code_node n JOIN impact i ON n.id = i.id
-    WHERE n.blob_sha = ANY(${blobs})
+    JOIN unnest(${blobs}::text[]) AS b(sha) ON n.blob_sha = b.sha
     LIMIT ${RESULT_LIMIT}
   `);
 
@@ -200,8 +201,8 @@ export async function queryFileStructure(
   const rows = await db.execute(sql`
     SELECT n.*
     FROM code_node n
+    JOIN unnest(${blobs}::text[]) AS b(sha) ON n.blob_sha = b.sha
     WHERE n.file_path = ${filePath} AND n.repo_id = ${repoId}
-      AND n.blob_sha = ANY(${blobs})
     ORDER BY n.start_line ASC NULLS LAST
     LIMIT ${RESULT_LIMIT}
   `);
@@ -215,8 +216,8 @@ export async function querySymbolLookup(
   const rows = await db.execute(sql`
     SELECT n.*
     FROM code_node n
+    JOIN unnest(${blobs}::text[]) AS b(sha) ON n.blob_sha = b.sha
     WHERE n.name ILIKE ${name} AND n.repo_id = ${repoId}
-      AND n.blob_sha = ANY(${blobs})
     ORDER BY CASE WHEN n.name = ${name} THEN 0 ELSE 1 END, n.type ASC
     LIMIT 50
   `);
@@ -230,8 +231,8 @@ export async function queryCommunity(
   const rows = await db.execute(sql`
     SELECT n.*
     FROM code_node n
+    JOIN unnest(${blobs}::text[]) AS b(sha) ON n.blob_sha = b.sha
     WHERE n.community_id = ${communityId} AND n.repo_id = ${repoId}
-      AND n.blob_sha = ANY(${blobs})
     ORDER BY n.type ASC, n.name ASC
     LIMIT ${RESULT_LIMIT}
   `);
@@ -245,11 +246,12 @@ export async function queryTestsFor(
   const rows = await db.execute(sql`
     SELECT DISTINCT n.*
     FROM code_node n
+    JOIN unnest(${blobs}::text[]) AS b1(sha) ON n.blob_sha = b1.sha
     JOIN code_edge e ON e.source_id = n.id
     JOIN code_node t ON e.target_id = t.id
+    JOIN unnest(${blobs}::text[]) AS b2(sha) ON t.blob_sha = b2.sha
     WHERE e.type = 'TESTS' AND e.repo_id = ${repoId}
       AND t.name = ${targetName} AND t.repo_id = ${repoId}
-      AND n.blob_sha = ANY(${blobs}) AND t.blob_sha = ANY(${blobs})
     LIMIT ${RESULT_LIMIT}
   `);
   return { nodes: rows.rows as unknown as CodeNode[] };
@@ -265,11 +267,11 @@ export async function queryUnusedExports(
   const rows = await db.execute(sql`
     SELECT n.*
     FROM code_node n
+    JOIN unnest(${blobs}::text[]) AS b(sha) ON n.blob_sha = b.sha
     LEFT JOIN code_edge e ON e.target_id = n.id
       AND e.type IN ('IMPORTS', 'CALLS', 'USES_TYPE')
       AND e.repo_id = ${repoId}
     WHERE n.exported = true AND n.repo_id = ${repoId}
-      AND n.blob_sha = ANY(${blobs})
       AND e.id IS NULL
     ORDER BY n.file_path ASC, n.name ASC
     LIMIT ${RESULT_LIMIT}
@@ -289,7 +291,11 @@ export async function queryCircularDeps(
       SELECT e.source_id, e.target_id, ARRAY[e.source_id] AS path, false AS is_cycle
       FROM code_edge e
       WHERE e.type = 'IMPORTS' AND e.repo_id = ${repoId}
-        AND EXISTS (SELECT 1 FROM code_node cn WHERE cn.id = e.source_id AND cn.blob_sha = ANY(${blobs}))
+        AND EXISTS (
+          SELECT 1 FROM code_node cn
+          JOIN unnest(${blobs}::text[]) AS b(sha) ON cn.blob_sha = b.sha
+          WHERE cn.id = e.source_id
+        )
       UNION ALL
       SELECT cd.source_id, e.target_id, cd.path || e.source_id,
              e.target_id = ANY(cd.path)
@@ -301,9 +307,9 @@ export async function queryCircularDeps(
     )
     SELECT DISTINCT n.*
     FROM code_node n
+    JOIN unnest(${blobs}::text[]) AS b(sha) ON n.blob_sha = b.sha
     JOIN cycle_detect cd ON n.id = ANY(cd.path || cd.target_id)
     WHERE cd.is_cycle = true AND n.repo_id = ${repoId}
-      AND n.blob_sha = ANY(${blobs})
     LIMIT 50
   `);
   return { nodes: rows.rows as unknown as CodeNode[] };
@@ -316,8 +322,8 @@ export async function queryApiRoutes(
   const rows = await db.execute(sql`
     SELECT n.*
     FROM code_node n
+    JOIN unnest(${blobs}::text[]) AS b(sha) ON n.blob_sha = b.sha
     WHERE n.type = 'Route' AND n.repo_id = ${repoId}
-      AND n.blob_sha = ANY(${blobs})
     ORDER BY n.file_path ASC, n.start_line ASC
     LIMIT ${RESULT_LIMIT}
   `);
@@ -333,10 +339,10 @@ export async function queryDataFlow(
       SELECT e.source_id AS id, 1 AS depth
       FROM code_edge e
       JOIN code_node t ON e.target_id = t.id
+      JOIN unnest(${blobs}::text[]) AS b(sha) ON t.blob_sha = b.sha
       WHERE e.type IN ('READS', 'WRITES')
         AND e.repo_id = ${repoId}
         AND t.name = ${name} AND t.repo_id = ${repoId}
-        AND t.blob_sha = ANY(${blobs})
       UNION
       SELECT CASE WHEN e.type IN ('READS', 'WRITES') THEN e.source_id ELSE e.target_id END,
              f.depth + 1
@@ -346,7 +352,7 @@ export async function queryDataFlow(
     )
     SELECT DISTINCT n.*
     FROM code_node n JOIN flow f ON n.id = f.id
-    WHERE n.blob_sha = ANY(${blobs})
+    JOIN unnest(${blobs}::text[]) AS b(sha) ON n.blob_sha = b.sha
     LIMIT ${RESULT_LIMIT}
   `);
   return { nodes: rows.rows as unknown as CodeNode[] };
@@ -389,9 +395,6 @@ export async function deleteAllForRepo(db: Database, repoId: string): Promise<vo
   await db.execute(sql`DELETE FROM code_node WHERE repo_id = ${repoId}`);
 }
 
-/**
- * Resolve __unresolved edges by matching target names to actual node IDs.
- */
 export async function resolveUnresolvedEdges(db: Database, repoId: string): Promise<number> {
   const result = await db.execute(sql`
     UPDATE code_edge e
