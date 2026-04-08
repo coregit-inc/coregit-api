@@ -1,13 +1,9 @@
 /**
  * Graph query functions for code intelligence.
  *
- * All queries accept a Set<blobSha> for version-aware filtering —
- * only nodes whose blob_sha is in the current commit's tree are returned.
- *
- * Performance notes:
- *   - blobShas passed via unnest() CTE, not ANY(array), to avoid huge SQL strings
- *   - All recursive CTEs have LIMIT on final SELECT (DoS protection)
- *   - queryCircularDeps depth capped at 5, LIMIT 50
+ * All queries accept a Set<blobSha> for version-aware filtering.
+ * Uses ANY() for blob SHA filtering (same pattern as semantic search).
+ * All recursive CTEs have LIMIT on final SELECT (DoS protection).
  *
  * Uses Drizzle ORM + Neon serverless (HTTP).
  */
@@ -24,223 +20,155 @@ export interface GraphQueryResult {
   edges?: Array<{ source_id: string; target_id: string; type: string }>;
 }
 
-// ── Helpers ──
-
-/**
- * Build a CTE for blob SHA filtering via unnest (avoids massive ANY arrays).
- */
-function liveBlobsCte(blobShas: Set<string>) {
-  return sql`live_blobs AS (SELECT unnest(${[...blobShas]}::text[]) AS sha)`;
-}
-
 const RESULT_LIMIT = 200;
 
 // ── Query Functions ──
 
-/**
- * Who calls function X?
- */
 export async function queryCallers(
-  db: Database,
-  repoId: string,
-  targetName: string,
-  blobShas: Set<string>
+  db: Database, repoId: string, targetName: string, blobShas: Set<string>
 ): Promise<GraphQueryResult> {
+  const blobs = [...blobShas];
   const rows = await db.execute(sql`
-    WITH ${liveBlobsCte(blobShas)}
     SELECT DISTINCT n.*
     FROM code_node n
-    JOIN live_blobs lb1 ON n.blob_sha = lb1.sha
     JOIN code_edge e ON e.source_id = n.id
     JOIN code_node t ON e.target_id = t.id
-    JOIN live_blobs lb2 ON t.blob_sha = lb2.sha
-    WHERE e.type = 'CALLS'
-      AND e.repo_id = ${repoId}
-      AND t.name = ${targetName}
-      AND t.repo_id = ${repoId}
+    WHERE e.type = 'CALLS' AND e.repo_id = ${repoId}
+      AND t.name = ${targetName} AND t.repo_id = ${repoId}
+      AND n.blob_sha = ANY(${blobs}) AND t.blob_sha = ANY(${blobs})
     LIMIT ${RESULT_LIMIT}
   `);
   return { nodes: rows.rows as unknown as CodeNode[] };
 }
 
-/**
- * What does function X call?
- */
 export async function queryCallees(
-  db: Database,
-  repoId: string,
-  sourceName: string,
-  blobShas: Set<string>
+  db: Database, repoId: string, sourceName: string, blobShas: Set<string>
 ): Promise<GraphQueryResult> {
+  const blobs = [...blobShas];
   const rows = await db.execute(sql`
-    WITH ${liveBlobsCte(blobShas)}
     SELECT DISTINCT n.*
     FROM code_node n
-    JOIN live_blobs lb1 ON n.blob_sha = lb1.sha
     JOIN code_edge e ON e.target_id = n.id
     JOIN code_node s ON e.source_id = s.id
-    JOIN live_blobs lb2 ON s.blob_sha = lb2.sha
-    WHERE e.type = 'CALLS'
-      AND e.repo_id = ${repoId}
-      AND s.name = ${sourceName}
-      AND s.repo_id = ${repoId}
+    WHERE e.type = 'CALLS' AND e.repo_id = ${repoId}
+      AND s.name = ${sourceName} AND s.repo_id = ${repoId}
+      AND n.blob_sha = ANY(${blobs}) AND s.blob_sha = ANY(${blobs})
     LIMIT ${RESULT_LIMIT}
   `);
   return { nodes: rows.rows as unknown as CodeNode[] };
 }
 
-/**
- * What does X depend on? (multi-hop: CALLS, IMPORTS, USES_TYPE)
- */
 export async function queryDependencies(
-  db: Database,
-  repoId: string,
-  name: string,
-  blobShas: Set<string>,
-  maxDepth: number = 3
+  db: Database, repoId: string, name: string, blobShas: Set<string>, maxDepth: number = 3
 ): Promise<GraphQueryResult> {
+  const blobs = [...blobShas];
   const rows = await db.execute(sql`
-    WITH ${liveBlobsCte(blobShas)},
-    RECURSIVE deps AS (
+    WITH RECURSIVE deps AS (
       SELECT e.target_id AS id, 1 AS depth
       FROM code_edge e
       JOIN code_node s ON e.source_id = s.id
-      JOIN live_blobs lb ON s.blob_sha = lb.sha
       WHERE e.type IN ('CALLS', 'IMPORTS', 'USES_TYPE')
         AND e.repo_id = ${repoId}
-        AND s.name = ${name}
-        AND s.repo_id = ${repoId}
+        AND s.name = ${name} AND s.repo_id = ${repoId}
+        AND s.blob_sha = ANY(${blobs})
       UNION
       SELECT e.target_id, d.depth + 1
-      FROM code_edge e
-      JOIN deps d ON e.source_id = d.id
+      FROM code_edge e JOIN deps d ON e.source_id = d.id
       WHERE e.type IN ('CALLS', 'IMPORTS', 'USES_TYPE')
-        AND e.repo_id = ${repoId}
-        AND d.depth < ${maxDepth}
+        AND e.repo_id = ${repoId} AND d.depth < ${maxDepth}
     )
     SELECT DISTINCT n.*
-    FROM code_node n
-    JOIN deps d ON n.id = d.id
-    JOIN live_blobs lb ON n.blob_sha = lb.sha
+    FROM code_node n JOIN deps d ON n.id = d.id
+    WHERE n.blob_sha = ANY(${blobs})
     LIMIT ${RESULT_LIMIT}
   `);
   return { nodes: rows.rows as unknown as CodeNode[] };
 }
 
-/**
- * What depends on X? (reverse multi-hop)
- */
 export async function queryDependents(
-  db: Database,
-  repoId: string,
-  name: string,
-  blobShas: Set<string>,
-  maxDepth: number = 3
+  db: Database, repoId: string, name: string, blobShas: Set<string>, maxDepth: number = 3
 ): Promise<GraphQueryResult> {
+  const blobs = [...blobShas];
   const rows = await db.execute(sql`
-    WITH ${liveBlobsCte(blobShas)},
-    RECURSIVE deps AS (
+    WITH RECURSIVE deps AS (
       SELECT e.source_id AS id, 1 AS depth
       FROM code_edge e
       JOIN code_node t ON e.target_id = t.id
-      JOIN live_blobs lb ON t.blob_sha = lb.sha
       WHERE e.type IN ('CALLS', 'IMPORTS', 'USES_TYPE')
         AND e.repo_id = ${repoId}
-        AND t.name = ${name}
-        AND t.repo_id = ${repoId}
+        AND t.name = ${name} AND t.repo_id = ${repoId}
+        AND t.blob_sha = ANY(${blobs})
       UNION
       SELECT e.source_id, d.depth + 1
-      FROM code_edge e
-      JOIN deps d ON e.target_id = d.id
+      FROM code_edge e JOIN deps d ON e.target_id = d.id
       WHERE e.type IN ('CALLS', 'IMPORTS', 'USES_TYPE')
-        AND e.repo_id = ${repoId}
-        AND d.depth < ${maxDepth}
+        AND e.repo_id = ${repoId} AND d.depth < ${maxDepth}
     )
     SELECT DISTINCT n.*
-    FROM code_node n
-    JOIN deps d ON n.id = d.id
-    JOIN live_blobs lb ON n.blob_sha = lb.sha
+    FROM code_node n JOIN deps d ON n.id = d.id
+    WHERE n.blob_sha = ANY(${blobs})
     LIMIT ${RESULT_LIMIT}
   `);
   return { nodes: rows.rows as unknown as CodeNode[] };
 }
 
 /**
- * Type hierarchy: EXTENDS + IMPLEMENTS.
- * Uses path tracking to prevent infinite loops on circular inheritance.
+ * Type hierarchy with path tracking to prevent infinite loops.
  */
 export async function queryTypeHierarchy(
-  db: Database,
-  repoId: string,
-  name: string,
-  blobShas: Set<string>,
-  maxDepth: number = 3
+  db: Database, repoId: string, name: string, blobShas: Set<string>, maxDepth: number = 3
 ): Promise<GraphQueryResult> {
+  const blobs = [...blobShas];
   const rows = await db.execute(sql`
-    WITH ${liveBlobsCte(blobShas)},
-    RECURSIVE hierarchy AS (
+    WITH RECURSIVE hierarchy AS (
       SELECT n.id, 0 AS depth, ARRAY[n.id] AS path
       FROM code_node n
-      JOIN live_blobs lb ON n.blob_sha = lb.sha
-      WHERE n.name = ${name}
-        AND n.repo_id = ${repoId}
+      WHERE n.name = ${name} AND n.repo_id = ${repoId}
+        AND n.blob_sha = ANY(${blobs})
       UNION
-      SELECT CASE
-        WHEN e.source_id = h.id THEN e.target_id
-        ELSE e.source_id
-      END,
-      h.depth + 1,
-      h.path || CASE WHEN e.source_id = h.id THEN e.target_id ELSE e.source_id END
+      SELECT
+        CASE WHEN e.source_id = h.id THEN e.target_id ELSE e.source_id END,
+        h.depth + 1,
+        h.path || CASE WHEN e.source_id = h.id THEN e.target_id ELSE e.source_id END
       FROM code_edge e
       JOIN hierarchy h ON (e.source_id = h.id OR e.target_id = h.id)
       WHERE e.type IN ('EXTENDS', 'IMPLEMENTS')
-        AND e.repo_id = ${repoId}
-        AND h.depth < ${maxDepth}
+        AND e.repo_id = ${repoId} AND h.depth < ${maxDepth}
         AND NOT (CASE WHEN e.source_id = h.id THEN e.target_id ELSE e.source_id END) = ANY(h.path)
     )
     SELECT DISTINCT n.*
-    FROM code_node n
-    JOIN hierarchy h ON n.id = h.id
-    JOIN live_blobs lb ON n.blob_sha = lb.sha
+    FROM code_node n JOIN hierarchy h ON n.id = h.id
+    WHERE n.blob_sha = ANY(${blobs})
     LIMIT ${RESULT_LIMIT}
   `);
   return { nodes: rows.rows as unknown as CodeNode[] };
 }
 
 /**
- * Impact analysis: what breaks if X changes?
- * Returns both affected nodes and the edge chain.
+ * Impact analysis with edge chain for visualization.
  */
 export async function queryImpactAnalysis(
-  db: Database,
-  repoId: string,
-  name: string,
-  blobShas: Set<string>,
-  maxDepth: number = 3
+  db: Database, repoId: string, name: string, blobShas: Set<string>, maxDepth: number = 3
 ): Promise<GraphQueryResult> {
+  const blobs = [...blobShas];
   const rows = await db.execute(sql`
-    WITH ${liveBlobsCte(blobShas)},
-    RECURSIVE impact AS (
+    WITH RECURSIVE impact AS (
       SELECT e.source_id AS id, e.source_id, e.target_id, e.type AS edge_type, 1 AS depth
       FROM code_edge e
       JOIN code_node t ON e.target_id = t.id
-      JOIN live_blobs lb ON t.blob_sha = lb.sha
       WHERE e.type IN ('CALLS', 'IMPORTS', 'USES_TYPE', 'EXTENDS', 'IMPLEMENTS')
         AND e.repo_id = ${repoId}
-        AND t.name = ${name}
-        AND t.repo_id = ${repoId}
+        AND t.name = ${name} AND t.repo_id = ${repoId}
+        AND t.blob_sha = ANY(${blobs})
       UNION
       SELECT e.source_id, e.source_id, e.target_id, e.type, i.depth + 1
-      FROM code_edge e
-      JOIN impact i ON e.target_id = i.id
+      FROM code_edge e JOIN impact i ON e.target_id = i.id
       WHERE e.type IN ('CALLS', 'IMPORTS', 'USES_TYPE', 'EXTENDS', 'IMPLEMENTS')
-        AND e.repo_id = ${repoId}
-        AND i.depth < ${maxDepth}
+        AND e.repo_id = ${repoId} AND i.depth < ${maxDepth}
     )
     SELECT DISTINCT n.*, i.source_id AS edge_source, i.target_id AS edge_target, i.edge_type
-    FROM code_node n
-    JOIN impact i ON n.id = i.id
-    JOIN live_blobs lb ON n.blob_sha = lb.sha
+    FROM code_node n JOIN impact i ON n.id = i.id
+    WHERE n.blob_sha = ANY(${blobs})
     LIMIT ${RESULT_LIMIT}
   `);
 
@@ -265,118 +193,83 @@ export async function queryImpactAnalysis(
   return { nodes, edges };
 }
 
-/**
- * All entities in a file.
- */
 export async function queryFileStructure(
-  db: Database,
-  repoId: string,
-  filePath: string,
-  blobShas: Set<string>
+  db: Database, repoId: string, filePath: string, blobShas: Set<string>
 ): Promise<GraphQueryResult> {
+  const blobs = [...blobShas];
   const rows = await db.execute(sql`
-    WITH ${liveBlobsCte(blobShas)}
     SELECT n.*
     FROM code_node n
-    JOIN live_blobs lb ON n.blob_sha = lb.sha
-    WHERE n.file_path = ${filePath}
-      AND n.repo_id = ${repoId}
+    WHERE n.file_path = ${filePath} AND n.repo_id = ${repoId}
+      AND n.blob_sha = ANY(${blobs})
     ORDER BY n.start_line ASC NULLS LAST
     LIMIT ${RESULT_LIMIT}
   `);
   return { nodes: rows.rows as unknown as CodeNode[] };
 }
 
-/**
- * Symbol lookup by name (case-insensitive).
- */
 export async function querySymbolLookup(
-  db: Database,
-  repoId: string,
-  name: string,
-  blobShas: Set<string>
+  db: Database, repoId: string, name: string, blobShas: Set<string>
 ): Promise<GraphQueryResult> {
+  const blobs = [...blobShas];
   const rows = await db.execute(sql`
-    WITH ${liveBlobsCte(blobShas)}
     SELECT n.*
     FROM code_node n
-    JOIN live_blobs lb ON n.blob_sha = lb.sha
-    WHERE n.name ILIKE ${name}
-      AND n.repo_id = ${repoId}
-    ORDER BY
-      CASE WHEN n.name = ${name} THEN 0 ELSE 1 END,
-      n.type ASC
+    WHERE n.name ILIKE ${name} AND n.repo_id = ${repoId}
+      AND n.blob_sha = ANY(${blobs})
+    ORDER BY CASE WHEN n.name = ${name} THEN 0 ELSE 1 END, n.type ASC
     LIMIT 50
   `);
   return { nodes: rows.rows as unknown as CodeNode[] };
 }
 
-/**
- * All entities in a Louvain community cluster.
- */
 export async function queryCommunity(
-  db: Database,
-  repoId: string,
-  communityId: string,
-  blobShas: Set<string>
+  db: Database, repoId: string, communityId: string, blobShas: Set<string>
 ): Promise<GraphQueryResult> {
+  const blobs = [...blobShas];
   const rows = await db.execute(sql`
-    WITH ${liveBlobsCte(blobShas)}
     SELECT n.*
     FROM code_node n
-    JOIN live_blobs lb ON n.blob_sha = lb.sha
-    WHERE n.community_id = ${communityId}
-      AND n.repo_id = ${repoId}
+    WHERE n.community_id = ${communityId} AND n.repo_id = ${repoId}
+      AND n.blob_sha = ANY(${blobs})
     ORDER BY n.type ASC, n.name ASC
     LIMIT ${RESULT_LIMIT}
   `);
   return { nodes: rows.rows as unknown as CodeNode[] };
 }
 
-/**
- * Tests for a given function.
- */
 export async function queryTestsFor(
-  db: Database,
-  repoId: string,
-  targetName: string,
-  blobShas: Set<string>
+  db: Database, repoId: string, targetName: string, blobShas: Set<string>
 ): Promise<GraphQueryResult> {
+  const blobs = [...blobShas];
   const rows = await db.execute(sql`
-    WITH ${liveBlobsCte(blobShas)}
     SELECT DISTINCT n.*
     FROM code_node n
-    JOIN live_blobs lb1 ON n.blob_sha = lb1.sha
     JOIN code_edge e ON e.source_id = n.id
     JOIN code_node t ON e.target_id = t.id
-    JOIN live_blobs lb2 ON t.blob_sha = lb2.sha
-    WHERE e.type = 'TESTS'
-      AND e.repo_id = ${repoId}
-      AND t.name = ${targetName}
-      AND t.repo_id = ${repoId}
+    WHERE e.type = 'TESTS' AND e.repo_id = ${repoId}
+      AND t.name = ${targetName} AND t.repo_id = ${repoId}
+      AND n.blob_sha = ANY(${blobs}) AND t.blob_sha = ANY(${blobs})
     LIMIT ${RESULT_LIMIT}
   `);
   return { nodes: rows.rows as unknown as CodeNode[] };
 }
 
 /**
- * Exported symbols with no incoming references — dead code candidates.
+ * Dead code: exported symbols with no incoming references. Uses LEFT JOIN.
  */
 export async function queryUnusedExports(
-  db: Database,
-  repoId: string,
-  blobShas: Set<string>
+  db: Database, repoId: string, blobShas: Set<string>
 ): Promise<GraphQueryResult> {
+  const blobs = [...blobShas];
   const rows = await db.execute(sql`
-    WITH ${liveBlobsCte(blobShas)}
     SELECT n.*
     FROM code_node n
-    JOIN live_blobs lb ON n.blob_sha = lb.sha
     LEFT JOIN code_edge e ON e.target_id = n.id
       AND e.type IN ('IMPORTS', 'CALLS', 'USES_TYPE')
       AND e.repo_id = ${repoId}
-    WHERE n.exported = true
-      AND n.repo_id = ${repoId}
+    WHERE n.exported = true AND n.repo_id = ${repoId}
+      AND n.blob_sha = ANY(${blobs})
       AND e.id IS NULL
     ORDER BY n.file_path ASC, n.name ASC
     LIMIT ${RESULT_LIMIT}
@@ -385,102 +278,75 @@ export async function queryUnusedExports(
 }
 
 /**
- * Circular dependency detection on IMPORTS edges.
- * Depth capped at 5, result capped at 50.
+ * Circular deps on IMPORTS. Depth capped at 5, result capped at 50.
  */
 export async function queryCircularDeps(
-  db: Database,
-  repoId: string,
-  blobShas: Set<string>
+  db: Database, repoId: string, blobShas: Set<string>
 ): Promise<GraphQueryResult> {
+  const blobs = [...blobShas];
   const rows = await db.execute(sql`
-    WITH ${liveBlobsCte(blobShas)},
-    RECURSIVE cycle_detect AS (
+    WITH RECURSIVE cycle_detect AS (
       SELECT e.source_id, e.target_id, ARRAY[e.source_id] AS path, false AS is_cycle
       FROM code_edge e
-      JOIN live_blobs lb ON EXISTS (
-        SELECT 1 FROM code_node cn WHERE cn.id = e.source_id AND cn.blob_sha = lb.sha
-      )
-      WHERE e.type = 'IMPORTS'
-        AND e.repo_id = ${repoId}
+      WHERE e.type = 'IMPORTS' AND e.repo_id = ${repoId}
+        AND EXISTS (SELECT 1 FROM code_node cn WHERE cn.id = e.source_id AND cn.blob_sha = ANY(${blobs}))
       UNION ALL
       SELECT cd.source_id, e.target_id, cd.path || e.source_id,
              e.target_id = ANY(cd.path)
       FROM code_edge e
       JOIN cycle_detect cd ON e.source_id = cd.target_id
-      WHERE e.type = 'IMPORTS'
-        AND e.repo_id = ${repoId}
+      WHERE e.type = 'IMPORTS' AND e.repo_id = ${repoId}
         AND NOT e.target_id = ANY(cd.path)
         AND array_length(cd.path, 1) < 5
     )
     SELECT DISTINCT n.*
     FROM code_node n
-    JOIN live_blobs lb ON n.blob_sha = lb.sha
     JOIN cycle_detect cd ON n.id = ANY(cd.path || cd.target_id)
-    WHERE cd.is_cycle = true
-      AND n.repo_id = ${repoId}
+    WHERE cd.is_cycle = true AND n.repo_id = ${repoId}
+      AND n.blob_sha = ANY(${blobs})
     LIMIT 50
   `);
   return { nodes: rows.rows as unknown as CodeNode[] };
 }
 
-/**
- * All API route endpoints.
- */
 export async function queryApiRoutes(
-  db: Database,
-  repoId: string,
-  blobShas: Set<string>
+  db: Database, repoId: string, blobShas: Set<string>
 ): Promise<GraphQueryResult> {
+  const blobs = [...blobShas];
   const rows = await db.execute(sql`
-    WITH ${liveBlobsCte(blobShas)}
     SELECT n.*
     FROM code_node n
-    JOIN live_blobs lb ON n.blob_sha = lb.sha
-    WHERE n.type = 'Route'
-      AND n.repo_id = ${repoId}
+    WHERE n.type = 'Route' AND n.repo_id = ${repoId}
+      AND n.blob_sha = ANY(${blobs})
     ORDER BY n.file_path ASC, n.start_line ASC
     LIMIT ${RESULT_LIMIT}
   `);
   return { nodes: rows.rows as unknown as CodeNode[] };
 }
 
-/**
- * Data flow: READS/WRITES chain for a variable.
- */
 export async function queryDataFlow(
-  db: Database,
-  repoId: string,
-  name: string,
-  blobShas: Set<string>,
-  maxDepth: number = 3
+  db: Database, repoId: string, name: string, blobShas: Set<string>, maxDepth: number = 3
 ): Promise<GraphQueryResult> {
+  const blobs = [...blobShas];
   const rows = await db.execute(sql`
-    WITH ${liveBlobsCte(blobShas)},
-    RECURSIVE flow AS (
+    WITH RECURSIVE flow AS (
       SELECT e.source_id AS id, 1 AS depth
       FROM code_edge e
       JOIN code_node t ON e.target_id = t.id
-      JOIN live_blobs lb ON t.blob_sha = lb.sha
       WHERE e.type IN ('READS', 'WRITES')
         AND e.repo_id = ${repoId}
-        AND t.name = ${name}
-        AND t.repo_id = ${repoId}
+        AND t.name = ${name} AND t.repo_id = ${repoId}
+        AND t.blob_sha = ANY(${blobs})
       UNION
-      SELECT CASE
-        WHEN e.type IN ('READS', 'WRITES') THEN e.source_id
-        ELSE e.target_id
-      END, f.depth + 1
-      FROM code_edge e
-      JOIN flow f ON (e.source_id = f.id OR e.target_id = f.id)
+      SELECT CASE WHEN e.type IN ('READS', 'WRITES') THEN e.source_id ELSE e.target_id END,
+             f.depth + 1
+      FROM code_edge e JOIN flow f ON (e.source_id = f.id OR e.target_id = f.id)
       WHERE e.type IN ('READS', 'WRITES', 'CALLS')
-        AND e.repo_id = ${repoId}
-        AND f.depth < ${maxDepth}
+        AND e.repo_id = ${repoId} AND f.depth < ${maxDepth}
     )
     SELECT DISTINCT n.*
-    FROM code_node n
-    JOIN flow f ON n.id = f.id
-    JOIN live_blobs lb ON n.blob_sha = lb.sha
+    FROM code_node n JOIN flow f ON n.id = f.id
+    WHERE n.blob_sha = ANY(${blobs})
     LIMIT ${RESULT_LIMIT}
   `);
   return { nodes: rows.rows as unknown as CodeNode[] };
@@ -488,75 +354,45 @@ export async function queryDataFlow(
 
 // ── Indexing helpers ──
 
-/**
- * Check which blob SHAs already have nodes in the graph.
- */
 export async function nodesExistForBlob(
-  db: Database,
-  repoId: string,
-  blobShas: string[]
+  db: Database, repoId: string, blobShas: string[]
 ): Promise<Set<string>> {
   if (blobShas.length === 0) return new Set();
-
   const rows = await db.execute(sql`
-    SELECT DISTINCT blob_sha
-    FROM code_node
-    WHERE repo_id = ${repoId}
-      AND blob_sha = ANY(${blobShas})
+    SELECT DISTINCT blob_sha FROM code_node
+    WHERE repo_id = ${repoId} AND blob_sha = ANY(${blobShas})
   `);
-
   return new Set((rows.rows as any[]).map((r) => r.blob_sha));
 }
 
-/**
- * Delete all nodes and edges for given blob SHAs.
- */
 export async function deleteByBlobSha(
-  db: Database,
-  repoId: string,
-  blobShas: string[]
+  db: Database, repoId: string, blobShas: string[]
 ): Promise<void> {
   if (blobShas.length === 0) return;
-
   const nodeRows = await db.execute(sql`
-    SELECT id FROM code_node
-    WHERE repo_id = ${repoId} AND blob_sha = ANY(${blobShas})
+    SELECT id FROM code_node WHERE repo_id = ${repoId} AND blob_sha = ANY(${blobShas})
   `);
   const nodeIds = (nodeRows.rows as any[]).map((r) => r.id);
-
   if (nodeIds.length > 0) {
     await db.execute(sql`
-      DELETE FROM code_edge
-      WHERE repo_id = ${repoId}
+      DELETE FROM code_edge WHERE repo_id = ${repoId}
         AND (source_id = ANY(${nodeIds}) OR target_id = ANY(${nodeIds}))
     `);
     await db.execute(sql`
-      DELETE FROM code_node
-      WHERE repo_id = ${repoId} AND blob_sha = ANY(${blobShas})
+      DELETE FROM code_node WHERE repo_id = ${repoId} AND blob_sha = ANY(${blobShas})
     `);
   }
 }
 
-/**
- * Delete all graph data for a repo.
- */
-export async function deleteAllForRepo(
-  db: Database,
-  repoId: string
-): Promise<void> {
+export async function deleteAllForRepo(db: Database, repoId: string): Promise<void> {
   await db.execute(sql`DELETE FROM code_edge WHERE repo_id = ${repoId}`);
   await db.execute(sql`DELETE FROM code_node WHERE repo_id = ${repoId}`);
 }
 
 /**
  * Resolve __unresolved edges by matching target names to actual node IDs.
- * Called after batch indexing completes.
  */
-export async function resolveUnresolvedEdges(
-  db: Database,
-  repoId: string
-): Promise<number> {
-  // Update edges pointing to __unresolved:Type:Name → actual node ID
+export async function resolveUnresolvedEdges(db: Database, repoId: string): Promise<number> {
   const result = await db.execute(sql`
     UPDATE code_edge e
     SET target_id = n.id
