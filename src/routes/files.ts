@@ -76,6 +76,34 @@ export function isBinaryContent(content: Uint8Array): boolean {
   return false;
 }
 
+async function flattenTreeRecursive(
+  storage: GitR2Storage,
+  entries: TreeEntry[],
+  basePath: string,
+  out: { name: string; path: string; type: string; sha: string; mode: string }[],
+  limit: number,
+): Promise<void> {
+  for (const entry of entries) {
+    if (out.length >= limit) return;
+    const entryPath = basePath ? `${basePath}/${entry.name}` : entry.name;
+    if (entry.mode === "40000") {
+      // Directory — recurse into it
+      out.push({ name: entry.name, path: entryPath, type: "folder", sha: entry.sha, mode: entry.mode });
+      if (out.length >= limit) return;
+      const raw = await storage.getObject(entry.sha);
+      if (raw) {
+        const obj = parseGitObject(raw);
+        if (obj.type === "tree") {
+          const subEntries = parseTree(obj.content);
+          await flattenTreeRecursive(storage, subEntries, entryPath, out, limit);
+        }
+      }
+    } else {
+      out.push({ name: entry.name, path: entryPath, type: "file", sha: entry.sha, mode: entry.mode });
+    }
+  }
+}
+
 // GET /v1/repos/:slug/refs
 const listRefsHandler = async (c: any) => {
   const orgId = c.get("orgId");
@@ -175,6 +203,8 @@ const treeHandler = async (c: any) => {
   const pathStr = parts.slice(1).join("/");
   const pathParts = pathStr.split("/").filter(Boolean);
 
+  const recursive = c.req.query("recursive") === "true";
+
   try {
     const commitSha = await resolveRef(storage, ref);
     if (!commitSha) return c.json({ error: "Ref not found" }, 404);
@@ -185,20 +215,48 @@ const treeHandler = async (c: any) => {
     const treeResult = await navigateToPath(storage, rootTreeSha, pathParts);
     if (!treeResult) return c.json({ error: "Path not found" }, 404);
 
-    const items = treeResult.entries.map((entry) => ({
-      name: entry.name,
-      path: pathStr ? `${pathStr}/${entry.name}` : entry.name,
-      type: entry.mode === "40000" ? "folder" : "file",
-      sha: entry.sha,
-      mode: entry.mode,
-    }));
+    // ETag: tree SHA is content-addressed and immutable
+    const etag = `"${treeResult.sha}"`;
+    const ifNoneMatch = c.req.header("If-None-Match");
+    if (ifNoneMatch === etag) {
+      return new Response(null, { status: 304 });
+    }
+
+    // Determine Cache-Control: immutable for commit SHA refs, short cache for branch/tag
+    const isCommitSha = /^[0-9a-f]{40}$/i.test(ref);
+    const cacheControl = isCommitSha
+      ? "public, max-age=31536000, immutable"
+      : "public, max-age=60";
+
+    let items: { name: string; path: string; type: string; sha: string; mode: string }[];
+    let truncated = false;
+
+    if (recursive) {
+      const RECURSIVE_LIMIT = 10_000;
+      const flatItems: typeof items = [];
+      await flattenTreeRecursive(storage, treeResult.entries, pathStr, flatItems, RECURSIVE_LIMIT);
+      truncated = flatItems.length >= RECURSIVE_LIMIT;
+      items = flatItems;
+    } else {
+      items = treeResult.entries.map((entry) => ({
+        name: entry.name,
+        path: pathStr ? `${pathStr}/${entry.name}` : entry.name,
+        type: entry.mode === "40000" ? "folder" : "file",
+        sha: entry.sha,
+        mode: entry.mode,
+      }));
+    }
 
     items.sort((a, b) => {
       if (a.type !== b.type) return a.type === "folder" ? -1 : 1;
       return a.name.localeCompare(b.name);
     });
 
-    return c.json({ items, path: pathStr, ref, sha: treeResult.sha });
+    return c.json(
+      { items, path: pathStr, ref, sha: treeResult.sha, truncated },
+      200,
+      { "ETag": etag, "Cache-Control": cacheControl },
+    );
   } catch (error) {
     console.error("Failed to fetch tree:", error);
     return c.json({ error: "Failed to fetch tree" }, 500);
