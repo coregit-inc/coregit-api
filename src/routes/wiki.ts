@@ -18,12 +18,12 @@
 
 import { Hono } from "hono";
 import { nanoid } from "nanoid";
-import { eq, and, isNull } from "drizzle-orm";
+import { eq, and } from "drizzle-orm";
 import { apiKeyAuth } from "../auth/middleware";
 import { hasRepoAccess, isMasterKey } from "../auth/scopes";
 import { repo, organization, semanticIndex, codeGraphIndex } from "../db/schema";
 import { GitR2Storage } from "../git/storage";
-import { parseGitObject, parseTree, parseCommit, type TreeEntry } from "../git/objects";
+import { parseGitObject, parseTree, type TreeEntry } from "../git/objects";
 import { resolveRepo, buildGitUrl, buildApiUrl } from "../services/repo-resolver";
 import { copyGraphForFork } from "../services/fork-graph";
 import { recordUsage } from "../services/usage";
@@ -168,12 +168,19 @@ async function collectSources(
   commitSha: string,
 ): Promise<SourceInfo[]> {
   const files = await listFilesUnderPath(storage, commitSha, "raw");
-  const sources: SourceInfo[] = [];
+  const filtered = files.filter((f) => f.name !== ".gitkeep");
 
-  for (const f of files) {
-    if (f.name === ".gitkeep") continue;
-    const size = await getBlobSize(storage, f.sha);
-    sources.push({ path: f.path, size });
+  // Batch R2 reads with Promise.all (same pattern as collectPages)
+  const sources: SourceInfo[] = [];
+  for (let i = 0; i < filtered.length; i += 50) {
+    const batch = filtered.slice(i, i + 50);
+    const results = await Promise.all(
+      batch.map(async (f) => {
+        const size = await getBlobSize(storage, f.sha);
+        return { path: f.path, size } satisfies SourceInfo;
+      }),
+    );
+    sources.push(...results);
   }
 
   return sources;
@@ -407,9 +414,18 @@ const listPagesHandler = async (c: any) => {
   const commitSha = await resolveRef(resolved.storage, ref);
   if (!commitSha) return c.json({ error: `Ref not found: ${ref}` }, 404);
 
-  // Check KV cache
+  const typeFilter = c.req.query("type") || "";
+  const tagFilter = c.req.query("tag") || "";
+  const VALID_SORTS = ["updated", "created", "title"];
+  const sort = VALID_SORTS.includes(c.req.query("sort") || "") ? c.req.query("sort") : "updated";
+  const limit = Math.min(parseInt(c.req.query("limit") || "50", 10), 200);
+  const offset = parseInt(c.req.query("offset") || "0", 10);
+
+  // Check KV cache (key includes query params)
   const searchCache = c.env.SEARCH_CACHE as KVNamespace | undefined;
-  const cacheKey = searchCache ? `wiki-pages:${orgId}/${resolved.repo.id}:${commitSha}` : null;
+  const cacheKey = searchCache
+    ? `wiki-pages:${orgId}/${resolved.repo.id}:${commitSha}:${typeFilter}:${tagFilter}:${sort}:${limit}:${offset}`
+    : null;
   if (searchCache && cacheKey) {
     const cached = await searchCache.get(cacheKey, "json");
     if (cached) return c.json(cached);
@@ -419,17 +435,14 @@ const listPagesHandler = async (c: any) => {
 
   // Apply filters
   let filtered = pages;
-  const typeFilter = c.req.query("type");
   if (typeFilter) {
     filtered = filtered.filter((p) => p.frontmatter.type === typeFilter);
   }
-  const tagFilter = c.req.query("tag");
   if (tagFilter) {
     filtered = filtered.filter((p) => p.frontmatter.tags?.includes(tagFilter));
   }
 
   // Sort
-  const sort = c.req.query("sort") || "updated";
   filtered.sort((a, b) => {
     const aVal = String(a.frontmatter[sort as keyof typeof a.frontmatter] || "");
     const bVal = String(b.frontmatter[sort as keyof typeof b.frontmatter] || "");
@@ -437,8 +450,6 @@ const listPagesHandler = async (c: any) => {
   });
 
   // Pagination
-  const limit = Math.min(parseInt(c.req.query("limit") || "50", 10), 200);
-  const offset = parseInt(c.req.query("offset") || "0", 10);
   const paged = filtered.slice(offset, offset + limit);
 
   const response = {
@@ -494,6 +505,9 @@ const getPageHandler = async (c: any) => {
   const pagePath = decodeURIComponent(url.pathname.slice(url.pathname.indexOf(prefix) + prefix.length));
 
   if (!pagePath) return c.json({ error: "Page path is required" }, 400);
+  if (pagePath.includes("..") || pagePath.includes("//")) {
+    return c.json({ error: "Invalid path" }, 400);
+  }
 
   const fullPath = pagePath.startsWith("wiki/") ? pagePath : `wiki/${pagePath}`;
   const result = await readFileAtPath(resolved.storage, commitSha, fullPath);
@@ -567,6 +581,9 @@ const getSourceHandler = async (c: any) => {
   const sourcePath = decodeURIComponent(url.pathname.slice(url.pathname.indexOf(prefix) + prefix.length));
 
   if (!sourcePath) return c.json({ error: "Source path is required" }, 400);
+  if (sourcePath.includes("..") || sourcePath.includes("//")) {
+    return c.json({ error: "Invalid path" }, 400);
+  }
 
   const fullPath = sourcePath.startsWith("raw/") ? sourcePath : `raw/${sourcePath}`;
   const result = await readFileAtPath(resolved.storage, commitSha, fullPath);
@@ -663,8 +680,12 @@ const llmsTxtHandler = async (c: any) => {
   const commitSha = await resolveRef(resolved.storage, ref);
   if (!commitSha) return c.json({ error: `Ref not found: ${ref}` }, 404);
 
-  // Check cache
-  const format = (c.req.query("format") || "compact") as "compact" | "full";
+  // Validate format
+  const formatParam = c.req.query("format") || "compact";
+  if (formatParam !== "compact" && formatParam !== "full") {
+    return c.json({ error: "format must be compact or full" }, 400);
+  }
+  const format = formatParam as "compact" | "full";
   const searchCache = c.env.SEARCH_CACHE as KVNamespace | undefined;
   const cacheKey = searchCache ? `wiki-llms:${orgId}/${resolved.repo.id}:${commitSha}:${format}` : null;
   if (searchCache && cacheKey) {
@@ -707,6 +728,16 @@ const llmsTxtHandler = async (c: any) => {
 };
 
 // ── POST /:slug/wiki/search ──
+//
+// Delegates to the existing semantic search pipeline by importing its
+// dependencies directly — no loopback fetch, no double auth.
+
+import { embedCode, rerankCode } from "../services/voyage";
+import { queryVectors, type QueryMatch } from "../services/pinecone";
+import { resolveRef as resolveRefFromTree, getTreeBlobShas, hashCacheKey } from "../services/tree-resolver";
+
+const WIKI_SEARCH_OVER_FETCH = 100;
+const WIKI_RERANK_CANDIDATES = 20;
 
 const searchHandler = async (c: any) => {
   const orgId = c.get("orgId");
@@ -735,66 +766,134 @@ const searchHandler = async (c: any) => {
   if (!body.q || typeof body.q !== "string") {
     return c.json({ error: "q (query) is required" }, 400);
   }
+  if (body.q.length > 1000) {
+    return c.json({ error: "Query too long (max 1000 chars)" }, 400);
+  }
 
-  // Determine path_pattern based on scope
   const scope = body.scope || "all";
-  let pathPattern: string | undefined;
-  if (scope === "wiki") pathPattern = "wiki/**/*.md";
-  else if (scope === "sources") pathPattern = "raw/**/*";
+  const topK = Math.min(body.top_k ?? 10, 50);
+  const ref = c.req.query("ref") || resolved.repo.defaultBranch;
 
-  // Delegate to existing semantic search by making internal request
-  // We build the internal fetch to reuse the full pipeline
-  const searchUrl = new URL(c.req.url);
-  const repoPath = namespace ? `${namespace}/${slug}` : slug;
-  searchUrl.pathname = `/v1/repos/${repoPath}/semantic-search`;
+  const commitSha = await resolveRefFromTree(resolved.storage, ref);
+  if (!commitSha) return c.json({ error: `Ref not found: ${ref}` }, 404);
 
-  const searchBody = {
-    q: body.q,
-    ref: c.req.query("ref") || resolved.repo.defaultBranch,
-    path_pattern: pathPattern,
-    top_k: body.top_k || 10,
-    expand_context: true,
-  };
+  // Scope → path prefix filter
+  const scopePrefix = scope === "wiki" ? "wiki/" : scope === "sources" ? "raw/" : null;
 
-  // Forward to semantic search handler via internal fetch
-  const internalReq = new Request(searchUrl.toString(), {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "x-api-key": c.req.header("x-api-key") || "",
-      "x-internal-token": c.env.INTERNAL_TOKEN || "",
-    },
-    body: JSON.stringify(searchBody),
+  // Parallel: embed query + get tree blob SHAs
+  const [queryVector, treeBlobMap] = await Promise.all([
+    embedCode([body.q], "query", c.env.VOYAGE_API_KEY!),
+    getTreeBlobShas(resolved.storage, commitSha, c.env.TREE_CACHE),
+  ]);
+
+  if (treeBlobMap.size === 0) {
+    return c.json({ results: [], query: body.q, scope, ref });
+  }
+
+  // Query Pinecone
+  const pineconeNs = `${orgId}/${resolved.repo.id}`;
+  const parentNs = resolved.repo.forkedFromRepoId && resolved.repo.forkedFromOrgId
+    ? `${resolved.repo.forkedFromOrgId}/${resolved.repo.forkedFromRepoId}`
+    : null;
+
+  const [forkMatches, parentMatches] = await Promise.all([
+    queryVectors(c.env.PINECONE_INDEX_HOST!, c.env.PINECONE_API_KEY!, pineconeNs, queryVector[0], WIKI_SEARCH_OVER_FETCH),
+    parentNs
+      ? queryVectors(c.env.PINECONE_INDEX_HOST!, c.env.PINECONE_API_KEY!, parentNs, queryVector[0], WIKI_SEARCH_OVER_FETCH).catch(() => [] as QueryMatch[])
+      : Promise.resolve([] as QueryMatch[]),
+  ]);
+
+  // Merge + dedup
+  const seenIds = new Set<string>();
+  const matches: QueryMatch[] = [];
+  for (const m of forkMatches) { seenIds.add(m.id); matches.push(m); }
+  for (const m of parentMatches) { if (!seenIds.has(m.id)) matches.push(m); }
+
+  // Post-filter by tree + scope
+  let filtered = matches.filter((m) => treeBlobMap.has(m.metadata.blob_sha));
+  if (scopePrefix) {
+    filtered = filtered.filter((m) => {
+      const filePath = treeBlobMap.get(m.metadata.blob_sha) || m.metadata.file_path;
+      return filePath.startsWith(scopePrefix);
+    });
+  }
+
+  if (filtered.length === 0) {
+    return c.json({ results: [], query: body.q, scope, ref });
+  }
+
+  const candidates = filtered.slice(0, WIKI_RERANK_CANDIDATES);
+
+  // Fetch blobs in parallel
+  const uniqueBlobs = [...new Set(candidates.map((m) => m.metadata.blob_sha))];
+  const blobEntries = await Promise.all(
+    uniqueBlobs.map(async (sha) => {
+      const data = await resolved.storage.getObject(sha);
+      return [sha, data] as const;
+    }),
+  );
+  const blobMap = new Map<string, Uint8Array>();
+  for (const [sha, data] of blobEntries) {
+    if (data) blobMap.set(sha, data);
+  }
+
+  // Extract snippets + collect frontmatter for wiki pages
+  const matchTexts: string[] = [];
+  const validMatches: Array<QueryMatch & { resolvedPath: string; frontmatterData?: Record<string, unknown> }> = [];
+
+  for (const match of candidates) {
+    const blobRaw = blobMap.get(match.metadata.blob_sha);
+    if (!blobRaw) continue;
+
+    const blobObj = parseGitObject(blobRaw);
+    if (blobObj.type !== "blob") continue;
+
+    const fullText = new TextDecoder().decode(blobObj.content);
+    const lines = fullText.split("\n");
+    const start = Math.max(0, match.metadata.start_line - 1);
+    const end = Math.min(lines.length, match.metadata.end_line);
+    const snippet = lines.slice(start, end).join("\n");
+
+    matchTexts.push(snippet);
+    const resolvedPath = treeBlobMap.get(match.metadata.blob_sha) || match.metadata.file_path;
+
+    // Parse frontmatter for wiki pages (already have the blob content — no extra R2 read)
+    let frontmatterData: Record<string, unknown> | undefined;
+    if (resolvedPath.startsWith("wiki/") && resolvedPath.endsWith(".md")) {
+      const parsed = parseFrontmatter(fullText);
+      frontmatterData = parsed.frontmatter as Record<string, unknown>;
+    }
+
+    validMatches.push({ ...match, resolvedPath, frontmatterData });
+  }
+
+  if (validMatches.length === 0) {
+    return c.json({ results: [], query: body.q, scope, ref });
+  }
+
+  // Rerank
+  const reranked = await rerankCode(body.q, matchTexts, Math.min(topK, matchTexts.length), c.env.VOYAGE_API_KEY!);
+
+  const results = reranked.map((r) => {
+    const match = validMatches[r.index];
+    return {
+      file_path: match.resolvedPath,
+      score: r.score,
+      snippet: matchTexts[r.index],
+      start_line: match.metadata.start_line,
+      end_line: match.metadata.end_line,
+      language: match.metadata.language,
+      ...(match.frontmatterData ? { frontmatter: match.frontmatterData } : {}),
+    };
   });
 
-  const app = c.env.__app;
-  if (app) {
-    // If we have access to the app instance, call it directly
-    return app.fetch(internalReq, c.env, c.executionCtx);
-  }
+  recordUsage(
+    c.executionCtx, db, orgId, "semantic_search_query", 1,
+    { repo_id: resolved.repo.id, wiki: true, scope },
+    c.env.DODO_PAYMENTS_API_KEY, c.get("dodoCustomerId"),
+  );
 
-  // Fallback: just proxy the semantic search via fetch
-  const resp = await fetch(internalReq);
-  const result = await resp.json();
-
-  // Enrich results with frontmatter for wiki pages
-  if (result.results) {
-    const ref = searchBody.ref;
-    const commitSha = await resolveRef(resolved.storage, ref);
-    if (commitSha) {
-      for (const r of result.results as any[]) {
-        if (r.file_path?.startsWith("wiki/") && r.file_path.endsWith(".md")) {
-          const fileResult = await readFileAtPath(resolved.storage, commitSha, r.file_path);
-          if (fileResult) {
-            const parsed = parseFrontmatter(fileResult.content);
-            r.frontmatter = parsed.frontmatter;
-          }
-        }
-      }
-    }
-  }
-
-  return c.json({ ...result, scope });
+  return c.json({ results, query: body.q, scope, ref });
 };
 
 // ── GET /:slug/wiki/graph ──

@@ -289,11 +289,12 @@ export interface KnowledgeGraph {
   };
 }
 
+const SHARED_TAG_MAX_PAGES = 20; // cap shared-tag edges to avoid O(n^2) explosion
+
 export function buildKnowledgeGraph(pages: PageSummary[], sources: SourceInfo[]): KnowledgeGraph {
   const nodes: GraphNode[] = [];
   const edges: GraphEdge[] = [];
   const tagMap = new Map<string, string[]>();          // tag → paths
-  const linkedPaths = new Set<string>();               // paths that have at least one inbound link
 
   // Wiki page nodes
   for (const page of pages) {
@@ -314,16 +315,12 @@ export function buildKnowledgeGraph(pages: PageSummary[], sources: SourceInfo[])
     // Explicit "related" edges
     for (const rel of (page.frontmatter.related || [])) {
       edges.push({ source: page.path, target: rel, type: "related" });
-      linkedPaths.add(rel);
     }
 
     // "sources" reference edges
     for (const src of (page.frontmatter.sources || [])) {
       edges.push({ source: page.path, target: src, type: "source-ref" });
-      linkedPaths.add(src);
     }
-
-    linkedPaths.add(page.path); // pages with outbound links are not orphans
   }
 
   // Source nodes
@@ -337,8 +334,9 @@ export function buildKnowledgeGraph(pages: PageSummary[], sources: SourceInfo[])
     });
   }
 
-  // Shared-tag edges (between wiki pages that share tags)
+  // Shared-tag edges — only for tags with <= SHARED_TAG_MAX_PAGES pages to avoid explosion
   for (const [tag, paths] of tagMap) {
+    if (paths.length > SHARED_TAG_MAX_PAGES) continue;
     for (let i = 0; i < paths.length; i++) {
       for (let j = i + 1; j < paths.length; j++) {
         edges.push({ source: paths[i], target: paths[j], type: "shared-tag", tag });
