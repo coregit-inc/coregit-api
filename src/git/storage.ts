@@ -379,6 +379,52 @@ export class GitR2Storage {
     return obj !== null;
   }
 
+  // ============ Copy Operations ============
+
+  /**
+   * Copy all R2 objects, refs, and HEAD from one repo path to another.
+   * Used for forking templates.
+   */
+  static async copyRepo(
+    bucket: R2Bucket,
+    sourceBasePath: string,
+    targetBasePath: string
+  ): Promise<{ count: number }> {
+    const prefix = `${sourceBasePath}/`;
+    const allKeys: string[] = [];
+    let cursor: string | undefined;
+
+    // 1. List all keys under source
+    do {
+      const listed = await bucket.list({ prefix, cursor });
+      for (const obj of listed.objects) {
+        allKeys.push(obj.key);
+      }
+      cursor = listed.truncated ? listed.cursor : undefined;
+    } while (cursor);
+
+    // 2. Copy in parallel batches of 20
+    const BATCH_SIZE = 20;
+    let copied = 0;
+
+    for (let i = 0; i < allKeys.length; i += BATCH_SIZE) {
+      const batch = allKeys.slice(i, i + BATCH_SIZE);
+      await Promise.all(
+        batch.map(async (key) => {
+          const obj = await bucket.get(key);
+          if (!obj) return;
+          const targetKey = `${targetBasePath}/${key.slice(prefix.length)}`;
+          await bucket.put(targetKey, await obj.arrayBuffer(), {
+            httpMetadata: obj.httpMetadata,
+          });
+          copied++;
+        })
+      );
+    }
+
+    return { count: copied };
+  }
+
   // ============ Private Helpers ============
 
   private objectKey(sha: string): string {

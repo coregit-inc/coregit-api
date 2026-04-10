@@ -185,20 +185,29 @@ const semanticSearchHandler = async (c: any) => {
   }
 
   // 4. Query Pinecone (over-fetch to compensate for post-filtering)
-  const pineconeNs = `${orgId}/${resolved.repo.id}`;
+  // For forks: query both fork namespace AND parent namespace, merge results
+  const forkNs = `${orgId}/${resolved.repo.id}`;
+  const parentNs = resolved.repo.forkedFromRepoId && resolved.repo.forkedFromOrgId
+    ? `${resolved.repo.forkedFromOrgId}/${resolved.repo.forkedFromRepoId}`
+    : null;
+
   let filter: Record<string, unknown> | undefined;
   if (body.language) {
     filter = { language: { $eq: body.language } };
   }
 
-  const matches = await queryVectors(
-    c.env.PINECONE_INDEX_HOST!,
-    c.env.PINECONE_API_KEY!,
-    pineconeNs,
-    queryVector,
-    PINECONE_OVER_FETCH,
-    filter
-  );
+  const [forkMatches, parentMatches] = await Promise.all([
+    queryVectors(c.env.PINECONE_INDEX_HOST!, c.env.PINECONE_API_KEY!, forkNs, queryVector, PINECONE_OVER_FETCH, filter),
+    parentNs
+      ? queryVectors(c.env.PINECONE_INDEX_HOST!, c.env.PINECONE_API_KEY!, parentNs, queryVector, PINECONE_OVER_FETCH, filter).catch(() => [] as QueryMatch[])
+      : Promise.resolve([] as QueryMatch[]),
+  ]);
+
+  // Merge: fork results take priority, dedup by vector ID
+  const seenIds = new Set<string>();
+  const matches: QueryMatch[] = [];
+  for (const m of forkMatches) { seenIds.add(m.id); matches.push(m); }
+  for (const m of parentMatches) { if (!seenIds.has(m.id)) matches.push(m); }
 
   if (matches.length === 0) {
     return c.json({ results: [], query: body.q, repo_slug: slug, ref });

@@ -20,7 +20,8 @@ export type AuditAction =
   | "token.revoke"
   | "webhook.create"
   | "webhook.update"
-  | "webhook.delete";
+  | "webhook.delete"
+  | "repo.fork";
 
 export function recordAudit(
   ctx: ExecutionContext,

@@ -50,13 +50,13 @@ export interface GraphFullReindexMessage {
 
 export type GraphIndexingMessage = GraphIndexFileMessage | GraphFullReindexMessage;
 
-// Content-addressed node ID
-function nodeId(blobSha: string, entityType: string, entityName: string): string {
-  return `${blobSha}:${entityType}:${entityName}`;
+// Content-addressed node ID (repo-scoped to avoid PK collisions across repos)
+export function nodeId(repoId: string, blobSha: string, entityType: string, entityName: string): string {
+  return `${repoId}:${blobSha}:${entityType}:${entityName}`;
 }
 
-// Content-addressed edge ID
-function edgeId(sourceId: string, targetId: string, type: string): string {
+// Content-addressed edge ID (repo-scoped)
+export function edgeId(sourceId: string, targetId: string, type: string): string {
   return `${sourceId}->${type}->${targetId}`;
 }
 
@@ -156,7 +156,7 @@ export async function processGraphIndexFileMessage(
 
     // Build nodes
     for (const entity of parsed.entities) {
-      const id = nodeId(blobSha, entity.type, entity.name);
+      const id = nodeId(repoId, blobSha, entity.type, entity.name);
       allNodes.push({
         id,
         type: entity.type,
@@ -178,7 +178,7 @@ export async function processGraphIndexFileMessage(
         // Try to find target in same file first
         const target = parsed.entities.find((e) => e.name === callName && e.type === "Function");
         if (target) {
-          const targetNodeId = nodeId(blobSha, target.type, target.name);
+          const targetNodeId = nodeId(repoId, blobSha, target.type, target.name);
           allEdges.push({
             id: edgeId(id, targetNodeId, "CALLS"),
             sourceId: id,
@@ -219,7 +219,7 @@ export async function processGraphIndexFileMessage(
     }
 
     // IMPORTS edges (file-level)
-    const fileNodeId = nodeId(blobSha, "File", path);
+    const fileNodeId = nodeId(repoId, blobSha, "File", path);
     allNodes.push({
       id: fileNodeId,
       type: "File",
@@ -238,7 +238,7 @@ export async function processGraphIndexFileMessage(
 
     // CONTAINS edges (file → entity)
     for (const entity of parsed.entities) {
-      const entityId = nodeId(blobSha, entity.type, entity.name);
+      const entityId = nodeId(repoId, blobSha, entity.type, entity.name);
       allEdges.push({
         id: edgeId(fileNodeId, entityId, "CONTAINS"),
         sourceId: fileNodeId,

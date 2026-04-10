@@ -29,6 +29,10 @@ export const repo = pgTable(
     defaultBranch: text("default_branch").notNull().default("main"),
     visibility: text("visibility").notNull().default("private"), // "public" | "private"
     autoIndex: boolean("auto_index").default(false),
+    isTemplate: boolean("is_template").default(false),
+    forkedFromRepoId: text("forked_from_repo_id"),
+    forkedFromOrgId: text("forked_from_org_id"),
+    forkedAt: timestamp("forked_at"),
     createdAt: timestamp("created_at").defaultNow().notNull(),
     updatedAt: timestamp("updated_at")
       .defaultNow()
@@ -38,6 +42,7 @@ export const repo = pgTable(
   (table) => [
     index("repo_org_idx").on(table.orgId),
     index("repo_namespace_idx").on(table.orgId, table.namespace),
+    index("repo_template_idx").on(table.orgId, table.isTemplate),
     // Uniqueness enforced via partial indexes in migration SQL:
     //   (org_id, slug) WHERE namespace IS NULL
     //   (org_id, namespace, slug) WHERE namespace IS NOT NULL
@@ -341,7 +346,7 @@ export type SemanticIndex = typeof semanticIndex.$inferSelect;
 export const codeNode = pgTable(
   "code_node",
   {
-    id: text("id").primaryKey(),                    // {blobSha}:{type}:{name}
+    id: text("id").primaryKey(),                    // {repoId}:{blobSha}:{type}:{name}
     type: text("type").notNull(),                   // Function, Class, Interface, Enum, Type, Variable, Module, Decorator, Test, Route, Comment, File
     name: text("name").notNull(),
     filePath: text("file_path").notNull(),

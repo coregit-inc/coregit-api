@@ -224,14 +224,28 @@ const hybridSearchHandler = async (c: any) => {
   const blobShasSet = new Set(treeBlobMap.keys());
 
   // Semantic retrieval (only if weight > 0 and configured)
+  // For forks: query both fork namespace AND parent namespace
+  const forkNs = `${orgId}/${resolved.repo.id}`;
+  const parentNs = resolved.repo.forkedFromRepoId && resolved.repo.forkedFromOrgId
+    ? `${resolved.repo.forkedFromOrgId}/${resolved.repo.forkedFromRepoId}`
+    : null;
+
   const semanticPromise = weights.semantic > 0 && c.env.PINECONE_API_KEY && c.env.VOYAGE_API_KEY && c.env.PINECONE_INDEX_HOST
     ? (async () => {
         const embedResult = await embedCode([body.q], "query", c.env.VOYAGE_API_KEY!);
         const queryVector = embedResult[0];
-        const matches = await queryVectors(
-          c.env.PINECONE_INDEX_HOST!, c.env.PINECONE_API_KEY!,
-          `${orgId}/${resolved.repo.id}`, queryVector, 50
-        );
+        const [forkMatches, parentMatches] = await Promise.all([
+          queryVectors(c.env.PINECONE_INDEX_HOST!, c.env.PINECONE_API_KEY!, forkNs, queryVector, 50),
+          parentNs
+            ? queryVectors(c.env.PINECONE_INDEX_HOST!, c.env.PINECONE_API_KEY!, parentNs, queryVector, 50).catch(() => [])
+            : Promise.resolve([]),
+        ]);
+        // Merge: fork results take priority, dedup by ID
+        const seenIds = new Set<string>();
+        const matches: typeof forkMatches = [];
+        for (const m of forkMatches) { seenIds.add(m.id); matches.push(m); }
+        for (const m of parentMatches) { if (!seenIds.has(m.id)) matches.push(m); }
+
         return matches
           .filter((m) => blobShasSet.has(m.metadata.blob_sha))
           .slice(0, 20)

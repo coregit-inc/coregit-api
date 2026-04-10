@@ -48,6 +48,7 @@ repos.post("/", apiKeyAuth, async (c) => {
     default_branch?: string;
     visibility?: string;
     init?: boolean;
+    is_template?: boolean;
   };
   try {
     body = await c.req.json();
@@ -55,7 +56,7 @@ repos.post("/", apiKeyAuth, async (c) => {
     return c.json({ error: "Invalid JSON body" }, 400);
   }
 
-  const { slug, namespace, description, default_branch = "main", visibility = "private", init = true } = body;
+  const { slug, namespace, description, default_branch = "main", visibility = "private", init = true, is_template = false } = body;
 
   if (!slug || typeof slug !== "string") {
     return c.json({ error: "slug is required" }, 400);
@@ -107,6 +108,7 @@ repos.post("/", apiKeyAuth, async (c) => {
         description: description || null,
         defaultBranch: default_branch,
         visibility,
+        isTemplate: is_template,
       })
       .returning();
 
@@ -159,6 +161,7 @@ repos.post("/", apiKeyAuth, async (c) => {
         description: newRepo.description,
         default_branch: newRepo.defaultBranch,
         visibility: newRepo.visibility,
+        is_template: newRepo.isTemplate,
         git_url: buildGitUrl(orgSlug, slug, ns, c.get("customDomain")),
         api_url: buildApiUrl(slug, ns),
         created_at: newRepo.createdAt,
@@ -205,6 +208,10 @@ repos.get("/", apiKeyAuth, async (c) => {
     let conditions: ReturnType<typeof eq> | ReturnType<typeof and> = eq(repo.orgId, orgId);
     if (nsFilter) {
       conditions = and(conditions, eq(repo.namespace, nsFilter))!;
+    }
+    const templateFilter = c.req.query("is_template");
+    if (templateFilter === "true") {
+      conditions = and(conditions, eq(repo.isTemplate, true))!;
     }
 
     // Scoped tokens: push scope filter to SQL for correct pagination
@@ -259,6 +266,8 @@ repos.get("/", apiKeyAuth, async (c) => {
         description: r.description,
         default_branch: r.defaultBranch,
         visibility: r.visibility,
+        is_template: r.isTemplate,
+        forked_from: r.forkedFromRepoId ? { repo_id: r.forkedFromRepoId, org_id: r.forkedFromOrgId } : null,
         created_at: r.createdAt,
         updated_at: r.updatedAt,
       })),
@@ -321,6 +330,10 @@ const getRepoHandler = async (c: any) => {
       description: found.description,
       default_branch: found.defaultBranch,
       visibility: found.visibility,
+      is_template: found.isTemplate,
+      forked_from: found.forkedFromRepoId
+        ? { repo_id: found.forkedFromRepoId, org_id: found.forkedFromOrgId }
+        : null,
       is_empty: isEmpty,
       git_url: buildGitUrl(orgSlug, found.slug, found.namespace, c.get("customDomain")),
       api_url: buildApiUrl(found.slug, found.namespace),
@@ -345,7 +358,7 @@ const patchRepoHandler = async (c: any) => {
   const bucket = c.env.REPOS_BUCKET;
   const { slug, namespace } = extractRepoParams(c);
 
-  let body: { description?: string; visibility?: string; default_branch?: string };
+  let body: { description?: string; visibility?: string; default_branch?: string; is_template?: boolean };
   try {
     body = await c.req.json();
   } catch {
@@ -364,6 +377,9 @@ const patchRepoHandler = async (c: any) => {
         return c.json({ error: "visibility must be 'public' or 'private'" }, 400);
       }
       updates.visibility = body.visibility;
+    }
+    if (body.is_template !== undefined) {
+      updates.isTemplate = body.is_template;
     }
     if (body.default_branch !== undefined) {
       const branchSha = await resolved.storage.getRef(`refs/heads/${body.default_branch}`);
@@ -397,6 +413,7 @@ const patchRepoHandler = async (c: any) => {
       description: updated.description,
       default_branch: updated.defaultBranch,
       visibility: updated.visibility,
+      is_template: updated.isTemplate,
       updated_at: updated.updatedAt,
     });
   } catch (error) {

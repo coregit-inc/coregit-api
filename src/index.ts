@@ -59,6 +59,7 @@ import { semanticSearch } from "./routes/semantic-search";
 import { semanticIndexRoutes } from "./routes/semantic-index";
 import { graphRoutes } from "./routes/graph";
 import { hybridSearchRoutes } from "./routes/hybrid-search";
+import { forks } from "./routes/forks";
 import {
   processIndexFileMessage,
   processFullReindex,
@@ -278,6 +279,7 @@ app.route("/v1/repos", semanticSearch);
 app.route("/v1/repos", graphRoutes);
 app.route("/v1/repos", hybridSearchRoutes);
 app.route("/v1/repos", semanticIndexRoutes);
+app.route("/v1/repos", forks);
 app.route("/v1/repos", repos);
 app.route("/v1", connections);
 app.route("/v1", tokens);
