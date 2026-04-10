@@ -34,6 +34,7 @@ export const repo = pgTable(
     forkedFromOrgId: text("forked_from_org_id"),
     forkedAt: timestamp("forked_at"),
     createdAt: timestamp("created_at").defaultNow().notNull(),
+    wikiConfig: jsonb("wiki_config"),               // null = regular repo, non-null = LLM Wiki
     updatedAt: timestamp("updated_at")
       .defaultNow()
       .$onUpdate(() => new Date())
