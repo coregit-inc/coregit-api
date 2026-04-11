@@ -184,7 +184,15 @@ app.use(
     },
     allowHeaders: ["Content-Type", "Authorization", "x-api-key"],
     allowMethods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    exposeHeaders: ["X-Request-Id"],
+    exposeHeaders: [
+      "X-Request-Id",
+      "X-RateLimit-Limit",
+      "X-RateLimit-Remaining",
+      "X-RateLimit-Reset",
+      "X-Org-RateLimit-Limit",
+      "X-Org-RateLimit-Remaining",
+      "Retry-After",
+    ],
     maxAge: 86400,
   })
 );

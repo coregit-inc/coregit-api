@@ -29,6 +29,14 @@ import { parseCommit, parseGitObject } from "../git/objects";
 import { recordUsage } from "../services/usage";
 import { getDodoCustomerId } from "../services/dodo";
 import { isValidSha, isValidRefPath } from "../git/validation";
+import {
+  checkRateLimit,
+  rateLimitHeaders,
+  checkOrgRateLimit,
+  orgRateLimitHeaders,
+  checkIpRateLimit,
+  ipRateLimitHeaders,
+} from "../services/rate-limit";
 import type { Env, Variables } from "../types";
 
 const encoder = new TextEncoder();
@@ -51,6 +59,8 @@ interface CDGitAuth {
   repoSlug: string;
   storage: GitR2Storage;
   defaultBranch: string;
+  /** Token ID for rate limiting (null for unauthenticated public access) */
+  tokenId: string | null;
 }
 
 /**
@@ -85,7 +95,7 @@ async function authenticateCDGit(c: any, requireAuth: boolean): Promise<CDGitAut
     if (!hasRepoAccess(authResult.scopes, resolved.scopeKey, requiredAction)) {
       return c.text(`Token does not have ${requiredAction} access to this repository`, 403);
     }
-    return { orgId, repoSlug, storage: resolved.storage, defaultBranch: resolved.repo.defaultBranch };
+    return { orgId, repoSlug, storage: resolved.storage, defaultBranch: resolved.repo.defaultBranch, tokenId: authResult.tokenId };
   } else if (requireAuth) {
     return c.text("", 401, { "WWW-Authenticate": 'Basic realm="CoreGit"' });
   } else {
@@ -94,8 +104,24 @@ async function authenticateCDGit(c: any, requireAuth: boolean): Promise<CDGitAut
     if (!resolved || resolved.repo.visibility !== "public") {
       return c.text("", 401, { "WWW-Authenticate": 'Basic realm="CoreGit"' });
     }
-    return { orgId, repoSlug, storage: resolved.storage, defaultBranch: resolved.repo.defaultBranch };
+    return { orgId, repoSlug, storage: resolved.storage, defaultBranch: resolved.repo.defaultBranch, tokenId: null };
   }
+}
+
+// ── Rate limiting ──
+
+function checkCDGitRateLimit(c: any, auth: CDGitAuth): Response | null {
+  if (auth.tokenId) {
+    const rl = checkRateLimit(auth.tokenId);
+    if (!rl.allowed) return c.text("rate limit exceeded", 429, rateLimitHeaders(rl));
+    const orgRl = checkOrgRateLimit(auth.orgId);
+    if (!orgRl.allowed) return c.text("organization rate limit exceeded", 429, orgRateLimitHeaders(orgRl));
+  } else {
+    const ip = c.req.header("CF-Connecting-IP") || c.req.header("X-Forwarded-For")?.split(",")[0]?.trim() || "unknown";
+    const ipRl = checkIpRateLimit(ip);
+    if (!ipRl.allowed) return c.text("rate limit exceeded", 429, ipRateLimitHeaders(ipRl));
+  }
+  return null;
 }
 
 // ── Routes ──
@@ -111,6 +137,10 @@ const cdInfoRefsHandler = async (c: any, next: any) => {
 
   const auth = await authenticateCDGit(c, service === "git-receive-pack");
   if (auth instanceof Response) return auth;
+
+  const rlResponse = checkCDGitRateLimit(c, auth);
+  if (rlResponse) return rlResponse;
+
   const { storage, defaultBranch } = auth;
 
   const head = await storage.resolveHead();
@@ -150,6 +180,10 @@ const cdUploadPackHandler = async (c: any, next: any) => {
 
   const auth = await authenticateCDGit(c, false);
   if (auth instanceof Response) return auth;
+
+  const rlResponse = checkCDGitRateLimit(c, auth);
+  if (rlResponse) return rlResponse;
+
   const { orgId, storage } = auth;
 
   let body = new Uint8Array(await c.req.arrayBuffer());
@@ -275,6 +309,10 @@ const cdReceivePackHandler = async (c: any, next: any) => {
 
   const auth = await authenticateCDGit(c, true);
   if (auth instanceof Response) return auth;
+
+  const rlResponse = checkCDGitRateLimit(c, auth);
+  if (rlResponse) return rlResponse;
+
   const { orgId, storage } = auth;
 
   const body = new Uint8Array(await c.req.arrayBuffer());

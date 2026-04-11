@@ -1,6 +1,6 @@
 # Coregit API — Status Report
 
-> Internal document. Last updated: March 31, 2026.
+> Internal document. Last updated: April 11, 2026.
 
 ---
 
@@ -15,9 +15,20 @@ API is live at `api.coregit.dev`. 21/21 end-to-end tests passing in production.
 - **Branch operations** — create from any ref/SHA, list, delete, fast-forward merge.
 - **File browsing** — read files, list directories, list refs.
 - **Diff** — compare two refs, get changed files with addition/deletion counts.
+- **Compare** — merge-base, ahead/behind counts, mergeable check.
+- **Cherry-pick** — cherry-pick commits onto a new base.
 - **Snapshots** — named restore points with metadata. Create, list, restore.
-- **Public repos** — unauthenticated clone for public repositories.
-- **Usage tracking** — API calls, repo creates, git transfer bytes.
+- **Public repos** — unauthenticated clone and browse for public repositories.
+- **Usage tracking** — API calls, repo creates, git transfer bytes, storage.
+- **API key scopes** — read-only, write, and fine-grained per-repo scoped tokens.
+- **Rate limiting** — per-key (600/min), per-org (2000/min), per-IP for public routes (1000/min).
+- **Git LFS** — batch upload/download with presigned R2 URLs, tier-based limits.
+- **Sync** — import/export with GitHub and GitLab, auto-sync on push via webhooks.
+- **Webhooks** — configurable outgoing webhooks on push events.
+- **Code search** — cross-repo semantic search and code graph indexing.
+- **Custom domains** — git clone/push via custom domains with cached org resolution.
+- **Wiki** — per-repo wiki with git-backed storage.
+- **Forks** — fork repos within an org.
 
 ### Coregit vs GitHub API
 
@@ -25,7 +36,7 @@ API is live at `api.coregit.dev`. 21/21 end-to-end tests passing in production.
 |-----------|---------|-----------|
 | Commit 3 files | **1 call** | 7 calls |
 | Commit 10 files | **1 call** | 14 calls |
-| Rate limits | None yet | 5,000/hour |
+| Rate limits | 600/min per key | 5,000/hour |
 | Snapshots / restore points | **Yes** | No |
 | Pay-per-use (no seat pricing) | **Yes** | No |
 
@@ -35,35 +46,36 @@ API is live at `api.coregit.dev`. 21/21 end-to-end tests passing in production.
 
 ### Critical
 
-| Issue | Impact |
+All previously-identified critical issues have been resolved.
+
+| Issue | Status |
 |-------|--------|
-| **File paths not validated in API commits** — accepts `..`, null bytes, empty segments | Malformed git objects, potential path traversal |
-| **No rate limiting** — valid API key = unlimited requests | DoS, billing abuse, brute-force |
-| **Blob read has no size cap** — loads entire file into Worker memory | OOM crash on large files |
-| **Packfile generation unbounded** — clone of large repo has no timeout or size limit | Worker timeout, memory exhaustion |
-| **Invalid base64 content crashes with 500** — should return 400 | Poor error handling, potential info leak |
+| ~~File paths not validated in API commits~~ | **Fixed** — path traversal and null bytes rejected |
+| ~~No rate limiting~~ | **Fixed** — per-key, per-org, and per-IP rate limiting on all routes |
+| ~~Blob read has no size cap~~ | **Fixed** — rejects >50MB |
+| ~~Packfile generation unbounded~~ | **Fixed** — 25s timeout, returns 504 with shallow clone hint |
+| ~~Invalid base64 content crashes with 500~~ | **Fixed** — returns 400 |
 
 ### High
 
-| Issue | Impact |
+| Issue | Status |
 |-------|--------|
-| No API key scopes — every key is full read+write | Can't issue read-only keys for CI |
-| No commit message size limit | OOM on huge messages |
-| Branch names not validated against git refname rules | Malformed refs |
-| Partial R2 delete — DB deleted but orphaned objects remain | Storage leak |
-| CORS origin check uses substring match | `localhost-evil.com` passes |
-| Ref names in git push not validated | Malformed refs via push |
-| No API key expiration | Compromised keys live forever |
+| ~~No API key scopes~~ | **Fixed** — scoped tokens with read/write/per-repo permissions |
+| ~~No commit message size limit~~ | **Fixed** |
+| ~~Branch names not validated~~ | **Fixed** — git refname rules enforced |
+| ~~Ref names in git push not validated~~ | **Fixed** — `isValidRefPath()` check |
+| CORS origin check uses substring match | Open — `localhost-evil.com` could pass in dev mode |
+| No API key expiration | Open — compromised keys live forever |
+| Partial R2 delete — DB deleted but orphaned objects remain | Open — storage leak |
 
 ### Medium
 
-| Issue | Impact |
+| Issue | Status |
 |-------|--------|
-| No pagination on branch/ref lists | Huge responses on repos with many branches |
-| Diff flattens entire tree into memory | Slow/OOM on large repos |
-| Usage period parsing fragile (month overflow) | Wrong billing data |
-| Usage events silently dropped on DB error | Incomplete billing |
-| No request IDs in responses | Hard to debug issues |
+| ~~No request IDs in responses~~ | **Fixed** — X-Request-Id on all responses |
+| No pagination on branch/ref lists | Open |
+| Diff flattens entire tree into memory | Open — slow/OOM on large repos |
+| Usage events silently dropped on DB error | Open |
 
 ---
 
@@ -84,10 +96,9 @@ API is live at `api.coregit.dev`. 21/21 end-to-end tests passing in production.
 
 | Area | Current problem | Expected improvement |
 |------|----------------|---------------------|
-| **Packfile generation** | Entire packfile built in memory, no timeout | Add timeout (25s), stream response |
 | **Tree operations** | Sequential R2 reads for deep paths | Batch parallel reads |
 | **Diff computation** | Reads all blobs twice (diff + stats) | Single pass, lazy stats |
-| **Large file reads** | Entire blob loaded into memory | Stream response, reject >50MB |
+| **Large file reads** | Entire blob loaded into memory | Stream response |
 | **Pagination** | Offset-based (slow on large sets) | Keyset cursor pagination |
 | **Object cache** | 32MB per-request cache, no cross-request | Consider KV cache for hot objects |
 
@@ -112,15 +123,22 @@ API is live at `api.coregit.dev`. 21/21 end-to-end tests passing in production.
 - [x] Validate commit message length
 - [x] Validate base64 content (catch errors, return 400)
 - [x] Cap blob read size (reject >50MB)
-- [ ] Fix CORS origin matching
-- [ ] Implement rate limiting per API key
-- [ ] Add API key scopes
+- [x] Implement rate limiting per API key
+- [x] Implement rate limiting per organization
+- [x] Implement per-IP rate limiting for public routes
+- [x] Rate limit Git Smart HTTP (clone/push/pull)
+- [x] Rate limit Git LFS endpoints
+- [x] Rate limit sync webhooks
+- [x] Add API key scopes (read-only, write, per-repo)
+- [x] Validate ref names in git push
+- [x] Expose rate limit headers in CORS
+- [ ] Fix CORS origin matching (dev mode substring match)
 - [ ] Add API key expiration
 
 ### P1 — Performance (before paid tier)
 
+- [x] Add packfile generation timeout (25s)
 - [ ] Benchmark all endpoints (p50/p95/p99)
-- [ ] Add packfile generation timeout
 - [ ] Stream large file responses
 - [ ] Parallelize tree reads
 - [ ] Keyset pagination for repos, commits, usage
@@ -128,15 +146,24 @@ API is live at `api.coregit.dev`. 21/21 end-to-end tests passing in production.
 
 ### P2 — Reliability
 
+- [x] Request IDs in all responses
+- [x] Health check with DB ping
+- [x] Structured error codes
 - [ ] Transactional repo delete (R2 first, then DB)
 - [ ] Retry failed usage events
-- [ ] Request IDs in all responses
-- [ ] Structured error codes
-- [ ] Health check with DB ping
 
-### P3 — Features
+### P3 — Features (shipped)
 
-- [ ] Webhooks (push events, repo lifecycle)
+- [x] Webhooks (push events, repo lifecycle)
+- [x] Code search (semantic + code graph)
+- [x] Sync from external providers (GitHub, GitLab)
+- [x] Git LFS support
+- [x] Custom domains
+- [x] Wiki
+- [x] Forks
+
+### P3 — Features (remaining)
+
 - [ ] Line-level diff (unified patch format)
 - [ ] 3-way merge strategy
 - [ ] TypeScript SDK (`@coregit/sdk`)
@@ -158,10 +185,10 @@ API is live at `api.coregit.dev`. 21/21 end-to-end tests passing in production.
 2. **Serverless economics** — no idle infra, pay per operation
 3. **Snapshots** — named restore points for agent rollback
 4. **Zero ops** — one API key replaces GitHub org + tokens + webhooks
+5. **Built-in sync** — bidirectional GitHub/GitLab sync
+6. **Code search** — semantic and code graph search across repos
 
 ### Our gaps
-1. No rate limiting (must fix)
-2. No webhooks (Phase 2)
-3. No merge beyond fast-forward
-4. No line-level diff
-5. No code search
+1. No line-level diff
+2. No 3-way merge
+3. No TypeScript SDK yet

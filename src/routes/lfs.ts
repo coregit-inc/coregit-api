@@ -20,6 +20,14 @@ import { resolveRepo } from "../services/repo-resolver";
 import { presignUpload, presignDownload, buildLfsKey } from "../services/lfs-presign";
 import { recordUsage } from "../services/usage";
 import { checkFreeLimits } from "../services/limits";
+import {
+  checkRateLimit,
+  rateLimitHeaders,
+  checkOrgRateLimit,
+  orgRateLimitHeaders,
+  checkIpRateLimit,
+  ipRateLimitHeaders,
+} from "../services/rate-limit";
 import type { Env, Variables } from "../types";
 
 const lfs = new Hono<{ Bindings: Env; Variables: Variables }>();
@@ -47,6 +55,8 @@ interface LfsAuthResult {
   repoSlug: string;
   tier: "free" | "usage";
   dodoCustomerId: string | null;
+  /** Token ID for rate limiting (null for unauthenticated public download) */
+  tokenId: string | null;
 }
 
 function extractLfsRepoParams(c: any): { orgParam: string; repoSlug: string; namespace: string | null } {
@@ -86,6 +96,7 @@ async function authLfsWrite(c: any): Promise<LfsAuthResult | Response> {
     repoSlug,
     tier: plan.tier,
     dodoCustomerId: plan.dodoCustomerId,
+    tokenId: authResult.tokenId,
   };
 }
 
@@ -117,6 +128,7 @@ async function authLfsRead(c: any): Promise<LfsAuthResult | Response> {
         repoSlug,
         tier: plan.tier,
         dodoCustomerId: plan.dodoCustomerId,
+        tokenId: authResult.tokenId,
       };
     }
   }
@@ -144,6 +156,7 @@ async function authLfsRead(c: any): Promise<LfsAuthResult | Response> {
     repoSlug,
     tier: plan.tier,
     dodoCustomerId: plan.dodoCustomerId,
+    tokenId: null,
   };
 }
 
@@ -179,6 +192,18 @@ async function batchHandler(c: any) {
   // Auth: write for upload, read for download
   const auth = isUpload ? await authLfsWrite(c) : await authLfsRead(c);
   if (auth instanceof Response) return auth;
+
+  // Rate limiting
+  if (auth.tokenId) {
+    const rl = checkRateLimit(auth.tokenId);
+    if (!rl.allowed) return lfsError(c, 429, "Rate limit exceeded");
+    const orgRl = checkOrgRateLimit(auth.orgId);
+    if (!orgRl.allowed) return lfsError(c, 429, "Organization rate limit exceeded");
+  } else {
+    const ip = c.req.header("CF-Connecting-IP") || c.req.header("X-Forwarded-For")?.split(",")[0]?.trim() || "unknown";
+    const ipRl = checkIpRateLimit(ip);
+    if (!ipRl.allowed) return lfsError(c, 429, "Rate limit exceeded");
+  }
 
   const tier = auth.tier;
   const maxFileSize = MAX_FILE_SIZE[tier] ?? MAX_FILE_SIZE.free;
@@ -328,6 +353,14 @@ async function verifyHandler(c: any) {
   const db = c.get("db");
   const auth = await authLfsWrite(c);
   if (auth instanceof Response) return auth;
+
+  // Rate limiting (verify is always authenticated)
+  if (auth.tokenId) {
+    const rl = checkRateLimit(auth.tokenId);
+    if (!rl.allowed) return lfsError(c, 429, "Rate limit exceeded");
+    const orgRl = checkOrgRateLimit(auth.orgId);
+    if (!orgRl.allowed) return lfsError(c, 429, "Organization rate limit exceeded");
+  }
 
   let body: { oid: string; size: number };
   try {

@@ -33,6 +33,14 @@ import { isValidSha, isValidRefPath } from "../git/validation";
 import { decryptSecret } from "../services/secret-manager";
 import { exportToGithub } from "../services/github-export";
 import { exportToGitlab } from "../services/gitlab-export";
+import {
+  checkRateLimit,
+  rateLimitHeaders,
+  checkOrgRateLimit,
+  orgRateLimitHeaders,
+  checkIpRateLimit,
+  ipRateLimitHeaders,
+} from "../services/rate-limit";
 import { nanoid } from "nanoid";
 import type { Env, Variables } from "../types";
 
@@ -69,6 +77,8 @@ interface GitAuthResult {
   repoSlug: string;
   storage: GitR2Storage;
   defaultBranch: string;
+  /** Token ID for rate limiting (null for unauthenticated public access) */
+  tokenId: string | null;
 }
 
 /** Extract repo slug and optional namespace from git route params. */
@@ -108,7 +118,7 @@ async function authenticateGit(c: any): Promise<GitAuthResult | Response> {
     return c.text("Token does not have write access to this repository", 403);
   }
 
-  return { orgId, repoSlug, storage: resolved.storage, defaultBranch: resolved.repo.defaultBranch };
+  return { orgId, repoSlug, storage: resolved.storage, defaultBranch: resolved.repo.defaultBranch, tokenId: authResult.tokenId };
 }
 
 /**
@@ -135,7 +145,7 @@ async function authenticateGitReadOnly(c: any): Promise<GitAuthResult | Response
         return c.text("Token does not have read access to this repository", 403);
       }
 
-      return { orgId, repoSlug, storage: resolved.storage, defaultBranch: resolved.repo.defaultBranch };
+      return { orgId, repoSlug, storage: resolved.storage, defaultBranch: resolved.repo.defaultBranch, tokenId: authResult.tokenId };
     }
   }
 
@@ -155,7 +165,39 @@ async function authenticateGitReadOnly(c: any): Promise<GitAuthResult | Response
     return c.text("", 401, { "WWW-Authenticate": 'Basic realm="CoreGit"' });
   }
 
-  return { orgId: org.id, repoSlug, storage: resolved.storage, defaultBranch: resolved.repo.defaultBranch };
+  return { orgId: org.id, repoSlug, storage: resolved.storage, defaultBranch: resolved.repo.defaultBranch, tokenId: null };
+}
+
+// ── Git rate limiting ──
+
+/**
+ * Apply rate limiting after git auth. Authenticated requests use per-key + per-org limits.
+ * Unauthenticated (public) requests use per-IP limits.
+ * Returns a 429 Response if rate limited, or null if allowed.
+ */
+function checkGitRateLimit(c: any, auth: GitAuthResult): Response | null {
+  if (auth.tokenId) {
+    // Authenticated: per-key + per-org rate limiting
+    const rl = checkRateLimit(auth.tokenId);
+    if (!rl.allowed) {
+      const headers = rateLimitHeaders(rl);
+      return c.text("rate limit exceeded", 429, headers);
+    }
+    const orgRl = checkOrgRateLimit(auth.orgId);
+    if (!orgRl.allowed) {
+      const headers = orgRateLimitHeaders(orgRl);
+      return c.text("organization rate limit exceeded", 429, headers);
+    }
+  } else {
+    // Unauthenticated: per-IP rate limiting
+    const ip = c.req.header("CF-Connecting-IP") || c.req.header("X-Forwarded-For")?.split(",")[0]?.trim() || "unknown";
+    const ipRl = checkIpRateLimit(ip);
+    if (!ipRl.allowed) {
+      const headers = ipRateLimitHeaders(ipRl);
+      return c.text("rate limit exceeded", 429, headers);
+    }
+  }
+  return null;
 }
 
 // ── Auto-export trigger ──
@@ -315,6 +357,10 @@ const infoRefsHandler = async (c: any) => {
     ? await authenticateGitReadOnly(c)
     : await authenticateGit(c);
   if (auth instanceof Response) return auth;
+
+  const rlResponse = checkGitRateLimit(c, auth);
+  if (rlResponse) return rlResponse;
+
   const { storage, defaultBranch } = auth;
 
   const head = await storage.resolveHead();
@@ -354,6 +400,10 @@ const uploadPackHandler = async (c: any) => {
   // Clone/fetch — allow public access
   const auth = await authenticateGitReadOnly(c);
   if (auth instanceof Response) return auth;
+
+  const rlResponse = checkGitRateLimit(c, auth);
+  if (rlResponse) return rlResponse;
+
   const { orgId, storage } = auth;
 
   let body = new Uint8Array(await c.req.arrayBuffer());
@@ -488,6 +538,10 @@ const receivePackHandler = async (c: any) => {
   // Push — always requires auth
   const auth = await authenticateGit(c);
   if (auth instanceof Response) return auth;
+
+  const rlResponse = checkGitRateLimit(c, auth);
+  if (rlResponse) return rlResponse;
+
   const { orgId, storage } = auth;
 
   const body = new Uint8Array(await c.req.arrayBuffer());

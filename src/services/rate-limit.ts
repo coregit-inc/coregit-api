@@ -211,3 +211,85 @@ export function rateLimitHeaders(result: RateLimitResult): Record<string, string
   }
   return headers;
 }
+
+// ── Per-IP rate limiting (unauthenticated routes) ──
+
+const IP_PER_MINUTE = 1000;
+const IP_PER_HOUR = 25_000;
+
+const ipWindows = new Map<string, KeyWindow>();
+let ipCheckCount = 0;
+
+/**
+ * Rate limit by client IP address.
+ * Used for unauthenticated routes (public browse, webhooks, anonymous git clone).
+ * More generous than per-key limits since these are read-only or signature-verified.
+ */
+export function checkIpRateLimit(ip: string): RateLimitResult {
+  const now = Date.now();
+
+  ipCheckCount++;
+  if (ipCheckCount >= 500) {
+    ipCheckCount = 0;
+    const hourAgo = now - HOUR_MS;
+    for (const [key, win] of ipWindows) {
+      if (win.timestamps.length === 0 || win.timestamps[win.timestamps.length - 1] < hourAgo) {
+        ipWindows.delete(key);
+      }
+    }
+    if (ipWindows.size > 10_000) {
+      const keys = [...ipWindows.keys()];
+      for (let i = 0; i < keys.length / 2; i++) {
+        ipWindows.delete(keys[i]);
+      }
+    }
+  }
+
+  let win = ipWindows.get(ip);
+  if (!win) {
+    win = { timestamps: [] };
+    ipWindows.set(ip, win);
+  }
+
+  const hourCutoff = now - HOUR_MS;
+  while (win.timestamps.length > 0 && win.timestamps[0] < hourCutoff) {
+    win.timestamps.shift();
+  }
+
+  const minuteCutoff = now - MINUTE_MS;
+  let minuteUsed = 0;
+  for (let i = win.timestamps.length - 1; i >= 0; i--) {
+    if (win.timestamps[i] >= minuteCutoff) minuteUsed++;
+    else break;
+  }
+
+  const hourUsed = win.timestamps.length;
+
+  if (minuteUsed >= IP_PER_MINUTE) {
+    return {
+      allowed: false, minuteUsed, hourUsed,
+      retryAfterSec: Math.ceil((win.timestamps[win.timestamps.length - minuteUsed] + MINUTE_MS - now) / 1000),
+    };
+  }
+  if (hourUsed >= IP_PER_HOUR) {
+    return {
+      allowed: false, minuteUsed, hourUsed,
+      retryAfterSec: Math.ceil((win.timestamps[0] + HOUR_MS - now) / 1000),
+    };
+  }
+
+  win.timestamps.push(now);
+  return { allowed: true, minuteUsed: minuteUsed + 1, hourUsed: hourUsed + 1, retryAfterSec: 0 };
+}
+
+export function ipRateLimitHeaders(result: RateLimitResult): Record<string, string> {
+  const headers: Record<string, string> = {
+    "X-RateLimit-Limit": String(IP_PER_MINUTE),
+    "X-RateLimit-Remaining": String(Math.max(0, IP_PER_MINUTE - result.minuteUsed)),
+    "X-RateLimit-Reset": String(Math.ceil(Date.now() / 1000) + 60),
+  };
+  if (!result.allowed) {
+    headers["Retry-After"] = String(Math.max(1, result.retryAfterSec));
+  }
+  return headers;
+}

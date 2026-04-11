@@ -19,6 +19,7 @@ import { syncFromGithub } from "../services/github-sync";
 import { syncFromGitlab } from "../services/gitlab-sync";
 import { GitR2Storage } from "../git/storage";
 import type { CommitAuthor } from "../services/commit-builder";
+import { checkIpRateLimit, ipRateLimitHeaders } from "../services/rate-limit";
 import type { Env, Variables } from "../types";
 
 const syncWebhooks = new Hono<{ Bindings: Env; Variables: Variables }>();
@@ -175,6 +176,14 @@ async function runImportSync(
 // POST /v1/sync-webhooks/github
 syncWebhooks.post("/sync-webhooks/github", async (c) => {
   try {
+    // IP rate limiting
+    const ip = c.req.header("CF-Connecting-IP") || c.req.header("X-Forwarded-For")?.split(",")[0]?.trim() || "unknown";
+    const ipRl = checkIpRateLimit(ip);
+    if (!ipRl.allowed) {
+      const headers = ipRateLimitHeaders(ipRl);
+      return c.json({ error: "Rate limit exceeded" }, 429, headers);
+    }
+
     const event = c.req.header("X-GitHub-Event");
     if (event !== "push") {
       return c.json({ ignored: true, reason: "not a push event" });
@@ -255,6 +264,14 @@ syncWebhooks.post("/sync-webhooks/github", async (c) => {
 // POST /v1/sync-webhooks/gitlab
 syncWebhooks.post("/sync-webhooks/gitlab", async (c) => {
   try {
+    // IP rate limiting
+    const ip = c.req.header("CF-Connecting-IP") || c.req.header("X-Forwarded-For")?.split(",")[0]?.trim() || "unknown";
+    const ipRl = checkIpRateLimit(ip);
+    if (!ipRl.allowed) {
+      const headers = ipRateLimitHeaders(ipRl);
+      return c.json({ error: "Rate limit exceeded" }, 429, headers);
+    }
+
     const gitlabEvent = c.req.header("X-Gitlab-Event");
     if (gitlabEvent !== "Push Hook") {
       return c.json({ ignored: true, reason: "not a push event" });
