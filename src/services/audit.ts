@@ -21,7 +21,8 @@ export type AuditAction =
   | "webhook.create"
   | "webhook.update"
   | "webhook.delete"
-  | "repo.fork";
+  | "repo.fork"
+  | "wiki.create";
 
 export function recordAudit(
   ctx: ExecutionContext,
