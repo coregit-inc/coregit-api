@@ -61,6 +61,7 @@ import { graphRoutes } from "./routes/graph";
 import { hybridSearchRoutes } from "./routes/hybrid-search";
 import { forks } from "./routes/forks";
 import { wiki } from "./routes/wiki";
+import { setRepoCacheRef } from "./services/repo-resolver";
 import {
   processIndexFileMessage,
   processFullReindex,
@@ -223,6 +224,8 @@ app.use("/v1/*", async (c, next) => {
     if (!c.env.DATABASE_URL) return c.json({ error: "Database not configured" }, 500);
     c.set("db", createDb(c.env.DATABASE_URL));
   }
+  // Set repo cache ref so resolveRepo() can use KV cache without changing call sites
+  setRepoCacheRef(c.env.AUTH_CACHE as KVNamespace | undefined);
   await next();
 });
 

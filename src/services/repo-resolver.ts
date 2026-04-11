@@ -27,16 +27,44 @@ export interface ResolvedRepo {
   storageSuffix: string;
 }
 
+const REPO_CACHE_TTL = 60; // seconds
+
+function repoCacheKey(orgId: string, slug: string, namespace?: string | null): string {
+  return `repo:${orgId}:${namespace || "_"}:${slug}`;
+}
+
 /**
  * Look up a repo by org + optional namespace + slug.
+ * Uses KV cache (60s TTL) when AUTH_CACHE is available.
  * Returns null if not found.
  */
+// Module-level cache ref — set once per request by middleware, used by resolveRepo.
+// This avoids changing 75+ call sites. The auth middleware sets this via setRepoCacheRef().
+let _authCacheRef: KVNamespace | undefined;
+
+export function setRepoCacheRef(kv: KVNamespace | undefined) {
+  _authCacheRef = kv;
+}
+
 export async function resolveRepo(
   db: Database,
   bucket: R2Bucket,
-  id: RepoIdentifier
+  id: RepoIdentifier,
 ): Promise<ResolvedRepo | null> {
   const { orgId, slug, namespace } = id;
+  const cacheKey = repoCacheKey(orgId, slug, namespace);
+  const authCache = _authCacheRef;
+
+  // Check KV cache
+  if (authCache) {
+    const cached = await authCache.get(cacheKey, "json") as Repo | null;
+    if (cached) {
+      const storageSuffix = cached.namespace ? `${cached.namespace}/${cached.slug}` : cached.slug;
+      const storage = new GitR2Storage(bucket, orgId, storageSuffix);
+      const scopeKey = cached.namespace ? `${cached.namespace}/${cached.slug}` : cached.slug;
+      return { repo: cached, storage, scopeKey, storageSuffix };
+    }
+  }
 
   const condition = namespace
     ? and(eq(repo.orgId, orgId), eq(repo.namespace, namespace), eq(repo.slug, slug))
@@ -50,11 +78,29 @@ export async function resolveRepo(
 
   if (!found) return null;
 
+  // Cache the result (fire-and-forget)
+  if (authCache) {
+    authCache.put(cacheKey, JSON.stringify(found), { expirationTtl: REPO_CACHE_TTL }).catch(() => {});
+  }
+
   const storageSuffix = namespace ? `${namespace}/${slug}` : slug;
   const storage = new GitR2Storage(bucket, orgId, storageSuffix);
   const scopeKey = namespace ? `${namespace}/${slug}` : slug;
 
   return { repo: found, storage, scopeKey, storageSuffix };
+}
+
+/**
+ * Invalidate cached repo data. Call after PATCH, DELETE, or creation.
+ */
+export async function invalidateRepoCache(
+  authCache: KVNamespace | undefined,
+  orgId: string,
+  slug: string,
+  namespace?: string | null,
+): Promise<void> {
+  if (!authCache) return;
+  await authCache.delete(repoCacheKey(orgId, slug, namespace)).catch(() => {});
 }
 
 /**

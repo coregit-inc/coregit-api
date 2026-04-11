@@ -20,7 +20,7 @@ import { recordAudit } from "../services/audit";
 import { deleteNamespace } from "../services/pinecone";
 import { checkFreeLimits } from "../services/limits";
 import { isMasterKey, hasRepoAccess, getAccessibleRepoKeys } from "../auth/scopes";
-import { resolveRepo, buildGitUrl, buildApiUrl } from "../services/repo-resolver";
+import { resolveRepo, buildGitUrl, buildApiUrl, invalidateRepoCache } from "../services/repo-resolver";
 import { extractRepoParams, validateNamespace } from "./helpers";
 import type { Env, Variables } from "../types";
 
@@ -400,6 +400,9 @@ const patchRepoHandler = async (c: any) => {
       .where(eq(repo.id, found.id))
       .returning();
 
+    // Invalidate repo cache
+    c.executionCtx.waitUntil(invalidateRepoCache(c.env.AUTH_CACHE, orgId, slug, namespace));
+
     recordAudit(c.executionCtx, db, {
       orgId, actorId: c.get("apiKeyId"), actorType: "master_key",
       action: "repo.update", resourceType: "repo", resourceId: found.id,
@@ -469,6 +472,9 @@ const deleteRepoHandler = async (c: any) => {
 
     // Delete DB record (cascades to snapshots + semantic_index)
     await db.delete(repo).where(eq(repo.id, found.id));
+
+    // Invalidate repo cache
+    c.executionCtx.waitUntil(invalidateRepoCache(c.env.AUTH_CACHE, orgId, found.slug, found.namespace));
 
     recordUsage(c.executionCtx, db, orgId, "repo_deleted", 1, { repo_id: found.id }, c.env.DODO_PAYMENTS_API_KEY, c.get("dodoCustomerId"));
     recordAudit(c.executionCtx, db, {

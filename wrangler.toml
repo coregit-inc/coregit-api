@@ -56,6 +56,11 @@ id = "728b507d5aac4961b6324622c7ae34d8"
 binding = "HYBRID_CACHE"
 id = "b1ab293bd0934871bf9369b024ed9b74"
 
+# Auth + repo resolution cache (short TTL)
+[[kv_namespaces]]
+binding = "AUTH_CACHE"
+id = "2e8b19027dac46aea1920850f594188c"
+
 # Semantic search indexing queue
 [[queues.producers]]
 queue = "coregit-indexing"

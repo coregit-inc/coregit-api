@@ -37,51 +37,94 @@ function timingSafeEqual(a: string, b: string): boolean {
   return result === 0;
 }
 
-/**
- * Verify a scoped token (cgt_*).
- * Returns org_id + scopes if valid, null otherwise.
- */
-async function verifyScopedToken(
-  db: any,
-  tokenValue: string
-): Promise<{ orgId: string; scopes: Scopes; tokenId: string } | null> {
-  const keyHash = await sha256(tokenValue);
+const AUTH_CACHE_TTL = 30; // seconds
 
-  const result = await db.execute(
-    sql`SELECT id, org_id, scopes FROM scoped_token
-        WHERE key_hash = ${keyHash}
-          AND expires_at > NOW()
-          AND revoked_at IS NULL
-        LIMIT 1`
-  );
-
-  const row = result.rows[0] as { id: string; org_id: string; scopes: Record<string, string[]> } | undefined;
-  if (!row) return null;
-
-  return { orgId: row.org_id, scopes: row.scopes, tokenId: row.id };
+interface CachedAuth {
+  orgId: string;
+  scopes: Scopes;
+  tokenId: string;
+  tier: "free" | "usage";
+  dodoCustomerId: string | null;
 }
 
 /**
- * Verify a master API key (non cgt_* prefix).
- * Returns org_id with null scopes (full access).
+ * Verify credentials with KV cache.
+ * On cache hit: returns cached auth + org plan (0 DB queries).
+ * On cache miss: single joined query for key + org plan (1 DB query), then caches result.
  */
-async function verifyMasterKey(
+async function verifyWithCache(
   db: any,
-  keyValue: string
-): Promise<{ orgId: string; scopes: null; tokenId: string; keyHash: string } | null> {
+  keyValue: string,
+  authCache: KVNamespace | undefined,
+): Promise<{ auth: CachedAuth; keyHash: string } | null> {
   const keyHash = await sha256(keyValue);
+  const isScopedToken = keyValue.startsWith(SCOPED_TOKEN_PREFIX);
 
-  const result = await db.execute(
-    sql`SELECT id, org_id, expires_at FROM api_key
-        WHERE key_hash = ${keyHash}
-          AND (expires_at IS NULL OR expires_at > NOW())
-        LIMIT 1`
-  );
+  // Check KV cache first
+  if (authCache) {
+    const cached = await authCache.get(`auth:${keyHash}`, "json") as CachedAuth | null;
+    if (cached) {
+      return { auth: cached, keyHash };
+    }
+  }
 
-  const row = result.rows[0] as { id: string; org_id: string; expires_at: string | null } | undefined;
-  if (!row) return null;
+  // Cache miss — single joined query (key + org plan)
+  let auth: CachedAuth | null = null;
 
-  return { orgId: row.org_id, scopes: null, tokenId: row.id, keyHash };
+  if (isScopedToken) {
+    const result = await db.execute(
+      sql`SELECT st.id, st.org_id, st.scopes,
+                 COALESCE(op.tier, 'free') AS tier,
+                 op.dodo_customer_id
+          FROM scoped_token st
+          LEFT JOIN org_plan op ON op.org_id = st.org_id
+          WHERE st.key_hash = ${keyHash}
+            AND st.expires_at > NOW()
+            AND st.revoked_at IS NULL
+          LIMIT 1`
+    );
+    const row = result.rows[0] as any;
+    if (row) {
+      auth = {
+        orgId: row.org_id,
+        scopes: row.scopes,
+        tokenId: row.id,
+        tier: row.tier ?? "free",
+        dodoCustomerId: row.dodo_customer_id ?? null,
+      };
+    }
+  } else {
+    const result = await db.execute(
+      sql`SELECT ak.id, ak.org_id,
+                 COALESCE(op.tier, 'free') AS tier,
+                 op.dodo_customer_id
+          FROM api_key ak
+          LEFT JOIN org_plan op ON op.org_id = ak.org_id
+          WHERE ak.key_hash = ${keyHash}
+            AND (ak.expires_at IS NULL OR ak.expires_at > NOW())
+          LIMIT 1`
+    );
+    const row = result.rows[0] as any;
+    if (row) {
+      auth = {
+        orgId: row.org_id,
+        scopes: null, // master key = full access
+        tokenId: row.id,
+        tier: row.tier ?? "free",
+        dodoCustomerId: row.dodo_customer_id ?? null,
+      };
+    }
+  }
+
+  if (!auth) return null;
+
+  // Cache the result (fire-and-forget)
+  if (authCache) {
+    // Don't await — caching shouldn't block the response
+    authCache.put(`auth:${keyHash}`, JSON.stringify(auth), { expirationTtl: AUTH_CACHE_TTL }).catch(() => {});
+  }
+
+  return { auth, keyHash };
 }
 
 /**
@@ -122,37 +165,34 @@ export const apiKeyAuth = createMiddleware<{
   }
 
   const isScopedToken = key.startsWith(SCOPED_TOKEN_PREFIX);
-  const authResult = isScopedToken
-    ? await verifyScopedToken(db, key)
-    : await verifyMasterKey(db, key);
+  const authCache = c.env.AUTH_CACHE as KVNamespace | undefined;
+  const verified = await verifyWithCache(db, key, authCache);
 
-  if (!authResult) {
+  if (!verified) {
     if (isScopedToken) {
       return c.json({ error: "Invalid or expired token" }, 401);
     }
     return c.json({ error: "Invalid API key" }, 401);
   }
 
+  const { auth, keyHash } = verified;
+
   // Touch last_used (fire-and-forget)
   if (isScopedToken) {
     c.executionCtx.waitUntil(
-      db.execute(sql`UPDATE scoped_token SET last_used = NOW() WHERE id = ${authResult.tokenId}`).catch(() => {})
+      db.execute(sql`UPDATE scoped_token SET last_used = NOW() WHERE id = ${auth.tokenId}`).catch(() => {})
     );
   } else {
-    // Use cached keyHash from verifyMasterKey (avoids double SHA-256)
-    const cachedHash = (authResult as any).keyHash;
     c.executionCtx.waitUntil(
-      db.execute(sql`UPDATE api_key SET last_used = NOW() WHERE key_hash = ${cachedHash}`).catch(() => {})
+      db.execute(sql`UPDATE api_key SET last_used = NOW() WHERE key_hash = ${keyHash}`).catch(() => {})
     );
   }
 
-  c.set("orgId", authResult.orgId);
-  c.set("apiKeyPermissions", authResult.scopes);
-  c.set("apiKeyId", authResult.tokenId);
-
-  const orgPlan = await getOrgPlan(db, authResult.orgId);
-  c.set("orgTier", orgPlan.tier);
-  c.set("dodoCustomerId", orgPlan.dodoCustomerId);
+  c.set("orgId", auth.orgId);
+  c.set("apiKeyPermissions", auth.scopes);
+  c.set("apiKeyId", auth.tokenId);
+  c.set("orgTier", auth.tier);
+  c.set("dodoCustomerId", auth.dodoCustomerId);
 
   // ── Per-key rate limiting ──
   const rl = checkRateLimit(authResult.tokenId);

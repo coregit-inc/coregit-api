@@ -23,6 +23,8 @@ export interface Env {
   TREE_CACHE?: KVNamespace;
   SEARCH_CACHE?: KVNamespace;
   EMBEDDING_CACHE?: KVNamespace;
+  // Auth + repo cache
+  AUTH_CACHE?: KVNamespace;
   // Code graph
   GRAPH_CACHE?: KVNamespace;
   HYBRID_CACHE?: KVNamespace;
