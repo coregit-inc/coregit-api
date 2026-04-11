@@ -29,6 +29,7 @@ export interface ResolvedRepo {
 
 const REPO_CACHE_TTL = 60; // seconds
 
+// "_" is safe as null-namespace placeholder: NAMESPACE_REGEX only allows [a-z0-9-], never "_"
 function repoCacheKey(orgId: string, slug: string, namespace?: string | null): string {
   return `repo:${orgId}:${namespace || "_"}:${slug}`;
 }
@@ -38,8 +39,10 @@ function repoCacheKey(orgId: string, slug: string, namespace?: string | null): s
  * Uses KV cache (60s TTL) when AUTH_CACHE is available.
  * Returns null if not found.
  */
-// Module-level cache ref — set once per request by middleware, used by resolveRepo.
-// This avoids changing 75+ call sites. The auth middleware sets this via setRepoCacheRef().
+// Module-level cache ref — set by DB middleware, used by resolveRepo.
+// Safe with concurrent requests: c.env.AUTH_CACHE is the same KVNamespace binding
+// for all requests in an isolate, so the value is always identical.
+// This avoids changing 75+ call sites.
 let _authCacheRef: KVNamespace | undefined;
 
 export function setRepoCacheRef(kv: KVNamespace | undefined) {
@@ -80,7 +83,7 @@ export async function resolveRepo(
 
   // Cache the result (fire-and-forget)
   if (authCache) {
-    authCache.put(cacheKey, JSON.stringify(found), { expirationTtl: REPO_CACHE_TTL }).catch(() => {});
+    authCache.put(cacheKey, JSON.stringify(found), { expirationTtl: REPO_CACHE_TTL }).catch((e) => console.error("Repo cache write failed:", e));
   }
 
   const storageSuffix = namespace ? `${namespace}/${slug}` : slug;

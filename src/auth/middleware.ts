@@ -121,7 +121,7 @@ async function verifyWithCache(
   // Cache the result (fire-and-forget)
   if (authCache) {
     // Don't await — caching shouldn't block the response
-    authCache.put(`auth:${keyHash}`, JSON.stringify(auth), { expirationTtl: AUTH_CACHE_TTL }).catch(() => {});
+    authCache.put(`auth:${keyHash}`, JSON.stringify(auth), { expirationTtl: AUTH_CACHE_TTL }).catch((e) => console.error("Auth cache write failed:", e));
   }
 
   return { auth, keyHash };
@@ -195,7 +195,7 @@ export const apiKeyAuth = createMiddleware<{
   c.set("dodoCustomerId", auth.dodoCustomerId);
 
   // ── Per-key rate limiting ──
-  const rl = checkRateLimit(authResult.tokenId);
+  const rl = checkRateLimit(auth.tokenId);
   const rlHeaders = rateLimitHeaders(rl);
   if (!rl.allowed) {
     for (const [k, v] of Object.entries(rlHeaders)) {
@@ -205,7 +205,7 @@ export const apiKeyAuth = createMiddleware<{
   }
 
   // ── Per-org rate limiting ──
-  const orgRl = checkOrgRateLimit(authResult.orgId);
+  const orgRl = checkOrgRateLimit(auth.orgId);
   const orgRlHeaders = orgRateLimitHeaders(orgRl);
   if (!orgRl.allowed) {
     for (const [k, v] of Object.entries(orgRlHeaders)) {
@@ -222,10 +222,10 @@ export const apiKeyAuth = createMiddleware<{
   }
 
   // Record api_call usage for every authenticated request
-  recordUsage(c.executionCtx, db, authResult.orgId, "api_call", 1, {
+  recordUsage(c.executionCtx, db, auth.orgId, "api_call", 1, {
     method: c.req.method,
     path: c.req.path,
-  }, c.env.DODO_PAYMENTS_API_KEY, orgPlan.dodoCustomerId);
+  }, c.env.DODO_PAYMENTS_API_KEY, auth.dodoCustomerId);
 });
 
 /**
@@ -246,14 +246,15 @@ export function parseBasicAuthKey(header: string | undefined): string | null {
 
 /**
  * Verify a credential (API key or scoped token) for Git operations.
+ * Uses verifyWithCache without KV (git requests don't benefit from short-lived cache).
  * Returns org ID + scopes, or null if invalid.
  */
 export async function verifyCredentialForGit(
   db: any,
-  credentialValue: string
+  credentialValue: string,
+  authCache?: KVNamespace,
 ): Promise<{ orgId: string; scopes: Scopes; tokenId: string } | null> {
-  if (credentialValue.startsWith(SCOPED_TOKEN_PREFIX)) {
-    return verifyScopedToken(db, credentialValue);
-  }
-  return verifyMasterKey(db, credentialValue);
+  const result = await verifyWithCache(db, credentialValue, authCache);
+  if (!result) return null;
+  return { orgId: result.auth.orgId, scopes: result.auth.scopes, tokenId: result.auth.tokenId };
 }
