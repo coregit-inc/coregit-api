@@ -403,20 +403,27 @@ export class GitR2Storage {
       cursor = listed.truncated ? listed.cursor : undefined;
     } while (cursor);
 
-    // 2. Copy all keys in parallel (single batch — git objects are small)
+    // 2. Copy in parallel batches
+    // CF Workers limits concurrent subrequests to 6. Each copy = get+put = 2 subrequests,
+    // so effective concurrency is ~3 copies. Batch size of 10 keeps the pipeline full
+    // without excessive queuing.
+    const BATCH_SIZE = 10;
     let copied = 0;
 
-    await Promise.all(
-      allKeys.map(async (key) => {
-        const obj = await bucket.get(key);
-        if (!obj) return;
-        const targetKey = `${targetBasePath}/${key.slice(prefix.length)}`;
-        await bucket.put(targetKey, obj.body, {
-          httpMetadata: obj.httpMetadata,
-        });
-        copied++;
-      })
-    );
+    for (let i = 0; i < allKeys.length; i += BATCH_SIZE) {
+      const batch = allKeys.slice(i, i + BATCH_SIZE);
+      await Promise.all(
+        batch.map(async (key) => {
+          const obj = await bucket.get(key);
+          if (!obj) return;
+          const targetKey = `${targetBasePath}/${key.slice(prefix.length)}`;
+          await bucket.put(targetKey, obj.body, {
+            httpMetadata: obj.httpMetadata,
+          });
+          copied++;
+        })
+      );
+    }
 
     return { count: copied };
   }
