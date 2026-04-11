@@ -130,12 +130,27 @@ async function readFileAtPath(
   return { content, sha: entry.sha };
 }
 
-// ── Collect pages with parsed frontmatter ──
+// ── Collect pages/sources with KV caching ──
+// Both are cached by commitSha so all endpoints (list, llms.txt, graph, stats) share one warm dataset.
+
+const WIKI_DATA_CACHE_TTL = 600; // 10 min — same as search cache
 
 async function collectPages(
   storage: GitR2Storage,
   commitSha: string,
+  searchCache?: KVNamespace,
+  orgId?: string,
+  repoId?: string,
 ): Promise<PageSummary[]> {
+  // Check KV cache (stores frontmatter only — body excluded to avoid 25MB KV limit)
+  const cacheKey = searchCache && orgId && repoId
+    ? `wiki-pdata:${orgId}/${repoId}:${commitSha}`
+    : null;
+  if (searchCache && cacheKey) {
+    const cached = await searchCache.get(cacheKey, "json") as PageSummary[] | null;
+    if (cached) return cached;
+  }
+
   const files = await listFilesUnderPath(storage, commitSha, "wiki", ".md");
   const pages: PageSummary[] = [];
 
@@ -160,17 +175,36 @@ async function collectPages(
     }
   }
 
+  // Cache frontmatter-only version (body stripped to keep under KV 25MB limit).
+  // Consumers needing body (llms.txt full) will get it from the full in-memory result
+  // on first call, and from cached frontmatter + fresh blob reads on subsequent calls.
+  if (searchCache && cacheKey) {
+    const lite = pages.map(({ body, ...rest }) => ({ ...rest, body: "" }));
+    searchCache.put(cacheKey, JSON.stringify(lite), { expirationTtl: WIKI_DATA_CACHE_TTL })
+      .catch((e: unknown) => console.error("Wiki pages cache write failed:", e));
+  }
+
   return pages;
 }
 
 async function collectSources(
   storage: GitR2Storage,
   commitSha: string,
+  searchCache?: KVNamespace,
+  orgId?: string,
+  repoId?: string,
 ): Promise<SourceInfo[]> {
+  const cacheKey = searchCache && orgId && repoId
+    ? `wiki-sdata:${orgId}/${repoId}:${commitSha}`
+    : null;
+  if (searchCache && cacheKey) {
+    const cached = await searchCache.get(cacheKey, "json") as SourceInfo[] | null;
+    if (cached) return cached;
+  }
+
   const files = await listFilesUnderPath(storage, commitSha, "raw");
   const filtered = files.filter((f) => f.name !== ".gitkeep");
 
-  // Batch R2 reads with Promise.all (same pattern as collectPages)
   const sources: SourceInfo[] = [];
   for (let i = 0; i < filtered.length; i += 50) {
     const batch = filtered.slice(i, i + 50);
@@ -181,6 +215,11 @@ async function collectSources(
       }),
     );
     sources.push(...results);
+  }
+
+  if (searchCache && cacheKey) {
+    searchCache.put(cacheKey, JSON.stringify(sources), { expirationTtl: WIKI_DATA_CACHE_TTL })
+      .catch((e: unknown) => console.error("Wiki sources cache write failed:", e));
   }
 
   return sources;
@@ -431,7 +470,7 @@ const listPagesHandler = async (c: any) => {
     if (cached) return c.json(cached);
   }
 
-  const pages = await collectPages(resolved.storage, commitSha);
+  const pages = await collectPages(resolved.storage, commitSha, searchCache, orgId, resolved.repo.id);
 
   // Apply filters
   let filtered = pages;
@@ -472,7 +511,7 @@ const listPagesHandler = async (c: any) => {
   // Cache
   if (searchCache && cacheKey) {
     c.executionCtx.waitUntil(
-      searchCache.put(cacheKey, JSON.stringify(response), { expirationTtl: 600 }).catch(() => {}),
+      searchCache.put(cacheKey, JSON.stringify(response), { expirationTtl: WIKI_DATA_CACHE_TTL }).catch(() => {}),
     );
   }
 
@@ -544,7 +583,8 @@ const listSourcesHandler = async (c: any) => {
   const commitSha = await resolveRef(resolved.storage, ref);
   if (!commitSha) return c.json({ error: `Ref not found: ${ref}` }, 404);
 
-  const sources = await collectSources(resolved.storage, commitSha);
+  const searchCache = c.env.SEARCH_CACHE as KVNamespace | undefined;
+  const sources = await collectSources(resolved.storage, commitSha, searchCache, orgId, resolved.repo.id);
 
   const limit = Math.min(parseInt(c.req.query("limit") || "50", 10), 200);
   const offset = parseInt(c.req.query("offset") || "0", 10);
@@ -697,10 +737,10 @@ const llmsTxtHandler = async (c: any) => {
     }
   }
 
-  // Build llms.txt
+  // Build llms.txt (searchCache already declared above for response caching)
   const [pages, sources, config] = await Promise.all([
-    collectPages(resolved.storage, commitSha),
-    collectSources(resolved.storage, commitSha),
+    collectPages(resolved.storage, commitSha, searchCache, orgId, resolved.repo.id),
+    collectSources(resolved.storage, commitSha, searchCache, orgId, resolved.repo.id),
     readWikiConfig(resolved.storage, commitSha),
   ]);
 
@@ -714,7 +754,7 @@ const llmsTxtHandler = async (c: any) => {
   // Cache
   if (searchCache && cacheKey) {
     c.executionCtx.waitUntil(
-      searchCache.put(cacheKey, text, { expirationTtl: 600 }).catch(() => {}),
+      searchCache.put(cacheKey, text, { expirationTtl: WIKI_DATA_CACHE_TTL }).catch(() => {}),
     );
   }
 
@@ -924,15 +964,15 @@ const graphHandler = async (c: any) => {
   }
 
   const [pages, sources] = await Promise.all([
-    collectPages(resolved.storage, commitSha),
-    collectSources(resolved.storage, commitSha),
+    collectPages(resolved.storage, commitSha, searchCache, orgId, resolved.repo.id),
+    collectSources(resolved.storage, commitSha, searchCache, orgId, resolved.repo.id),
   ]);
 
   const graph = buildKnowledgeGraph(pages, sources);
 
   if (searchCache && cacheKey) {
     c.executionCtx.waitUntil(
-      searchCache.put(cacheKey, JSON.stringify(graph), { expirationTtl: 600 }).catch(() => {}),
+      searchCache.put(cacheKey, JSON.stringify(graph), { expirationTtl: WIKI_DATA_CACHE_TTL }).catch(() => {}),
     );
   }
 
@@ -958,9 +998,17 @@ const statsHandler = async (c: any) => {
   const commitSha = await resolveRef(resolved.storage, ref);
   if (!commitSha) return c.json({ error: `Ref not found: ${ref}` }, 404);
 
+  // Check stats cache
+  const searchCache = c.env.SEARCH_CACHE as KVNamespace | undefined;
+  const statsCacheKey = searchCache ? `wiki-stats:${orgId}/${resolved.repo.id}:${commitSha}` : null;
+  if (searchCache && statsCacheKey) {
+    const cached = await searchCache.get(statsCacheKey, "json");
+    if (cached) return c.json(cached);
+  }
+
   const [pages, sources] = await Promise.all([
-    collectPages(resolved.storage, commitSha),
-    collectSources(resolved.storage, commitSha),
+    collectPages(resolved.storage, commitSha, searchCache, orgId, resolved.repo.id),
+    collectSources(resolved.storage, commitSha, searchCache, orgId, resolved.repo.id),
   ]);
 
   const graph = buildKnowledgeGraph(pages, sources);
@@ -985,7 +1033,7 @@ const statsHandler = async (c: any) => {
     }
   }
 
-  return c.json({
+  const statsResponse = {
     pages: pages.length,
     sources: sources.length,
     links: graph.stats.links,
@@ -996,7 +1044,16 @@ const statsHandler = async (c: any) => {
     tags: Object.keys(graph.tag_clusters).length,
     last_activity: lastActivity,
     ref,
-  });
+  };
+
+  // Cache stats response
+  if (searchCache && statsCacheKey) {
+    c.executionCtx.waitUntil(
+      searchCache.put(statsCacheKey, JSON.stringify(statsResponse), { expirationTtl: WIKI_DATA_CACHE_TTL }).catch(() => {}),
+    );
+  }
+
+  return c.json(statsResponse);
 };
 
 // ═══════════════════════════════════════════
