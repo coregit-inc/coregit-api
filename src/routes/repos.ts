@@ -12,7 +12,7 @@ import { Hono } from "hono";
 import { nanoid } from "nanoid";
 import { eq, and, or, isNull, sql, desc } from "drizzle-orm";
 import { apiKeyAuth } from "../auth/middleware";
-import { repo, organization } from "../db/schema";
+import { repo } from "../db/schema";
 import { GitR2Storage } from "../git/storage";
 import { createTree, createCommit, hashGitObject, parseGitObject, parseCommit } from "../git/objects";
 import { recordUsage } from "../services/usage";
@@ -20,7 +20,7 @@ import { recordAudit } from "../services/audit";
 import { deleteNamespace } from "../services/pinecone";
 import { checkFreeLimits } from "../services/limits";
 import { isMasterKey, hasRepoAccess, getAccessibleRepoKeys } from "../auth/scopes";
-import { resolveRepo, buildGitUrl, buildApiUrl, invalidateRepoCache } from "../services/repo-resolver";
+import { resolveRepo, buildGitUrl, buildApiUrl, invalidateRepoCache, getOrgSlug } from "../services/repo-resolver";
 import { extractRepoParams, validateNamespace } from "./helpers";
 import type { Env, Variables } from "../types";
 
@@ -145,13 +145,7 @@ repos.post("/", apiKeyAuth, async (c) => {
       metadata: { slug, namespace: ns }, requestId: c.get("requestId"),
     });
 
-    // Look up org slug for git_url
-    const [org] = await db
-      .select({ slug: organization.slug })
-      .from(organization)
-      .where(eq(organization.id, orgId))
-      .limit(1);
-    const orgSlug = org?.slug || orgId;
+    const orgSlug = await getOrgSlug(db, orgId);
 
     return c.json(
       {
@@ -316,12 +310,7 @@ const getRepoHandler = async (c: any) => {
       }
     }
 
-    const [org] = await db
-      .select({ slug: organization.slug })
-      .from(organization)
-      .where(eq(organization.id, orgId))
-      .limit(1);
-    const orgSlug = org?.slug || orgId;
+    const orgSlug = await getOrgSlug(db, orgId);
 
     return c.json({
       id: found.id,

@@ -24,7 +24,7 @@ import { hasRepoAccess, isMasterKey } from "../auth/scopes";
 import { repo, organization, semanticIndex, codeGraphIndex } from "../db/schema";
 import { GitR2Storage } from "../git/storage";
 import { parseGitObject, parseTree, type TreeEntry } from "../git/objects";
-import { resolveRepo, buildGitUrl, buildApiUrl } from "../services/repo-resolver";
+import { resolveRepo, buildGitUrl, buildApiUrl, getOrgSlug } from "../services/repo-resolver";
 import { copyGraphForFork } from "../services/fork-graph";
 import { recordUsage } from "../services/usage";
 import { recordAudit } from "../services/audit";
@@ -154,9 +154,9 @@ async function collectPages(
   const files = await listFilesUnderPath(storage, commitSha, "wiki", ".md");
   const pages: PageSummary[] = [];
 
-  // Read blobs in parallel (batch of 50)
-  for (let i = 0; i < files.length; i += 50) {
-    const batch = files.slice(i, i + 50);
+  // Read blobs in parallel (batch of 200)
+  for (let i = 0; i < files.length; i += 200) {
+    const batch = files.slice(i, i + 200);
     const results = await Promise.all(
       batch.map(async (f) => {
         const content = await readBlob(storage, f.sha);
@@ -206,8 +206,8 @@ async function collectSources(
   const filtered = files.filter((f) => f.name !== ".gitkeep");
 
   const sources: SourceInfo[] = [];
-  for (let i = 0; i < filtered.length; i += 50) {
-    const batch = filtered.slice(i, i + 50);
+  for (let i = 0; i < filtered.length; i += 200) {
+    const batch = filtered.slice(i, i + 200);
     const results = await Promise.all(
       batch.map(async (f) => {
         const size = await getBlobSize(storage, f.sha);
@@ -406,13 +406,7 @@ const initHandler = async (c: any) => {
       requestId: c.get("requestId"),
     });
 
-    // Look up org slug for git URL
-    const [org] = await db
-      .select({ slug: organization.slug })
-      .from(organization)
-      .where(eq(organization.id, orgId))
-      .limit(1);
-    const orgSlug = org?.slug || orgId;
+    const orgSlug = await getOrgSlug(db, orgId);
 
     return c.json({
       id: newRepo.id,

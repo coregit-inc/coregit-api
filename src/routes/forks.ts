@@ -10,9 +10,9 @@ import { nanoid } from "nanoid";
 import { eq, and } from "drizzle-orm";
 import { apiKeyAuth } from "../auth/middleware";
 import { hasRepoAccess, isMasterKey } from "../auth/scopes";
-import { repo, organization, semanticIndex, codeGraphIndex } from "../db/schema";
+import { repo, semanticIndex, codeGraphIndex } from "../db/schema";
 import { GitR2Storage } from "../git/storage";
-import { resolveRepo, buildGitUrl, buildApiUrl } from "../services/repo-resolver";
+import { resolveRepo, buildGitUrl, buildApiUrl, getOrgSlug } from "../services/repo-resolver";
 import { copyGraphForFork } from "../services/fork-graph";
 import { recordUsage } from "../services/usage";
 import { recordAudit } from "../services/audit";
@@ -210,13 +210,7 @@ const forkHandler = async (c: any) => {
       requestId: c.get("requestId"),
     });
 
-    // Look up org slug for git_url
-    const [org] = await db
-      .select({ slug: organization.slug })
-      .from(organization)
-      .where(eq(organization.id, orgId))
-      .limit(1);
-    const orgSlug = org?.slug || orgId;
+    const orgSlug = await getOrgSlug(db, orgId);
 
     return c.json(
       {

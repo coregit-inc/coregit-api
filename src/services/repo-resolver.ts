@@ -7,7 +7,7 @@
  */
 
 import { eq, and, isNull } from "drizzle-orm";
-import { repo } from "../db/schema";
+import { repo, organization } from "../db/schema";
 import { GitR2Storage } from "../git/storage";
 import type { Database } from "../db";
 import type { Repo } from "../db/schema";
@@ -104,6 +104,38 @@ export async function invalidateRepoCache(
 ): Promise<void> {
   if (!authCache) return;
   await authCache.delete(repoCacheKey(orgId, slug, namespace)).catch(() => {});
+}
+
+const ORG_SLUG_CACHE_TTL = 300; // 5 minutes — org slugs never change
+
+/**
+ * Look up an organization's slug by ID.
+ * Uses AUTH_CACHE (key: orgslug:{orgId}, TTL 300s) when available.
+ * Falls back to orgId if the org record is missing.
+ */
+export async function getOrgSlug(db: Database, orgId: string): Promise<string> {
+  const authCache = _authCacheRef;
+  const cacheKey = `orgslug:${orgId}`;
+
+  if (authCache) {
+    const cached = await authCache.get(cacheKey, "text");
+    if (cached) return cached;
+  }
+
+  const [org] = await db
+    .select({ slug: organization.slug })
+    .from(organization)
+    .where(eq(organization.id, orgId))
+    .limit(1);
+
+  const slug = org?.slug || orgId;
+
+  if (authCache) {
+    authCache.put(cacheKey, slug, { expirationTtl: ORG_SLUG_CACHE_TTL })
+      .catch((e) => console.error("Org slug cache write failed:", e));
+  }
+
+  return slug;
 }
 
 /**

@@ -24,6 +24,8 @@ import type { Env, Variables } from "../types";
 
 const commits = new Hono<{ Bindings: Env; Variables: Variables }>();
 
+const COMMIT_LIST_CACHE_TTL = 600; // 10 min — commit SHAs are immutable
+
 export function parseAuthorString(author: string): { name: string; email: string; timestamp: number } {
   const match = author.match(/^(.+?)\s+<([^>]+)>\s+(\d+)/);
   if (match) {
@@ -230,6 +232,19 @@ const listCommitsHandler = async (c: any) => {
   }
 
   try {
+    // KV cache: keyed by immutable commitSha + limit
+    const searchCache = c.env.SEARCH_CACHE as KVNamespace | undefined;
+    const cacheKey = searchCache
+      ? `commits:${orgId}/${found.id}:${commitSha}:${limit}`
+      : null;
+
+    if (searchCache && cacheKey) {
+      const cached = await searchCache.get(cacheKey, "json");
+      if (cached) {
+        return c.json(cached, 200, { "X-Cache": "HIT" });
+      }
+    }
+
     const commitList: { sha: string; message: string; author_name: string; author_email: string; timestamp: number; parents: string[] }[] = [];
     let currentSha: string | null = commitSha;
 
@@ -256,12 +271,21 @@ const listCommitsHandler = async (c: any) => {
     const hasMore = currentSha !== null && commitList.length >= limit;
     const nextCursor = hasMore ? commitList[commitList.length - 1].sha : null;
 
-    return c.json({
+    const response = {
       commits: commitList,
       ref: branchName,
       has_more: hasMore,
       next_cursor: nextCursor,
-    });
+    };
+
+    // Fire-and-forget cache write
+    if (searchCache && cacheKey) {
+      c.executionCtx.waitUntil(
+        searchCache.put(cacheKey, JSON.stringify(response), { expirationTtl: COMMIT_LIST_CACHE_TTL }).catch(() => {}),
+      );
+    }
+
+    return c.json(response, 200, { "X-Cache": "MISS" });
   } catch (error) {
     console.error("Failed to list commits:", error);
     return c.json({ error: "Failed to list commits" }, 500);
