@@ -5,6 +5,9 @@
  *
  * P0.4: Uses embedding cache (KV) to avoid redundant Voyage API calls.
  * P1.1: Chunk ID format v2 — `{blobSha}:v2:{chunkIndex}` (contextual prefix).
+ *
+ * TODO: Replace Pinecone with Turbopuffer at scale (100K+ repos).
+ * See pinecone.ts header comment for rationale.
  */
 
 import { eq, and, sql } from "drizzle-orm";

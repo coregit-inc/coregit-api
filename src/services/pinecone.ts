@@ -1,6 +1,12 @@
 /**
  * Pinecone REST API client for vector operations.
  * Pure fetch() — no SDK dependency.
+ *
+ * TODO: Replace Pinecone with Turbopuffer at scale (100K+ repos).
+ * Pinecone Serverless limits 100K namespaces/index — one namespace per repo
+ * hits this wall at 100K repos. Turbopuffer has no namespace limit (Notion
+ * runs 10B+ vectors on it), S3-native storage ($0.02/GB vs $0.33/GB).
+ * See turbopuffer.com — API is similar, migration is straightforward.
  */
 
 const UPSERT_BATCH_SIZE = 100;

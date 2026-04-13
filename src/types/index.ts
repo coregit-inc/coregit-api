@@ -28,6 +28,10 @@ export interface Env {
   // Code graph
   GRAPH_CACHE?: KVNamespace;
   HYBRID_CACHE?: KVNamespace;
+  // Rate limiting
+  RATE_LIMITER: DurableObjectNamespace;
+  // Hyperdrive (Neon connection pooling)
+  HYPERDRIVE: Hyperdrive;
 }
 
 export interface Variables {

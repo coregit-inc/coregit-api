@@ -21,6 +21,12 @@ CORS_ORIGIN = "https://coregit.dev"
 [placement]
 mode = "smart"
 
+# ── Hyperdrive (Neon PostgreSQL connection pooling + query cache) ──
+
+[[hyperdrive]]
+binding = "HYPERDRIVE"
+id = "96f53f0e51e34fa1affe045c62e2f907"
+
 [limits]
 cpu_ms = 30_000
 
@@ -73,6 +79,17 @@ max_batch_timeout = 10
 max_retries = 3
 dead_letter_queue = "coregit-indexing-dlq"
 max_concurrency = 1
+
+# ── Durable Objects ──
+
+[durable_objects]
+bindings = [
+  { name = "RATE_LIMITER", class_name = "RateLimiterDO" }
+]
+
+[[migrations]]
+tag = "v1"
+new_classes = ["RateLimiterDO"]
 
 # Secrets (set via wrangler secret put):
 # DATABASE_URL           — Neon PostgreSQL (separate project from Strayl)

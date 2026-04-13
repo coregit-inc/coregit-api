@@ -76,6 +76,9 @@ import {
 } from "./services/graph-index";
 import type { Env, Variables } from "./types";
 
+// Durable Objects must be exported from the entry point
+export { RateLimiterDO } from "./durable-objects/rate-limiter";
+
 const app = new Hono<{ Bindings: Env; Variables: Variables }>();
 
 // ── Request ID + Security headers ──
@@ -116,8 +119,8 @@ app.use("*", async (c, next) => {
     if (cached.status !== "active") {
       return c.text("Domain is not active", 403);
     }
-    if (!c.env.DATABASE_URL) return c.text("Database not configured", 500);
-    const db = createDb(c.env.DATABASE_URL);
+    if (!(c.env.HYPERDRIVE?.connectionString || c.env.DATABASE_URL)) return c.text("Database not configured", 500);
+    const db = createDb((c.env.HYPERDRIVE?.connectionString || c.env.DATABASE_URL));
     c.set("db", db);
     c.set("orgId", cached.orgId);
     c.set("customDomain", host);
@@ -127,8 +130,8 @@ app.use("*", async (c, next) => {
     return next();
   }
 
-  if (!c.env.DATABASE_URL) return c.text("Database not configured", 500);
-  const db = createDb(c.env.DATABASE_URL);
+  if (!(c.env.HYPERDRIVE?.connectionString || c.env.DATABASE_URL)) return c.text("Database not configured", 500);
+  const db = createDb((c.env.HYPERDRIVE?.connectionString || c.env.DATABASE_URL));
   c.set("db", db);
 
   const result = await db.execute(
@@ -212,11 +215,11 @@ app.get("/", (c) => {
 });
 
 app.get("/health", async (c) => {
-  if (!c.env.DATABASE_URL) {
+  if (!(c.env.HYPERDRIVE?.connectionString || c.env.DATABASE_URL)) {
     return c.json({ status: "degraded", db: "not_configured" }, 503);
   }
   try {
-    const db = createDb(c.env.DATABASE_URL);
+    const db = createDb((c.env.HYPERDRIVE?.connectionString || c.env.DATABASE_URL));
     await db.execute(sql`SELECT 1`);
     return c.json({ status: "ok", db: "ok" });
   } catch {
@@ -229,8 +232,9 @@ app.get("/health", async (c) => {
 app.use("/v1/*", async (c, next) => {
   // DB may already be set by custom domain middleware
   if (!c.get("db")) {
-    if (!c.env.DATABASE_URL) return c.json({ error: "Database not configured" }, 500);
-    c.set("db", createDb(c.env.DATABASE_URL));
+    const connStr = c.env.HYPERDRIVE?.connectionString || c.env.DATABASE_URL;
+    if (!connStr) return c.json({ error: "Database not configured" }, 500);
+    c.set("db", createDb(connStr));
   }
   // Set repo cache ref so resolveRepo() can use KV cache without changing call sites
   setRepoCacheRef(c.env.AUTH_CACHE as KVNamespace | undefined);
@@ -248,8 +252,8 @@ app.use("/:org/:repo/*", async (c, next) => {
     return next();
   }
   if (!c.get("db")) {
-    if (!c.env.DATABASE_URL) return c.text("Database not configured", 500);
-    c.set("db", createDb(c.env.DATABASE_URL));
+    if (!(c.env.HYPERDRIVE?.connectionString || c.env.DATABASE_URL)) return c.text("Database not configured", 500);
+    c.set("db", createDb((c.env.HYPERDRIVE?.connectionString || c.env.DATABASE_URL)));
   }
   await next();
 });
@@ -261,8 +265,8 @@ app.use("/:org/:namespace/:repo/*", async (c, next) => {
   const repoParam = c.req.param("repo");
   if (!repoParam?.endsWith(".git") && !repoParam?.includes(".git/")) return next();
   if (!c.get("db")) {
-    if (!c.env.DATABASE_URL) return c.text("Database not configured", 500);
-    c.set("db", createDb(c.env.DATABASE_URL));
+    if (!(c.env.HYPERDRIVE?.connectionString || c.env.DATABASE_URL)) return c.text("Database not configured", 500);
+    c.set("db", createDb((c.env.HYPERDRIVE?.connectionString || c.env.DATABASE_URL)));
   }
   await next();
 });
@@ -339,7 +343,7 @@ export default {
   fetch: app.fetch,
 
   async queue(batch: MessageBatch<IndexingMessage | GraphIndexingMessage>, env: Env, ctx: ExecutionContext) {
-    const db = createDb(env.DATABASE_URL);
+    const db = createDb(env.HYPERDRIVE?.connectionString || env.DATABASE_URL);
     for (const message of batch.messages) {
       try {
         const { type } = message.body;

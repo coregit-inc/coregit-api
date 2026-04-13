@@ -110,15 +110,16 @@ async function authenticateCDGit(c: any, requireAuth: boolean): Promise<CDGitAut
 
 // ── Rate limiting ──
 
-function checkCDGitRateLimit(c: any, auth: CDGitAuth): Response | null {
+async function checkCDGitRateLimit(c: any, auth: CDGitAuth): Promise<Response | null> {
+  const rateLimiter = c.env.RATE_LIMITER as DurableObjectNamespace;
   if (auth.tokenId) {
-    const rl = checkRateLimit(auth.tokenId);
+    const rl = await checkRateLimit(rateLimiter, auth.tokenId);
     if (!rl.allowed) return c.text("rate limit exceeded", 429, rateLimitHeaders(rl));
-    const orgRl = checkOrgRateLimit(auth.orgId);
+    const orgRl = await checkOrgRateLimit(rateLimiter, auth.orgId);
     if (!orgRl.allowed) return c.text("organization rate limit exceeded", 429, orgRateLimitHeaders(orgRl));
   } else {
     const ip = c.req.header("CF-Connecting-IP") || c.req.header("X-Forwarded-For")?.split(",")[0]?.trim() || "unknown";
-    const ipRl = checkIpRateLimit(ip);
+    const ipRl = await checkIpRateLimit(rateLimiter, ip);
     if (!ipRl.allowed) return c.text("rate limit exceeded", 429, ipRateLimitHeaders(ipRl));
   }
   return null;
@@ -138,7 +139,7 @@ const cdInfoRefsHandler = async (c: any, next: any) => {
   const auth = await authenticateCDGit(c, service === "git-receive-pack");
   if (auth instanceof Response) return auth;
 
-  const rlResponse = checkCDGitRateLimit(c, auth);
+  const rlResponse = await checkCDGitRateLimit(c, auth);
   if (rlResponse) return rlResponse;
 
   const { storage, defaultBranch } = auth;
@@ -181,7 +182,7 @@ const cdUploadPackHandler = async (c: any, next: any) => {
   const auth = await authenticateCDGit(c, false);
   if (auth instanceof Response) return auth;
 
-  const rlResponse = checkCDGitRateLimit(c, auth);
+  const rlResponse = await checkCDGitRateLimit(c, auth);
   if (rlResponse) return rlResponse;
 
   const { orgId, storage } = auth;
@@ -310,7 +311,7 @@ const cdReceivePackHandler = async (c: any, next: any) => {
   const auth = await authenticateCDGit(c, true);
   if (auth instanceof Response) return auth;
 
-  const rlResponse = checkCDGitRateLimit(c, auth);
+  const rlResponse = await checkCDGitRateLimit(c, auth);
   if (rlResponse) return rlResponse;
 
   const { orgId, storage } = auth;

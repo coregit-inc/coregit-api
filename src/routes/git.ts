@@ -175,15 +175,16 @@ async function authenticateGitReadOnly(c: any): Promise<GitAuthResult | Response
  * Unauthenticated (public) requests use per-IP limits.
  * Returns a 429 Response if rate limited, or null if allowed.
  */
-function checkGitRateLimit(c: any, auth: GitAuthResult): Response | null {
+async function checkGitRateLimit(c: any, auth: GitAuthResult): Promise<Response | null> {
+  const rateLimiter = c.env.RATE_LIMITER as DurableObjectNamespace;
   if (auth.tokenId) {
     // Authenticated: per-key + per-org rate limiting
-    const rl = checkRateLimit(auth.tokenId);
+    const rl = await checkRateLimit(rateLimiter, auth.tokenId);
     if (!rl.allowed) {
       const headers = rateLimitHeaders(rl);
       return c.text("rate limit exceeded", 429, headers);
     }
-    const orgRl = checkOrgRateLimit(auth.orgId);
+    const orgRl = await checkOrgRateLimit(rateLimiter, auth.orgId);
     if (!orgRl.allowed) {
       const headers = orgRateLimitHeaders(orgRl);
       return c.text("organization rate limit exceeded", 429, headers);
@@ -191,7 +192,7 @@ function checkGitRateLimit(c: any, auth: GitAuthResult): Response | null {
   } else {
     // Unauthenticated: per-IP rate limiting
     const ip = c.req.header("CF-Connecting-IP") || c.req.header("X-Forwarded-For")?.split(",")[0]?.trim() || "unknown";
-    const ipRl = checkIpRateLimit(ip);
+    const ipRl = await checkIpRateLimit(rateLimiter, ip);
     if (!ipRl.allowed) {
       const headers = ipRateLimitHeaders(ipRl);
       return c.text("rate limit exceeded", 429, headers);
@@ -358,7 +359,7 @@ const infoRefsHandler = async (c: any) => {
     : await authenticateGit(c);
   if (auth instanceof Response) return auth;
 
-  const rlResponse = checkGitRateLimit(c, auth);
+  const rlResponse = await checkGitRateLimit(c, auth);
   if (rlResponse) return rlResponse;
 
   const { storage, defaultBranch } = auth;
@@ -401,7 +402,7 @@ const uploadPackHandler = async (c: any) => {
   const auth = await authenticateGitReadOnly(c);
   if (auth instanceof Response) return auth;
 
-  const rlResponse = checkGitRateLimit(c, auth);
+  const rlResponse = await checkGitRateLimit(c, auth);
   if (rlResponse) return rlResponse;
 
   const { orgId, storage } = auth;
@@ -539,7 +540,7 @@ const receivePackHandler = async (c: any) => {
   const auth = await authenticateGit(c);
   if (auth instanceof Response) return auth;
 
-  const rlResponse = checkGitRateLimit(c, auth);
+  const rlResponse = await checkGitRateLimit(c, auth);
   if (rlResponse) return rlResponse;
 
   const { orgId, storage } = auth;

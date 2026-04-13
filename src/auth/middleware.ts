@@ -13,7 +13,7 @@ import { sql } from "drizzle-orm";
 import type { Env, Variables } from "../types";
 import { getOrgPlan } from "../services/limits";
 import { recordUsage } from "../services/usage";
-import { checkRateLimit, rateLimitHeaders, checkOrgRateLimit, orgRateLimitHeaders } from "../services/rate-limit";
+import { checkRateLimit, rateLimitHeaders, checkOrgRateLimit, orgRateLimitHeaders, type RateLimitResult } from "../services/rate-limit";
 import type { Scopes } from "./scopes";
 
 const encoder = new TextEncoder();
@@ -194,8 +194,8 @@ export const apiKeyAuth = createMiddleware<{
   c.set("orgTier", auth.tier);
   c.set("dodoCustomerId", auth.dodoCustomerId);
 
-  // ── Per-key rate limiting ──
-  const rl = checkRateLimit(auth.tokenId);
+  // ── Per-key rate limiting (via Durable Object) ──
+  const rl = await checkRateLimit(c.env.RATE_LIMITER, auth.tokenId);
   const rlHeaders = rateLimitHeaders(rl);
   if (!rl.allowed) {
     for (const [k, v] of Object.entries(rlHeaders)) {
@@ -204,8 +204,8 @@ export const apiKeyAuth = createMiddleware<{
     return c.json({ error: "Rate limit exceeded", code: "RATE_LIMITED" }, 429);
   }
 
-  // ── Per-org rate limiting ──
-  const orgRl = checkOrgRateLimit(auth.orgId);
+  // ── Per-org rate limiting (via Durable Object) ──
+  const orgRl = await checkOrgRateLimit(c.env.RATE_LIMITER, auth.orgId);
   const orgRlHeaders = orgRateLimitHeaders(orgRl);
   if (!orgRl.allowed) {
     for (const [k, v] of Object.entries(orgRlHeaders)) {

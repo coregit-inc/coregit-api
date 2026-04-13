@@ -37,7 +37,7 @@ const publicRoutes = new Hono<{ Bindings: Env; Variables: Variables }>();
 
 publicRoutes.use("*", async (c, next) => {
   const ip = c.req.header("CF-Connecting-IP") || c.req.header("X-Forwarded-For")?.split(",")[0]?.trim() || "unknown";
-  const rl = checkIpRateLimit(ip);
+  const rl = await checkIpRateLimit(c.env.RATE_LIMITER, ip);
   if (!rl.allowed) {
     const headers = ipRateLimitHeaders(rl);
     for (const [k, v] of Object.entries(headers)) {

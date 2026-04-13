@@ -193,15 +193,16 @@ async function batchHandler(c: any) {
   const auth = isUpload ? await authLfsWrite(c) : await authLfsRead(c);
   if (auth instanceof Response) return auth;
 
-  // Rate limiting
+  // Rate limiting (via Durable Object)
+  const rateLimiter = c.env.RATE_LIMITER as DurableObjectNamespace;
   if (auth.tokenId) {
-    const rl = checkRateLimit(auth.tokenId);
+    const rl = await checkRateLimit(rateLimiter, auth.tokenId);
     if (!rl.allowed) return lfsError(c, 429, "Rate limit exceeded");
-    const orgRl = checkOrgRateLimit(auth.orgId);
+    const orgRl = await checkOrgRateLimit(rateLimiter, auth.orgId);
     if (!orgRl.allowed) return lfsError(c, 429, "Organization rate limit exceeded");
   } else {
     const ip = c.req.header("CF-Connecting-IP") || c.req.header("X-Forwarded-For")?.split(",")[0]?.trim() || "unknown";
-    const ipRl = checkIpRateLimit(ip);
+    const ipRl = await checkIpRateLimit(rateLimiter, ip);
     if (!ipRl.allowed) return lfsError(c, 429, "Rate limit exceeded");
   }
 
@@ -354,11 +355,12 @@ async function verifyHandler(c: any) {
   const auth = await authLfsWrite(c);
   if (auth instanceof Response) return auth;
 
-  // Rate limiting (verify is always authenticated)
+  // Rate limiting (verify is always authenticated, via Durable Object)
+  const rateLimiterVerify = c.env.RATE_LIMITER as DurableObjectNamespace;
   if (auth.tokenId) {
-    const rl = checkRateLimit(auth.tokenId);
+    const rl = await checkRateLimit(rateLimiterVerify, auth.tokenId);
     if (!rl.allowed) return lfsError(c, 429, "Rate limit exceeded");
-    const orgRl = checkOrgRateLimit(auth.orgId);
+    const orgRl = await checkOrgRateLimit(rateLimiterVerify, auth.orgId);
     if (!orgRl.allowed) return lfsError(c, 429, "Organization rate limit exceeded");
   }
 

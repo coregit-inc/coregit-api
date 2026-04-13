@@ -178,7 +178,7 @@ syncWebhooks.post("/sync-webhooks/github", async (c) => {
   try {
     // IP rate limiting
     const ip = c.req.header("CF-Connecting-IP") || c.req.header("X-Forwarded-For")?.split(",")[0]?.trim() || "unknown";
-    const ipRl = checkIpRateLimit(ip);
+    const ipRl = await checkIpRateLimit(c.env.RATE_LIMITER, ip);
     if (!ipRl.allowed) {
       const headers = ipRateLimitHeaders(ipRl);
       return c.json({ error: "Rate limit exceeded" }, 429, headers);
@@ -208,7 +208,7 @@ syncWebhooks.post("/sync-webhooks/github", async (c) => {
     }
 
     // Find matching sync configs — DB already set by /v1/* middleware
-    const db = c.get("db") || createDb(c.env.DATABASE_URL);
+    const db = c.get("db") || createDb(c.env.HYPERDRIVE?.connectionString || c.env.DATABASE_URL);
 
     const syncConfigs = await db
       .select()
@@ -266,7 +266,7 @@ syncWebhooks.post("/sync-webhooks/gitlab", async (c) => {
   try {
     // IP rate limiting
     const ip = c.req.header("CF-Connecting-IP") || c.req.header("X-Forwarded-For")?.split(",")[0]?.trim() || "unknown";
-    const ipRl = checkIpRateLimit(ip);
+    const ipRl = await checkIpRateLimit(c.env.RATE_LIMITER, ip);
     if (!ipRl.allowed) {
       const headers = ipRateLimitHeaders(ipRl);
       return c.json({ error: "Rate limit exceeded" }, 429, headers);
@@ -294,7 +294,7 @@ syncWebhooks.post("/sync-webhooks/gitlab", async (c) => {
       return c.json({ error: "Missing project.path_with_namespace" }, 400);
     }
 
-    const db = c.get("db") || createDb(c.env.DATABASE_URL);
+    const db = c.get("db") || createDb(c.env.HYPERDRIVE?.connectionString || c.env.DATABASE_URL);
 
     const syncConfigs = await db
       .select()
