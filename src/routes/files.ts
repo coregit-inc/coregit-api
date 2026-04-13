@@ -14,6 +14,7 @@ import { extractRepoParams } from "./helpers";
 import { repo } from "../db/schema";
 import { GitR2Storage } from "../git/storage";
 import { parseGitObject, parseTree, parseCommit, type TreeEntry } from "../git/objects";
+import { getTreeBlobShas } from "../services/tree-resolver";
 import type { Env, Variables } from "../types";
 
 const files = new Hono<{ Bindings: Env; Variables: Variables }>();
@@ -268,6 +269,13 @@ files.get("/:slug/tree/*", apiKeyAuth, treeHandler);
 files.get("/:namespace/:slug/tree/*", apiKeyAuth, treeHandler);
 
 // GET /v1/repos/:slug/blob/*
+//
+// Optimized read path:
+// 1. Resolve ref → commitSha (1 R2 read)
+// 2. getTreeBlobShas() — KV cached flat tree (0 R2 reads on cache hit)
+// 3. Lookup file path in flat map → get blobSha (in-memory)
+// 4. getObject(blobSha) — 1 R2 read
+// Total: 2 R2 reads (was 5-8 with tree navigation)
 const blobHandler = async (c: any) => {
   const orgId = c.get("orgId");
   const db = c.get("db");
@@ -286,7 +294,6 @@ const blobHandler = async (c: any) => {
   const storage = resolved.storage;
 
   const url = new URL(c.req.url);
-  // Build the prefix dynamically based on namespace
   const repoPath = namespace ? `${namespace}/${slug}` : slug;
   const blobPrefix = `/v1/repos/${repoPath}/blob/`;
   const refAndPath = decodeURIComponent(url.pathname.slice(url.pathname.indexOf(blobPrefix) + blobPrefix.length));
@@ -299,40 +306,34 @@ const blobHandler = async (c: any) => {
   if (!pathStr) return c.json({ error: "File path is required" }, 400);
 
   try {
+    // 1. Resolve ref → commitSha (1 R2 read)
     const commitSha = await resolveRef(storage, ref);
     if (!commitSha) return c.json({ error: "Ref not found" }, 404);
 
-    const rootTreeSha = await getTreeFromCommit(storage, commitSha);
-    if (!rootTreeSha) return c.json({ error: "Invalid commit" }, 500);
+    // 2. Get flat tree from KV cache (0 R2 reads on hit, flattens on miss)
+    // Returns Map<blobSha, filePath> — skips all tree navigation
+    const treeBlobMap = await getTreeBlobShas(storage, commitSha, c.env.TREE_CACHE);
 
-    // Navigate to parent directory
-    const dirParts = pathParts.slice(0, -1);
-    const fileName = pathParts[pathParts.length - 1];
-
-    let treeEntries: TreeEntry[];
-    if (dirParts.length === 0) {
-      const raw = await storage.getObject(rootTreeSha);
-      if (!raw) return c.json({ error: "Tree not found" }, 500);
-      const obj = parseGitObject(raw);
-      treeEntries = parseTree(obj.content);
-    } else {
-      const treeResult = await navigateToPath(storage, rootTreeSha, dirParts);
-      if (!treeResult) return c.json({ error: "Directory not found" }, 404);
-      treeEntries = treeResult.entries;
+    // 3. Find file by path (in-memory lookup, no R2)
+    let fileSha: string | null = null;
+    for (const [sha, path] of treeBlobMap) {
+      if (path === pathStr) {
+        fileSha = sha;
+        break;
+      }
     }
 
-    const fileEntry = treeEntries.find((e) => e.name === fileName);
-    if (!fileEntry) return c.json({ error: "File not found" }, 404);
-    if (fileEntry.mode === "40000") return c.json({ error: "Path is a directory" }, 400);
+    if (!fileSha) return c.json({ error: "File not found" }, 404);
 
     // ETag: git objects are immutable by SHA — cache forever
     const ifNoneMatch = c.req.header("If-None-Match");
-    if (ifNoneMatch === `"${fileEntry.sha}"`) {
+    if (ifNoneMatch === `"${fileSha}"`) {
       return new Response(null, { status: 304 });
     }
 
-    const MAX_BLOB_SIZE = 50 * 1024 * 1024; // 50 MB
-    const blobData = await storage.getObject(fileEntry.sha);
+    // 4. Read blob (1 R2 read)
+    const MAX_BLOB_SIZE = 50 * 1024 * 1024;
+    const blobData = await storage.getObject(fileSha);
     if (!blobData) return c.json({ error: "Blob not found" }, 500);
     if (blobData.byteLength > MAX_BLOB_SIZE) {
       return c.json({ error: "File exceeds 50 MB size limit", size: blobData.byteLength }, 400);
@@ -346,7 +347,6 @@ const blobHandler = async (c: any) => {
     let encoding: "utf-8" | "base64";
 
     if (binary) {
-      // Chunk-based base64 to avoid stack overflow on large binary files
       const chunkSize = 8192;
       let binaryStr = '';
       for (let i = 0; i < parsed.content.length; i += chunkSize) {
@@ -364,10 +364,10 @@ const blobHandler = async (c: any) => {
       content,
       encoding,
       path: pathStr,
-      sha: fileEntry.sha,
+      sha: fileSha,
       size: parsed.content.length,
     }, 200, {
-      "ETag": `"${fileEntry.sha}"`,
+      "ETag": `"${fileSha}"`,
       "Cache-Control": "public, max-age=31536000, s-maxage=31536000, immutable",
     });
   } catch (error) {
