@@ -32,6 +32,8 @@ export interface Env {
   RATE_LIMITER: DurableObjectNamespace;
   // Sessions (Zero-Wait Protocol)
   SESSION_DO: DurableObjectNamespace;
+  // Per-repo hot layer (Level 1: automatic for all)
+  REPO_HOT_DO: DurableObjectNamespace;
   // Hyperdrive (Neon connection pooling)
   HYPERDRIVE: Hyperdrive;
 }

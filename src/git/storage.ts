@@ -42,8 +42,10 @@ export class GitR2Storage {
   private _packIndices: PackIndex[] | null = null;
   /** Edge cache for immutable git objects (Cache API, per-colo, <5ms) */
   private _edgeCache: Cache | undefined;
-  /** Session stub for Zero-Wait hot layer reads/writes */
+  /** Session stub for Zero-Wait hot layer reads/writes (Level 2) */
   private _sessionStub: DurableObjectStub | undefined;
+  /** Per-repo hot layer DO stub (Level 1: automatic for all) */
+  private _repoDOStub: DurableObjectStub | undefined;
   /** Base URL for edge cache keys */
   private static readonly CACHE_BASE = "https://cache.coregit.internal";
 
@@ -60,6 +62,15 @@ export class GitR2Storage {
 
   setSessionStub(stub: DurableObjectStub | undefined) {
     this._sessionStub = stub;
+  }
+
+  setRepoDOStub(stub: DurableObjectStub, _basePath: string) {
+    this._repoDOStub = stub;
+  }
+
+  /** Get the active hot layer stub — session (Level 2) takes priority over repo DO (Level 1) */
+  private get _hotStub(): DurableObjectStub | undefined {
+    return this._sessionStub || this._repoDOStub;
   }
 
   // ============ Object Operations ============
@@ -85,11 +96,13 @@ export class GitR2Storage {
       }
     }
 
-    // 3. Session hot layer (read-your-own-writes, ~2ms)
-    if (this._sessionStub) {
-      const hotRes = await this._sessionStub.fetch(
-        `https://session/get-object?sha=${sha}&repoKey=${encodeURIComponent(this.basePath)}`
-      );
+    // 3. Hot layer — RepoDO (Level 1, all requests) or SessionDO (Level 2)
+    const hotStub = this._hotStub;
+    if (hotStub) {
+      const hotUrl = this._sessionStub
+        ? `https://session/get-object?sha=${sha}&repoKey=${encodeURIComponent(this.basePath)}`
+        : `https://repo-hot/get-object?sha=${sha}`;
+      const hotRes = await hotStub.fetch(hotUrl);
       if (hotRes.ok) {
         const compressed = new Uint8Array(await hotRes.arrayBuffer());
         const result = this._decompressAndCache(sha, compressed);
@@ -247,14 +260,18 @@ export class GitR2Storage {
     const fullObject = createGitObjectRaw(type, content);
     const compressed = zlibSync(fullObject);
 
-    if (this._sessionStub) {
-      // Session hot layer — DO storage (~2ms), flushed to R2 on session close
-      await this._sessionStub.fetch(
-        `https://session/put-object?sha=${sha}&repoKey=${encodeURIComponent(this.basePath)}`,
-        { method: "POST", body: compressed }
-      );
-      this._addToCache(sha, fullObject);
-      return;
+    // Hot layer — RepoDO (Level 1) or SessionDO (Level 2). ~2ms vs R2 200-500ms.
+    const hotStub = this._hotStub;
+    if (hotStub) {
+      const hotUrl = this._sessionStub
+        ? `https://session/put-object?sha=${sha}&repoKey=${encodeURIComponent(this.basePath)}`
+        : `https://repo-hot/put-object?sha=${sha}&basePath=${encodeURIComponent(this.basePath)}`;
+      const res = await hotStub.fetch(hotUrl, { method: "POST", body: compressed });
+      if (res.status === 202) {
+        this._addToCache(sha, fullObject);
+        return;
+      }
+      // 507 = DO full, fall through to R2
     }
 
     // Cold path — direct R2 write
@@ -457,11 +474,13 @@ export class GitR2Storage {
    * Returns the SHA it points to or null if not found
    */
   async getRef(name: string): Promise<string | null> {
-    // Session hot layer first (pending ref updates)
-    if (this._sessionStub) {
-      const res = await this._sessionStub.fetch(
-        `https://session/get-ref?repoKey=${encodeURIComponent(this.basePath)}&refName=${encodeURIComponent(name)}`
-      );
+    // Hot layer first (pending ref updates)
+    const hotStub = this._hotStub;
+    if (hotStub) {
+      const hotUrl = this._sessionStub
+        ? `https://session/get-ref?repoKey=${encodeURIComponent(this.basePath)}&refName=${encodeURIComponent(name)}`
+        : `https://repo-hot/get-ref?refName=${encodeURIComponent(name)}`;
+      const res = await hotStub.fetch(hotUrl);
       if (res.ok) {
         const { sha } = (await res.json()) as { sha: string };
         return sha;
@@ -479,12 +498,15 @@ export class GitR2Storage {
    * Set a reference to point to a SHA
    */
   async setRef(name: string, sha: string): Promise<void> {
-    if (this._sessionStub) {
-      // Session hot layer — deferred write, flushed on session close
-      await this._sessionStub.fetch("https://session/put-ref", {
-        method: "POST",
-        body: JSON.stringify({ repoKey: this.basePath, refName: name, sha }),
-      });
+    const hotStub = this._hotStub;
+    if (hotStub) {
+      const hotUrl = this._sessionStub
+        ? "https://session/put-ref"
+        : "https://repo-hot/put-ref";
+      const body = this._sessionStub
+        ? JSON.stringify({ repoKey: this.basePath, refName: name, sha })
+        : JSON.stringify({ refName: name, sha });
+      await hotStub.fetch(hotUrl, { method: "POST", body });
       return;
     }
 

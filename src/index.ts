@@ -62,7 +62,7 @@ import { hybridSearchRoutes } from "./routes/hybrid-search";
 import { forks } from "./routes/forks";
 import { wiki } from "./routes/wiki";
 import { session } from "./routes/session";
-import { setRepoCacheRef } from "./services/repo-resolver";
+import { setRepoCacheRef, setRepoHotDORef } from "./services/repo-resolver";
 import {
   processIndexFileMessage,
   processFullReindex,
@@ -80,6 +80,7 @@ import type { Env, Variables } from "./types";
 // Durable Objects must be exported from the entry point
 export { RateLimiterDO } from "./durable-objects/rate-limiter";
 export { SessionDO } from "./durable-objects/session";
+export { RepoHotDO } from "./durable-objects/repo-hot";
 
 const app = new Hono<{ Bindings: Env; Variables: Variables }>();
 
@@ -240,6 +241,7 @@ app.use("/v1/*", async (c, next) => {
   }
   // Set repo cache ref so resolveRepo() can use KV cache without changing call sites
   setRepoCacheRef(c.env.AUTH_CACHE as KVNamespace | undefined);
+  setRepoHotDORef(c.env.REPO_HOT_DO as DurableObjectNamespace | undefined);
   await next();
 });
 

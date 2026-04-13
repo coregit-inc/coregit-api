@@ -29,6 +29,13 @@ export interface ResolvedRepo {
 
 const REPO_CACHE_TTL = 300; // 5 minutes — repos rarely change metadata, invalidated on PATCH/DELETE
 
+// Module-level ref for per-repo hot layer DO
+let _repoHotDORef: DurableObjectNamespace | undefined;
+
+export function setRepoHotDORef(ns: DurableObjectNamespace | undefined) {
+  _repoHotDORef = ns;
+}
+
 // "_" is safe as null-namespace placeholder: NAMESPACE_REGEX only allows [a-z0-9-], never "_"
 function repoCacheKey(orgId: string, slug: string, namespace?: string | null): string {
   return `repo:${orgId}:${namespace || "_"}:${slug}`;
@@ -64,6 +71,7 @@ export async function resolveRepo(
     if (cached) {
       const storageSuffix = cached.namespace ? `${cached.namespace}/${cached.slug}` : cached.slug;
       const storage = new GitR2Storage(bucket, orgId, storageSuffix);
+      attachRepoHotDO(storage, orgId, storageSuffix, cached.id);
       const scopeKey = cached.namespace ? `${cached.namespace}/${cached.slug}` : cached.slug;
       return { repo: cached, storage, scopeKey, storageSuffix };
     }
@@ -88,9 +96,21 @@ export async function resolveRepo(
 
   const storageSuffix = namespace ? `${namespace}/${slug}` : slug;
   const storage = new GitR2Storage(bucket, orgId, storageSuffix);
+  attachRepoHotDO(storage, orgId, storageSuffix, found.id);
   const scopeKey = namespace ? `${namespace}/${slug}` : slug;
 
   return { repo: found, storage, scopeKey, storageSuffix };
+}
+
+/**
+ * Attach per-repo hot layer DO to storage instance.
+ * Called automatically by resolveRepo — every request gets hot layer for free.
+ */
+function attachRepoHotDO(storage: GitR2Storage, orgId: string, storageSuffix: string, repoId: string) {
+  if (!_repoHotDORef) return;
+  const doId = _repoHotDORef.idFromName(repoId);
+  const stub = _repoHotDORef.get(doId);
+  storage.setRepoDOStub(stub, `${orgId}/${storageSuffix}`);
 }
 
 /**
