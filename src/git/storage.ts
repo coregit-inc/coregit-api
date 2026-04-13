@@ -96,21 +96,7 @@ export class GitR2Storage {
       }
     }
 
-    // 3. Hot layer — RepoDO (Level 1, all requests) or SessionDO (Level 2)
-    const hotStub = this._hotStub;
-    if (hotStub) {
-      const hotUrl = this._sessionStub
-        ? `https://session/get-object?sha=${sha}&repoKey=${encodeURIComponent(this.basePath)}`
-        : `https://repo-hot/get-object?sha=${sha}`;
-      const hotRes = await hotStub.fetch(hotUrl);
-      if (hotRes.ok) {
-        const compressed = new Uint8Array(await hotRes.arrayBuffer());
-        const result = this._decompressAndCache(sha, compressed);
-        return result;
-      }
-    }
-
-    // 4. Try loose object in R2
+    // 3. Try loose object in R2 (most objects live here)
     const key = this.objectKey(sha);
     const looseObj = await this.bucket.get(key);
 
@@ -128,6 +114,22 @@ export class GitR2Storage {
       this._addToCache(sha, fullObject);
       this._putEdgeCache(edgeCacheKey, fullObject);
       return fullObject;
+    }
+
+    // 5. Hot layer — last resort for unflushed writes (RepoDO or SessionDO)
+    // Checked AFTER R2 to avoid adding DO latency to every read.
+    // Only hits when object was recently written and not yet flushed to R2.
+    const hotStub = this._hotStub;
+    if (hotStub) {
+      const hotUrl = this._sessionStub
+        ? `https://session/get-object?sha=${sha}&repoKey=${encodeURIComponent(this.basePath)}`
+        : `https://repo-hot/get-object?sha=${sha}`;
+      const hotRes = await hotStub.fetch(hotUrl);
+      if (hotRes.ok) {
+        const compressed = new Uint8Array(await hotRes.arrayBuffer());
+        const result = this._decompressAndCache(sha, compressed);
+        return result;
+      }
     }
 
     return null;
@@ -474,7 +476,12 @@ export class GitR2Storage {
    * Returns the SHA it points to or null if not found
    */
   async getRef(name: string): Promise<string | null> {
-    // Hot layer first (pending ref updates)
+    // R2 first (most refs are here)
+    const key = `${this.basePath}/${name}`;
+    const obj = await this.bucket.get(key);
+    if (obj) return (await obj.text()).trim();
+
+    // Hot layer fallback — unflushed ref updates
     const hotStub = this._hotStub;
     if (hotStub) {
       const hotUrl = this._sessionStub
@@ -487,11 +494,7 @@ export class GitR2Storage {
       }
     }
 
-    // R2 cold storage
-    const key = `${this.basePath}/${name}`;
-    const obj = await this.bucket.get(key);
-    if (!obj) return null;
-    return (await obj.text()).trim();
+    return null;
   }
 
   /**
