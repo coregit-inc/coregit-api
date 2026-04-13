@@ -14,7 +14,7 @@ import { extractRepoParams } from "./helpers";
 import { repo } from "../db/schema";
 import { GitR2Storage } from "../git/storage";
 import { parseGitObject, parseCommit } from "../git/objects";
-import { createApiCommit, ConflictError, EditConflictError, InvalidBase64Error, type FileChange, type CommitAuthor } from "../services/commit-builder";
+import { createApiCommit, ConflictError, EditConflictError, InvalidBase64Error, setTreeCacheRef, type FileChange, type CommitAuthor } from "../services/commit-builder";
 
 import { checkFreeLimits } from "../services/limits";
 import { isValidRefName, validateFilePath } from "../git/validation";
@@ -123,6 +123,8 @@ const createCommitHandler = async (c: any) => {
   }
 
   try {
+    // Enable KV tree cache for commit-builder (immutable flat tree by commitSha)
+    setTreeCacheRef(c.env.TREE_CACHE as KVNamespace | undefined);
     const result = await createApiCommit(storage, branch, message, author, changes, parent_sha);
 
     // Trigger delta indexing if auto_index enabled

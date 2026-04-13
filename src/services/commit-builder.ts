@@ -50,19 +50,45 @@ export class ConflictError extends Error {
   }
 }
 
+// Module-level KV ref — set by the commit route before calling createApiCommit.
+let _treeCacheRef: KVNamespace | undefined;
+
+export function setTreeCacheRef(kv: KVNamespace | undefined) {
+  _treeCacheRef = kv;
+}
+
 /**
  * Recursively flatten a git tree into a Map<path, {sha, mode}>.
+ * Uses KV cache keyed by commitSha — tree is immutable, so no TTL needed.
  */
 async function flattenTreeFromCommit(
   storage: GitR2Storage,
   commitSha: string
 ): Promise<Map<string, { sha: string; mode: string }>> {
+  const kv = _treeCacheRef;
+
+  // Check KV cache (commitSha → flat tree is immutable)
+  if (kv) {
+    const cached = await kv.get(`ftree:${commitSha}`, "json") as Array<[string, { sha: string; mode: string }]> | null;
+    if (cached) {
+      return new Map(cached);
+    }
+  }
+
+  // Cache miss — flatten from R2
   const raw = await storage.getObject(commitSha);
   if (!raw) throw new Error(`Commit not found: ${commitSha}`);
   const obj = parseGitObject(raw);
   if (obj.type !== "commit") throw new Error(`Expected commit, got ${obj.type}`);
   const commit = parseCommit(obj.content);
-  return flattenTree(storage, commit.tree);
+  const tree = await flattenTree(storage, commit.tree);
+
+  // Write to KV cache (fire-and-forget, no TTL — immutable)
+  if (kv) {
+    kv.put(`ftree:${commitSha}`, JSON.stringify([...tree.entries()])).catch(() => {});
+  }
+
+  return tree;
 }
 
 async function flattenTree(
@@ -378,6 +404,12 @@ export async function createApiCommit(
     }
   } else {
     await storage.setRef(`refs/heads/${branch}`, commitSha);
+  }
+
+  // Cache the new commit's flat tree for the next commit (fire-and-forget)
+  const kv = _treeCacheRef;
+  if (kv) {
+    kv.put(`ftree:${commitSha}`, JSON.stringify([...currentTree.entries()])).catch(() => {});
   }
 
   return {

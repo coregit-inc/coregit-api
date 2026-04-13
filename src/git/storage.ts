@@ -1,25 +1,33 @@
 /**
  * Git R2 Storage Layer
  *
- * R2 Key Structure:
+ * R2 Key Structure (dual-mode: loose + packfiles):
  * {userId}/{repo}/
- * ├── objects/
- * │   └── {sha[0:2]}/{sha[2:40]}  # loose objects (zlib-compressed)
+ * ├── objects/                      # legacy loose objects (zlib-compressed)
+ * │   └── {sha[0:2]}/{sha[2:40]}
+ * ├── pack/                         # packfiles (fewer R2 keys, scalable)
+ * │   ├── {packId}.pack
+ * │   └── {packId}.idx
  * ├── refs/
  * │   ├── heads/
- * │   │   └── main                 # SHA + newline
+ * │   │   └── main
  * │   └── tags/
- * │       └── v1.0                 # SHA + newline
- * ├── HEAD                         # "ref: refs/heads/main\n"
- * └── pack/                        # Future: packfiles
+ * │       └── v1.0
+ * └── HEAD
+ *
+ * Object lookup order: in-memory cache → loose → pack indices → R2 pack
+ * New writes go to loose. Packing triggered when loose count > PACK_THRESHOLD.
  */
 
 import { createGitObjectRaw, type GitObjectType } from "./objects";
 import { zlibSync, unzlibSync } from "fflate";
 import { isValidSha } from "./validation";
+import { createMinimalPack, readFromPack, type PackIndex } from "./pack-storage";
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
+
+const PACK_THRESHOLD = 256; // pack loose objects when count exceeds this
 
 export class GitR2Storage {
   private bucket: R2Bucket;
@@ -28,38 +36,60 @@ export class GitR2Storage {
   private _cacheBytes = 0;
   private static readonly MAX_CACHE_BYTES = 32 * 1024 * 1024; // 32 MB per request
 
+  /** KV namespace for caching pack indices (set externally) */
+  private _packIndexKv: KVNamespace | undefined;
+  /** Loaded pack indices for this request */
+  private _packIndices: PackIndex[] | null = null;
+
   constructor(bucket: R2Bucket, userId: string, repo: string) {
     this.bucket = bucket;
     this.basePath = `${userId}/${repo}`;
   }
 
+  setPackIndexKv(kv: KVNamespace | undefined) {
+    this._packIndexKv = kv;
+  }
+
   // ============ Object Operations ============
 
   /**
-   * Get a git object by SHA
-   * Returns decompressed object data or null if not found
+   * Get a git object by SHA.
+   * Lookup order: in-memory cache → loose R2 object → packfiles.
+   * Returns decompressed full git object data or null if not found.
    */
   async getObject(sha: string): Promise<Uint8Array | null> {
-    // Cache hit — skip R2 entirely
+    // 1. In-memory cache hit
     const cached = this._objectCache.get(sha);
     if (cached) return cached;
 
+    // 2. Try loose object in R2
     const key = this.objectKey(sha);
-    const obj = await this.bucket.get(key);
+    const looseObj = await this.bucket.get(key);
 
-    if (!obj) {
-      return null;
+    if (looseObj) {
+      return this._decompressAndCache(sha, new Uint8Array(await looseObj.arrayBuffer()));
     }
 
-    const compressed = new Uint8Array(await obj.arrayBuffer());
+    // 3. Try packfiles
+    const packResult = await this._getFromPacks(sha);
+    if (packResult) {
+      // packResult is already decompressed raw content (without git header).
+      // We need to wrap it with git object header for compatibility.
+      const { type, data } = packResult;
+      const fullObject = createGitObjectRaw(type, data);
+      this._addToCache(sha, fullObject);
+      return fullObject;
+    }
 
-    // Decompress using sync unzlibSync — matches zlibSync format, no async overhead
+    return null;
+  }
+
+  private _decompressAndCache(sha: string, compressed: Uint8Array): Uint8Array {
     const MAX_DECOMPRESSED_SIZE = 100 * 1024 * 1024; // 100 MB
     let result: Uint8Array;
     try {
       result = unzlibSync(compressed);
     } catch {
-      // If decompression fails, return raw (might be uncompressed)
       result = compressed;
     }
 
@@ -67,10 +97,13 @@ export class GitR2Storage {
       throw new Error(`Git object exceeds ${MAX_DECOMPRESSED_SIZE} byte decompression limit`);
     }
 
-    // Populate cache with simple size-based eviction
-    this._cacheBytes += result.length;
+    this._addToCache(sha, result);
+    return result;
+  }
+
+  private _addToCache(sha: string, data: Uint8Array) {
+    this._cacheBytes += data.length;
     if (this._cacheBytes > GitR2Storage.MAX_CACHE_BYTES) {
-      // Evict oldest half
       const iter = this._objectCache.keys();
       while (this._cacheBytes > GitR2Storage.MAX_CACHE_BYTES / 2) {
         const key = iter.next().value;
@@ -79,9 +112,78 @@ export class GitR2Storage {
         this._objectCache.delete(key);
       }
     }
-    this._objectCache.set(sha, result);
+    this._objectCache.set(sha, data);
+  }
 
-    return result;
+  /**
+   * Look up a SHA in loaded pack indices, fetch from R2 pack if found.
+   */
+  private async _getFromPacks(sha: string): Promise<{ type: GitObjectType; data: Uint8Array } | null> {
+    const indices = await this._loadPackIndices();
+    for (const idx of indices) {
+      const entry = idx.entries[sha];
+      if (!entry) continue;
+
+      // Fetch the pack from R2
+      const packKey = `${this.basePath}/pack/${idx.packSha}.pack`;
+      const packObj = await this.bucket.get(packKey);
+      if (!packObj) continue;
+
+      const packData = new Uint8Array(await packObj.arrayBuffer());
+      return readFromPack(packData, entry.offset);
+    }
+    return null;
+  }
+
+  /**
+   * Load all pack indices for this repo. Cached per-request in memory,
+   * and in KV (immutable — pack SHA is content-addressed).
+   */
+  private async _loadPackIndices(): Promise<PackIndex[]> {
+    if (this._packIndices !== null) return this._packIndices;
+
+    // List pack index files in R2
+    const prefix = `${this.basePath}/pack/`;
+    const listed = await this.bucket.list({ prefix, limit: 100 });
+    const idxKeys = listed.objects
+      .filter((o) => o.key.endsWith(".idx"))
+      .map((o) => o.key);
+
+    if (idxKeys.length === 0) {
+      this._packIndices = [];
+      return [];
+    }
+
+    const indices: PackIndex[] = [];
+    const kv = this._packIndexKv;
+
+    for (const idxKey of idxKeys) {
+      const packSha = idxKey.slice(prefix.length, -4); // remove prefix and .idx
+
+      // Try KV cache first
+      if (kv) {
+        const cached = await kv.get(`packidx:${this.basePath}/${packSha}`, "json") as PackIndex | null;
+        if (cached) {
+          indices.push(cached);
+          continue;
+        }
+      }
+
+      // Load from R2
+      const idxObj = await this.bucket.get(idxKey);
+      if (!idxObj) continue;
+
+      const idxData = JSON.parse(await idxObj.text()) as PackIndex;
+      indices.push(idxData);
+
+      // Cache in KV (immutable — no TTL)
+      if (kv) {
+        kv.put(`packidx:${this.basePath}/${packSha}`, JSON.stringify(idxData)).catch(() => {});
+      }
+    }
+
+    this._packIndices = indices;
+    return indices;
   }
 
   /**
@@ -189,6 +291,106 @@ export class GitR2Storage {
     } while (cursor);
 
     return shas;
+  }
+
+  // ============ Pack Operations ============
+
+  /**
+   * Pack all loose objects into a single packfile.
+   * 1. List all loose objects
+   * 2. Read each, create minimal pack
+   * 3. Upload pack + JSON index to R2
+   * 4. Delete loose objects
+   * 5. Cache index in KV
+   */
+  async packLooseObjects(): Promise<{ packed: number; packSha: string } | null> {
+    const prefix = `${this.basePath}/objects/`;
+    const allKeys: string[] = [];
+    let cursor: string | undefined;
+
+    do {
+      const listed = await this.bucket.list({ prefix, cursor });
+      for (const obj of listed.objects) {
+        if (obj.key.endsWith(".gitkeep")) continue;
+        const parts = obj.key.slice(prefix.length).split("/");
+        if (parts.length === 2 && parts[0].length === 2 && parts[1].length === 38) {
+          allKeys.push(obj.key);
+        }
+      }
+      cursor = listed.truncated ? listed.cursor : undefined;
+    } while (cursor);
+
+    if (allKeys.length < 2) return null; // not worth packing 0-1 objects
+
+    // Read all loose objects
+    const objects: { sha: string; type: GitObjectType; data: Uint8Array }[] = [];
+    const BATCH = 20;
+
+    for (let i = 0; i < allKeys.length; i += BATCH) {
+      const batch = allKeys.slice(i, i + BATCH);
+      const results = await Promise.all(
+        batch.map(async (key) => {
+          const sha = key.slice(prefix.length).replace("/", "");
+          const obj = await this.bucket.get(key);
+          if (!obj) return null;
+
+          const compressed = new Uint8Array(await obj.arrayBuffer());
+          let decompressed: Uint8Array;
+          try {
+            decompressed = unzlibSync(compressed);
+          } catch {
+            decompressed = compressed;
+          }
+
+          // Parse git object header to get type
+          const { parseGitObject } = await import("./objects");
+          const parsed = parseGitObject(decompressed);
+
+          return { sha, type: parsed.type as GitObjectType, data: parsed.content };
+        })
+      );
+
+      for (const r of results) {
+        if (r) objects.push(r);
+      }
+    }
+
+    if (objects.length === 0) return null;
+
+    // Create packfile
+    const { pack, index } = await createMinimalPack(objects);
+
+    // Upload pack + index to R2
+    const packKey = `${this.basePath}/pack/${index.packSha}.pack`;
+    const idxKey = `${this.basePath}/pack/${index.packSha}.idx`;
+
+    await Promise.all([
+      this.bucket.put(packKey, pack, {
+        httpMetadata: { contentType: "application/x-git-pack" },
+      }),
+      this.bucket.put(idxKey, JSON.stringify(index), {
+        httpMetadata: { contentType: "application/json" },
+      }),
+    ]);
+
+    // Cache index in KV
+    if (this._packIndexKv) {
+      await this._packIndexKv.put(
+        `packidx:${this.basePath}/${index.packSha}`,
+        JSON.stringify(index)
+      ).catch(() => {});
+    }
+
+    // Delete loose objects in parallel batches
+    for (let i = 0; i < allKeys.length; i += BATCH) {
+      const batch = allKeys.slice(i, i + BATCH);
+      await Promise.all(batch.map((key) => this.bucket.delete(key)));
+    }
+
+    // Reset pack indices cache (new pack added)
+    this._packIndices = null;
+
+    return { packed: objects.length, packSha: index.packSha };
   }
 
   // ============ Reference Operations ============
