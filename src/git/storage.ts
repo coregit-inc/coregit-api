@@ -116,15 +116,13 @@ export class GitR2Storage {
       return fullObject;
     }
 
-    // 5. Hot layer — last resort for unflushed writes (RepoDO or SessionDO)
-    // Checked AFTER R2 to avoid adding DO latency to every read.
-    // Only hits when object was recently written and not yet flushed to R2.
-    const hotStub = this._hotStub;
-    if (hotStub) {
-      const hotUrl = this._sessionStub
-        ? `https://session/get-object?sha=${sha}&repoKey=${encodeURIComponent(this.basePath)}`
-        : `https://repo-hot/get-object?sha=${sha}`;
-      const hotRes = await hotStub.fetch(hotUrl);
+    // 5. Session DO (Level 2 only) — unflushed writes from active session
+    // RepoDO (Level 1) flushes to R2 every 30s, so objects are always in R2.
+    // Only sessions defer writes — check DO only when session is active.
+    if (this._sessionStub) {
+      const hotRes = await this._sessionStub.fetch(
+        `https://session/get-object?sha=${sha}&repoKey=${encodeURIComponent(this.basePath)}`
+      );
       if (hotRes.ok) {
         const compressed = new Uint8Array(await hotRes.arrayBuffer());
         const result = this._decompressAndCache(sha, compressed);
@@ -262,21 +260,40 @@ export class GitR2Storage {
     const fullObject = createGitObjectRaw(type, content);
     const compressed = zlibSync(fullObject);
 
-    // Hot layer — RepoDO (Level 1) or SessionDO (Level 2). ~2ms vs R2 200-500ms.
-    const hotStub = this._hotStub;
-    if (hotStub) {
-      const hotUrl = this._sessionStub
-        ? `https://session/put-object?sha=${sha}&repoKey=${encodeURIComponent(this.basePath)}`
-        : `https://repo-hot/put-object?sha=${sha}&basePath=${encodeURIComponent(this.basePath)}`;
-      const res = await hotStub.fetch(hotUrl, { method: "POST", body: compressed });
+    // Session (Level 2): write to DO only, flushed on session close
+    if (this._sessionStub) {
+      const res = await this._sessionStub.fetch(
+        `https://session/put-object?sha=${sha}&repoKey=${encodeURIComponent(this.basePath)}`,
+        { method: "POST", body: compressed }
+      );
       if (res.status === 202) {
         this._addToCache(sha, fullObject);
         return;
       }
-      // 507 = DO full, fall through to R2
     }
 
-    // Cold path — direct R2 write
+    // Level 1 (RepoDO): write-through — R2 in background, return after DO ack.
+    // DO write is fast (~2ms), R2 write runs in parallel via fire-and-forget.
+    // Reads go to R2 directly — no DO fallback needed.
+    if (this._repoDOStub) {
+      const r2Key = this.objectKey(sha);
+      // Fire-and-forget R2 write (durability) — don't await
+      this.bucket.put(r2Key, compressed, {
+        httpMetadata: { contentType: "application/x-git-object" },
+      }).catch(() => {});
+      // DO write (fast ack) — await for in-request consistency
+      const res = await this._repoDOStub.fetch(
+        `https://repo-hot/put-object?sha=${sha}&basePath=${encodeURIComponent(this.basePath)}`,
+        { method: "POST", body: compressed }
+      );
+      if (res.status === 202) {
+        this._addToCache(sha, fullObject);
+        return;
+      }
+      // DO full — R2 write already in flight, just wait for it
+    }
+
+    // No session, no RepoDO: direct R2 write
     const key = this.objectKey(sha);
     await this.bucket.put(key, compressed, {
       httpMetadata: { contentType: "application/x-git-object" },
@@ -476,43 +493,38 @@ export class GitR2Storage {
    * Returns the SHA it points to or null if not found
    */
   async getRef(name: string): Promise<string | null> {
-    // R2 first (most refs are here)
-    const key = `${this.basePath}/${name}`;
-    const obj = await this.bucket.get(key);
-    if (obj) return (await obj.text()).trim();
-
-    // Hot layer fallback — unflushed ref updates
-    const hotStub = this._hotStub;
-    if (hotStub) {
-      const hotUrl = this._sessionStub
-        ? `https://session/get-ref?repoKey=${encodeURIComponent(this.basePath)}&refName=${encodeURIComponent(name)}`
-        : `https://repo-hot/get-ref?refName=${encodeURIComponent(name)}`;
-      const res = await hotStub.fetch(hotUrl);
+    // Session (Level 2): check DO first — refs may be deferred
+    if (this._sessionStub) {
+      const res = await this._sessionStub.fetch(
+        `https://session/get-ref?repoKey=${encodeURIComponent(this.basePath)}&refName=${encodeURIComponent(name)}`
+      );
       if (res.ok) {
         const { sha } = (await res.json()) as { sha: string };
         return sha;
       }
     }
 
-    return null;
+    // R2 (Level 1 writes refs directly to R2 — no DO fallback needed)
+    const key = `${this.basePath}/${name}`;
+    const obj = await this.bucket.get(key);
+    if (!obj) return null;
+    return (await obj.text()).trim();
   }
 
   /**
    * Set a reference to point to a SHA
    */
   async setRef(name: string, sha: string): Promise<void> {
-    const hotStub = this._hotStub;
-    if (hotStub) {
-      const hotUrl = this._sessionStub
-        ? "https://session/put-ref"
-        : "https://repo-hot/put-ref";
-      const body = this._sessionStub
-        ? JSON.stringify({ repoKey: this.basePath, refName: name, sha })
-        : JSON.stringify({ refName: name, sha });
-      await hotStub.fetch(hotUrl, { method: "POST", body });
+    // Session (Level 2): write to DO only — flushed on session close
+    if (this._sessionStub) {
+      await this._sessionStub.fetch("https://session/put-ref", {
+        method: "POST",
+        body: JSON.stringify({ repoKey: this.basePath, refName: name, sha }),
+      });
       return;
     }
 
+    // Level 1 (RepoDO) or no session: always write to R2 (durable, immediate read)
     const key = `${this.basePath}/${name}`;
     await this.bucket.put(key, sha + "\n", {
       httpMetadata: { contentType: "text/plain" },
