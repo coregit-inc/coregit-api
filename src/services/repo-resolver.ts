@@ -27,7 +27,7 @@ export interface ResolvedRepo {
   storageSuffix: string;
 }
 
-const REPO_CACHE_TTL = 60; // seconds
+const REPO_CACHE_TTL = 300; // 5 minutes — repos rarely change metadata, invalidated on PATCH/DELETE
 
 // "_" is safe as null-namespace placeholder: NAMESPACE_REGEX only allows [a-z0-9-], never "_"
 function repoCacheKey(orgId: string, slug: string, namespace?: string | null): string {

@@ -365,7 +365,7 @@ const blobHandler = async (c: any) => {
       size: parsed.content.length,
     }, 200, {
       "ETag": `"${fileEntry.sha}"`,
-      "Cache-Control": "public, max-age=31536000, immutable",
+      "Cache-Control": "public, max-age=31536000, s-maxage=31536000, immutable",
     });
   } catch (error) {
     console.error("Failed to fetch blob:", error);

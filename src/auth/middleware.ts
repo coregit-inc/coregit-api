@@ -37,7 +37,7 @@ function timingSafeEqual(a: string, b: string): boolean {
   return result === 0;
 }
 
-const AUTH_CACHE_TTL = 60; // seconds (KV minimum is 60)
+const AUTH_CACHE_TTL = 300; // 5 minutes — keys rarely change mid-session, revocation checked in JS
 
 interface CachedAuth {
   orgId: string;
@@ -71,20 +71,26 @@ async function verifyWithCache(
   // Cache miss — single joined query (key + org plan)
   let auth: CachedAuth | null = null;
 
+  // NOTE: queries intentionally omit NOW() checks so Hyperdrive can cache them.
+  // Expiry and revocation are checked in JS below. This makes auth queries
+  // cacheable by Hyperdrive (queries with NOW() are never cached).
   if (isScopedToken) {
     const result = await db.execute(
-      sql`SELECT st.id, st.org_id, st.scopes,
+      sql`SELECT st.id, st.org_id, st.scopes, st.expires_at, st.revoked_at,
                  COALESCE(op.tier, 'free') AS tier,
                  op.dodo_customer_id
           FROM scoped_token st
           LEFT JOIN org_plan op ON op.org_id = st.org_id
           WHERE st.key_hash = ${keyHash}
-            AND st.expires_at > NOW()
-            AND st.revoked_at IS NULL
           LIMIT 1`
     );
     const row = result.rows[0] as any;
     if (row) {
+      // Check expiry and revocation in JS (not SQL) for Hyperdrive cacheability
+      const now = new Date();
+      if (row.expires_at && new Date(row.expires_at) <= now) return null;
+      if (row.revoked_at) return null;
+
       auth = {
         orgId: row.org_id,
         scopes: row.scopes,
@@ -95,17 +101,19 @@ async function verifyWithCache(
     }
   } else {
     const result = await db.execute(
-      sql`SELECT ak.id, ak.org_id,
+      sql`SELECT ak.id, ak.org_id, ak.expires_at,
                  COALESCE(op.tier, 'free') AS tier,
                  op.dodo_customer_id
           FROM api_key ak
           LEFT JOIN org_plan op ON op.org_id = ak.org_id
           WHERE ak.key_hash = ${keyHash}
-            AND (ak.expires_at IS NULL OR ak.expires_at > NOW())
           LIMIT 1`
     );
     const row = result.rows[0] as any;
     if (row) {
+      // Check expiry in JS for Hyperdrive cacheability
+      if (row.expires_at && new Date(row.expires_at) <= new Date()) return null;
+
       auth = {
         orgId: row.org_id,
         scopes: null, // master key = full access

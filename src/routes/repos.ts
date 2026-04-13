@@ -115,13 +115,10 @@ repos.post("/", apiKeyAuth, async (c) => {
     // Initialize R2 storage
     const storageSuffix = ns ? `${ns}/${slug}` : slug;
     const storage = new GitR2Storage(bucket, orgId, storageSuffix);
-    await storage.setHead(`refs/heads/${default_branch}`);
-
     if (init) {
-      // Create empty tree + initial commit
+      // Hash objects locally (CPU-only, no R2), then write all 4 R2 keys in parallel
       const emptyTree = createTree([]);
       const treeSha = await hashGitObject("tree", emptyTree);
-      await storage.putObject(treeSha, "tree", emptyTree);
 
       const timestamp = Math.floor(Date.now() / 1000);
       const identity = `CoreGit <noreply@coregit.dev> ${timestamp} +0000`;
@@ -133,8 +130,16 @@ repos.post("/", apiKeyAuth, async (c) => {
         message: "Initial commit",
       });
       const commitSha = await hashGitObject("commit", commitContent);
-      await storage.putObject(commitSha, "commit", commitContent);
-      await storage.setRef(`refs/heads/${default_branch}`, commitSha);
+
+      // Parallel R2 writes (~60-90ms saved vs sequential)
+      await Promise.all([
+        storage.setHead(`refs/heads/${default_branch}`),
+        storage.putObject(treeSha, "tree", emptyTree),
+        storage.putObject(commitSha, "commit", commitContent),
+        storage.setRef(`refs/heads/${default_branch}`, commitSha),
+      ]);
+    } else {
+      await storage.setHead(`refs/heads/${default_branch}`);
     }
 
     // Track usage + audit

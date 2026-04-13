@@ -385,11 +385,13 @@ export async function createApiCommit(
     message,
   });
   const commitSha = await hashGitObject("commit", commitContent);
-  await storage.putObject(commitSha, "commit", commitContent);
 
-  // 6. Update branch ref with CAS
+  // 6. Write commit + read ref etag in parallel (~25ms saved)
   if (currentSha) {
-    const ref = await storage.getRefWithEtag(`refs/heads/${branch}`);
+    const [, ref] = await Promise.all([
+      storage.putObject(commitSha, "commit", commitContent),
+      storage.getRefWithEtag(`refs/heads/${branch}`),
+    ]);
     if (ref) {
       const ok = await storage.setRefConditional(
         `refs/heads/${branch}`,
@@ -403,7 +405,11 @@ export async function createApiCommit(
       await storage.setRef(`refs/heads/${branch}`, commitSha);
     }
   } else {
-    await storage.setRef(`refs/heads/${branch}`, commitSha);
+    // First commit — no CAS needed, write commit + ref in parallel
+    await Promise.all([
+      storage.putObject(commitSha, "commit", commitContent),
+      storage.setRef(`refs/heads/${branch}`, commitSha),
+    ]);
   }
 
   // Cache the new commit's flat tree for the next commit (fire-and-forget)

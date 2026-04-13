@@ -40,10 +40,16 @@ export class GitR2Storage {
   private _packIndexKv: KVNamespace | undefined;
   /** Loaded pack indices for this request */
   private _packIndices: PackIndex[] | null = null;
+  /** Edge cache for immutable git objects (Cache API, per-colo, <5ms) */
+  private _edgeCache: Cache | undefined;
+  /** Base URL for edge cache keys */
+  private static readonly CACHE_BASE = "https://cache.coregit.internal";
 
   constructor(bucket: R2Bucket, userId: string, repo: string) {
     this.bucket = bucket;
     this.basePath = `${userId}/${repo}`;
+    // Cache API is available globally in Workers
+    try { this._edgeCache = caches.default; } catch { /* not available in tests */ }
   }
 
   setPackIndexKv(kv: KVNamespace | undefined) {
@@ -54,34 +60,60 @@ export class GitR2Storage {
 
   /**
    * Get a git object by SHA.
-   * Lookup order: in-memory cache → loose R2 object → packfiles.
-   * Returns decompressed full git object data or null if not found.
+   * Lookup order: in-memory → edge cache (Cache API, <5ms) → loose R2 → packfiles.
+   * Git objects are content-addressed (SHA = hash of content) → truly immutable → cache forever.
    */
   async getObject(sha: string): Promise<Uint8Array | null> {
-    // 1. In-memory cache hit
+    // 1. In-memory cache hit (per-request)
     const cached = this._objectCache.get(sha);
     if (cached) return cached;
 
-    // 2. Try loose object in R2
+    // 2. Edge cache hit (per-colo, <5ms vs R2 200-500ms)
+    const edgeCacheKey = `${GitR2Storage.CACHE_BASE}/${this.basePath}/objects/${sha}`;
+    if (this._edgeCache) {
+      const edgeHit = await this._edgeCache.match(edgeCacheKey);
+      if (edgeHit) {
+        const data = new Uint8Array(await edgeHit.arrayBuffer());
+        this._addToCache(sha, data);
+        return data;
+      }
+    }
+
+    // 3. Try loose object in R2
     const key = this.objectKey(sha);
     const looseObj = await this.bucket.get(key);
 
     if (looseObj) {
-      return this._decompressAndCache(sha, new Uint8Array(await looseObj.arrayBuffer()));
+      const result = this._decompressAndCache(sha, new Uint8Array(await looseObj.arrayBuffer()));
+      this._putEdgeCache(edgeCacheKey, result);
+      return result;
     }
 
-    // 3. Try packfiles
+    // 4. Try packfiles
     const packResult = await this._getFromPacks(sha);
     if (packResult) {
-      // packResult is already decompressed raw content (without git header).
-      // We need to wrap it with git object header for compatibility.
       const { type, data } = packResult;
       const fullObject = createGitObjectRaw(type, data);
       this._addToCache(sha, fullObject);
+      this._putEdgeCache(edgeCacheKey, fullObject);
       return fullObject;
     }
 
     return null;
+  }
+
+  /** Store in edge cache (fire-and-forget). Git objects are immutable — cache 1 year. */
+  private _putEdgeCache(cacheKey: string, data: Uint8Array): void {
+    if (!this._edgeCache) return;
+    const response = new Response(data, {
+      headers: {
+        "Cache-Control": "public, s-maxage=31536000, immutable",
+        "Content-Type": "application/x-git-object",
+        "Content-Length": String(data.byteLength),
+      },
+    });
+    // fire-and-forget — don't block on cache write
+    this._edgeCache.put(cacheKey, response).catch(() => {});
   }
 
   private _decompressAndCache(sha: string, compressed: Uint8Array): Uint8Array {

@@ -18,8 +18,11 @@ bucket_name = "coregit-lfs"
 [vars]
 CORS_ORIGIN = "https://coregit.dev"
 
-[placement]
-mode = "smart"
+# Smart Placement disabled: Worker runs at edge (near user) so Cache API
+# hits are local (<5ms). With Smart Placement, Worker would run near R2/DB
+# (us-east-1), making every request pay user→us-east RTT even for cache hits.
+# [placement]
+# mode = "smart"
 
 # ── Hyperdrive (Neon PostgreSQL connection pooling + query cache) ──
 
