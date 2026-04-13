@@ -194,8 +194,12 @@ export const apiKeyAuth = createMiddleware<{
   c.set("orgTier", auth.tier);
   c.set("dodoCustomerId", auth.dodoCustomerId);
 
-  // ── Per-key rate limiting (via Durable Object) ──
-  const rl = await checkRateLimit(c.env.RATE_LIMITER, auth.tokenId);
+  // ── Rate limiting: per-key + per-org in parallel (via Durable Objects) ──
+  const [rl, orgRl] = await Promise.all([
+    checkRateLimit(c.env.RATE_LIMITER, auth.tokenId),
+    checkOrgRateLimit(c.env.RATE_LIMITER, auth.orgId),
+  ]);
+
   const rlHeaders = rateLimitHeaders(rl);
   if (!rl.allowed) {
     for (const [k, v] of Object.entries(rlHeaders)) {
@@ -204,8 +208,6 @@ export const apiKeyAuth = createMiddleware<{
     return c.json({ error: "Rate limit exceeded", code: "RATE_LIMITED" }, 429);
   }
 
-  // ── Per-org rate limiting (via Durable Object) ──
-  const orgRl = await checkOrgRateLimit(c.env.RATE_LIMITER, auth.orgId);
   const orgRlHeaders = orgRateLimitHeaders(orgRl);
   if (!orgRl.allowed) {
     for (const [k, v] of Object.entries(orgRlHeaders)) {
