@@ -125,6 +125,10 @@ const createCommitHandler = async (c: any) => {
   try {
     // Enable KV tree cache for commit-builder (immutable flat tree by commitSha)
     setTreeCacheRef(c.env.TREE_CACHE as KVNamespace | undefined);
+    // Session hot layer for zero-wait writes
+    if (c.get("sessionStub")) {
+      storage.setSessionStub(c.get("sessionStub") as DurableObjectStub);
+    }
     const result = await createApiCommit(storage, branch, message, author, changes, parent_sha);
 
     // Trigger delta indexing if auto_index enabled

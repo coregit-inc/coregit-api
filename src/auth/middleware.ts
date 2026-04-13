@@ -52,7 +52,7 @@ interface CachedAuth {
  * On cache hit: returns cached auth + org plan (0 DB queries).
  * On cache miss: single joined query for key + org plan (1 DB query), then caches result.
  */
-async function verifyWithCache(
+export async function verifyWithCache(
   db: any,
   keyValue: string,
   authCache: KVNamespace | undefined,
@@ -144,6 +144,51 @@ export const apiKeyAuth = createMiddleware<{
   Variables: Variables;
 }>(async (c, next) => {
   const db = c.get("db");
+
+  // ── Session fast-path (Zero-Wait Protocol) ──
+  // Auth validated once at session open. Subsequent requests skip DB/KV auth entirely.
+  const sessionId = c.req.header("x-session-id");
+  if (sessionId) {
+    if (!sessionId.startsWith("ses_")) {
+      return c.json({ error: "Invalid session ID format" }, 400);
+    }
+    const doId = c.env.SESSION_DO.idFromName(sessionId);
+    const stub = c.env.SESSION_DO.get(doId);
+    const res = await stub.fetch("https://session/validate");
+
+    if (!res.ok) {
+      return c.json({ error: "Session expired or invalid" }, 401);
+    }
+
+    const session = (await res.json()) as {
+      orgId: string;
+      apiKeyId: string;
+      scopes: Record<string, string[]> | null;
+      orgTier: "free" | "usage";
+      dodoCustomerId: string | null;
+    };
+
+    c.set("orgId", session.orgId);
+    c.set("apiKeyPermissions", session.scopes);
+    c.set("apiKeyId", session.apiKeyId);
+    c.set("orgTier", session.orgTier);
+    c.set("dodoCustomerId", session.dodoCustomerId);
+    c.set("sessionId", sessionId);
+    c.set("sessionStub", stub);
+
+    await next();
+
+    // Usage tracking (fire-and-forget)
+    recordUsage(c.executionCtx, db, session.orgId, "api_call", 1, {
+      method: c.req.method,
+      path: c.req.path,
+    }, c.env.DODO_PAYMENTS_API_KEY, session.dodoCustomerId);
+    return;
+  }
+
+  // No session — initialize session variables to null
+  c.set("sessionId", null);
+  c.set("sessionStub", null);
 
   // ── Internal sync token ──
   const internalToken = c.req.header("x-internal-token");

@@ -113,6 +113,7 @@ const listRefsHandler = async (c: any) => {
 
   const resolved = await resolveRepo(db, bucket, { orgId, slug, namespace });
   if (!resolved) return c.json({ error: "Repository not found" }, 404);
+  if (c.get("sessionStub")) resolved.storage.setSessionStub(c.get("sessionStub") as DurableObjectStub);
 
   if (!hasRepoAccess(c.get("apiKeyPermissions"), resolved.scopeKey, "read")) {
     return c.json({ error: "Insufficient permissions" }, 403);
@@ -184,6 +185,7 @@ const treeHandler = async (c: any) => {
 
   const resolved = await resolveRepo(db, bucket, { orgId, slug, namespace });
   if (!resolved) return c.json({ error: "Repository not found" }, 404);
+  if (c.get("sessionStub")) resolved.storage.setSessionStub(c.get("sessionStub") as DurableObjectStub);
 
   if (!hasRepoAccess(c.get("apiKeyPermissions"), resolved.scopeKey, "read")) {
     return c.json({ error: "Insufficient permissions" }, 403);
@@ -274,6 +276,7 @@ const blobHandler = async (c: any) => {
 
   const resolved = await resolveRepo(db, bucket, { orgId, slug, namespace });
   if (!resolved) return c.json({ error: "Repository not found" }, 404);
+  if (c.get("sessionStub")) resolved.storage.setSessionStub(c.get("sessionStub") as DurableObjectStub);
 
   if (!hasRepoAccess(c.get("apiKeyPermissions"), resolved.scopeKey, "read")) {
     return c.json({ error: "Insufficient permissions" }, 403);

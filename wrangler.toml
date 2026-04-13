@@ -87,12 +87,17 @@ max_concurrency = 20
 
 [durable_objects]
 bindings = [
-  { name = "RATE_LIMITER", class_name = "RateLimiterDO" }
+  { name = "RATE_LIMITER", class_name = "RateLimiterDO" },
+  { name = "SESSION_DO", class_name = "SessionDO" }
 ]
 
 [[migrations]]
 tag = "v1"
 new_classes = ["RateLimiterDO"]
+
+[[migrations]]
+tag = "v2"
+new_classes = ["SessionDO"]
 
 # Secrets (set via wrangler secret put):
 # DATABASE_URL           — Neon PostgreSQL (separate project from Strayl)

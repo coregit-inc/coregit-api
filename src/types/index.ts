@@ -30,6 +30,8 @@ export interface Env {
   HYBRID_CACHE?: KVNamespace;
   // Rate limiting
   RATE_LIMITER: DurableObjectNamespace;
+  // Sessions (Zero-Wait Protocol)
+  SESSION_DO: DurableObjectNamespace;
   // Hyperdrive (Neon connection pooling)
   HYPERDRIVE: Hyperdrive;
 }
@@ -43,5 +45,7 @@ export interface Variables {
   dodoCustomerId: string | null;
   customDomain: string | null;
   requestId: string;
+  sessionId: string | null;
+  sessionStub: DurableObjectStub | null;
 }
 

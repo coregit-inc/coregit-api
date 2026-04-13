@@ -61,6 +61,7 @@ import { graphRoutes } from "./routes/graph";
 import { hybridSearchRoutes } from "./routes/hybrid-search";
 import { forks } from "./routes/forks";
 import { wiki } from "./routes/wiki";
+import { session } from "./routes/session";
 import { setRepoCacheRef } from "./services/repo-resolver";
 import {
   processIndexFileMessage,
@@ -78,6 +79,7 @@ import type { Env, Variables } from "./types";
 
 // Durable Objects must be exported from the entry point
 export { RateLimiterDO } from "./durable-objects/rate-limiter";
+export { SessionDO } from "./durable-objects/session";
 
 const app = new Hono<{ Bindings: Env; Variables: Variables }>();
 
@@ -185,7 +187,7 @@ app.use(
       }
       return null;
     },
-    allowHeaders: ["Content-Type", "Authorization", "x-api-key"],
+    allowHeaders: ["Content-Type", "Authorization", "x-api-key", "x-session-id"],
     allowMethods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     exposeHeaders: [
       "X-Request-Id",
@@ -307,6 +309,7 @@ app.route("/v1", audit);
 // ── Public webhook endpoints (no auth) — MUST be before auth-gated routes ──
 // Sync webhooks use DB directly, mounted on /v1 but skip apiKeyAuth
 app.route("/v1", syncWebhooks);
+app.route("/v1", session);
 app.route("/v1", multiWorkspace);
 app.route("/v1/usage", usage);
 

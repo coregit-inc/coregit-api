@@ -42,6 +42,8 @@ export class GitR2Storage {
   private _packIndices: PackIndex[] | null = null;
   /** Edge cache for immutable git objects (Cache API, per-colo, <5ms) */
   private _edgeCache: Cache | undefined;
+  /** Session stub for Zero-Wait hot layer reads/writes */
+  private _sessionStub: DurableObjectStub | undefined;
   /** Base URL for edge cache keys */
   private static readonly CACHE_BASE = "https://cache.coregit.internal";
 
@@ -54,6 +56,10 @@ export class GitR2Storage {
 
   setPackIndexKv(kv: KVNamespace | undefined) {
     this._packIndexKv = kv;
+  }
+
+  setSessionStub(stub: DurableObjectStub | undefined) {
+    this._sessionStub = stub;
   }
 
   // ============ Object Operations ============
@@ -79,7 +85,19 @@ export class GitR2Storage {
       }
     }
 
-    // 3. Try loose object in R2
+    // 3. Session hot layer (read-your-own-writes, ~2ms)
+    if (this._sessionStub) {
+      const hotRes = await this._sessionStub.fetch(
+        `https://session/get-object?sha=${sha}&repoKey=${encodeURIComponent(this.basePath)}`
+      );
+      if (hotRes.ok) {
+        const compressed = new Uint8Array(await hotRes.arrayBuffer());
+        const result = this._decompressAndCache(sha, compressed);
+        return result;
+      }
+    }
+
+    // 4. Try loose object in R2
     const key = this.objectKey(sha);
     const looseObj = await this.bucket.get(key);
 
@@ -223,17 +241,24 @@ export class GitR2Storage {
    * Compresses the object data before storing
    */
   async putObject(sha: string, type: GitObjectType, content: Uint8Array): Promise<void> {
-    // Skip R2 write if already in memory cache (content-addressed = idempotent)
+    // Skip write if already in memory cache (content-addressed = idempotent)
     if (this._objectCache.has(sha)) return;
 
-    const key = this.objectKey(sha);
-
-    // Create full git object (header + content)
     const fullObject = createGitObjectRaw(type, content);
-
-    // Compress using sync zlibSync (faster than async CompressionStream)
     const compressed = zlibSync(fullObject);
 
+    if (this._sessionStub) {
+      // Session hot layer — DO storage (~2ms), flushed to R2 on session close
+      await this._sessionStub.fetch(
+        `https://session/put-object?sha=${sha}&repoKey=${encodeURIComponent(this.basePath)}`,
+        { method: "POST", body: compressed }
+      );
+      this._addToCache(sha, fullObject);
+      return;
+    }
+
+    // Cold path — direct R2 write
+    const key = this.objectKey(sha);
     await this.bucket.put(key, compressed, {
       httpMetadata: { contentType: "application/x-git-object" },
     });
@@ -432,21 +457,37 @@ export class GitR2Storage {
    * Returns the SHA it points to or null if not found
    */
   async getRef(name: string): Promise<string | null> {
-    const key = `${this.basePath}/${name}`;
-    const obj = await this.bucket.get(key);
-
-    if (!obj) {
-      return null;
+    // Session hot layer first (pending ref updates)
+    if (this._sessionStub) {
+      const res = await this._sessionStub.fetch(
+        `https://session/get-ref?repoKey=${encodeURIComponent(this.basePath)}&refName=${encodeURIComponent(name)}`
+      );
+      if (res.ok) {
+        const { sha } = (await res.json()) as { sha: string };
+        return sha;
+      }
     }
 
-    const content = await obj.text();
-    return content.trim();
+    // R2 cold storage
+    const key = `${this.basePath}/${name}`;
+    const obj = await this.bucket.get(key);
+    if (!obj) return null;
+    return (await obj.text()).trim();
   }
 
   /**
    * Set a reference to point to a SHA
    */
   async setRef(name: string, sha: string): Promise<void> {
+    if (this._sessionStub) {
+      // Session hot layer — deferred write, flushed on session close
+      await this._sessionStub.fetch("https://session/put-ref", {
+        method: "POST",
+        body: JSON.stringify({ repoKey: this.basePath, refName: name, sha }),
+      });
+      return;
+    }
+
     const key = `${this.basePath}/${name}`;
     await this.bucket.put(key, sha + "\n", {
       httpMetadata: { contentType: "text/plain" },
