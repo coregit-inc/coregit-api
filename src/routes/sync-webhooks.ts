@@ -208,7 +208,7 @@ syncWebhooks.post("/sync-webhooks/github", async (c) => {
     }
 
     // Find matching sync configs — DB already set by /v1/* middleware
-    const db = c.get("db") || createDb(c.env.HYPERDRIVE?.connectionString || c.env.DATABASE_URL);
+    const db = c.get("db") || createDb(c.env.DATABASE_URL);
 
     const syncConfigs = await db
       .select()
@@ -294,7 +294,7 @@ syncWebhooks.post("/sync-webhooks/gitlab", async (c) => {
       return c.json({ error: "Missing project.path_with_namespace" }, 400);
     }
 
-    const db = c.get("db") || createDb(c.env.HYPERDRIVE?.connectionString || c.env.DATABASE_URL);
+    const db = c.get("db") || createDb(c.env.DATABASE_URL);
 
     const syncConfigs = await db
       .select()
