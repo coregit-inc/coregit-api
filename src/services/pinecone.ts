@@ -236,7 +236,8 @@ export async function deleteNamespace(
     body: JSON.stringify({ deleteAll: true, namespace }),
   });
 
-  if (!res.ok) {
+  // 404 = namespace doesn't exist — nothing to delete, not an error
+  if (!res.ok && res.status !== 404) {
     const errorBody = await res.text();
     throw new Error(
       `Pinecone deleteNamespace failed (${res.status}): ${errorBody}`

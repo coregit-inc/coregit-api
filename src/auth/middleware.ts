@@ -37,7 +37,7 @@ function timingSafeEqual(a: string, b: string): boolean {
   return result === 0;
 }
 
-const AUTH_CACHE_TTL = 30; // seconds
+const AUTH_CACHE_TTL = 60; // seconds (KV minimum is 60)
 
 interface CachedAuth {
   orgId: string;
