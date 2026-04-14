@@ -1,0 +1,81 @@
+name: Bug Report
+description: Report a bug in the Coregit API
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting! Please fill in the details below.
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: What happened?
+      placeholder: A clear description of the bug
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to Reproduce
+      description: How can we reproduce this?
+      placeholder: |
+        1. Call `POST /v1/repos/my-repo/commits` with body ...
+        2. Response returns ...
+        3. Expected ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected Behavior
+      description: What should have happened instead?
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - API (REST endpoints)
+        - Git protocol (clone/push/pull)
+        - SDK (@coregit/sdk)
+        - CLI (@coregit/cli)
+        - Semantic search
+        - Code graph
+        - LLM Wiki
+        - LFS
+        - Sync (GitHub/GitLab)
+        - Auth / API keys
+        - Self-hosting
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: response
+    attributes:
+      label: API Response
+      description: Include the HTTP status and response body if applicable
+      render: json
+
+  - type: input
+    id: sdk-version
+    attributes:
+      label: SDK/CLI Version
+      description: Output of `npm ls @coregit/sdk` or `cgt --version`
+      placeholder: "@coregit/sdk@0.7.2"
+
+  - type: dropdown
+    id: environment
+    attributes:
+      label: Environment
+      options:
+        - Hosted (api.coregit.dev)
+        - Self-hosted
+    validations:
+      required: true

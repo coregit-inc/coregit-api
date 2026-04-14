@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Documentation
+    url: https://docs.coregit.dev
+    about: Check the docs before opening an issue
+  - name: API Reference
+    url: https://docs.coregit.dev/docs/api-reference
+    about: Full API reference with examples
