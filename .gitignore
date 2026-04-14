@@ -5,6 +5,7 @@ dist/
 .env
 .env.*
 *.log
+.DS_Store
 
 # Benchmark files (may contain API keys)
 bench*.mjs
