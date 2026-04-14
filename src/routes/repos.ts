@@ -124,6 +124,7 @@ repos.post("/", apiKeyAuth, async (c) => {
 
     // Parallel: DB insert + R2 storage init (independent operations)
     const storage = new GitR2Storage(bucket, orgId, storageSuffix);
+    storage.setRefCacheKv(c.env.AUTH_CACHE as KVNamespace | undefined);
     const [dbResult] = await Promise.all([
       db.insert(repo).values({
         id: repoId,

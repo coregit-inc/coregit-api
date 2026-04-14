@@ -36,6 +36,13 @@ export function setRepoHotDORef(ns: DurableObjectNamespace | undefined) {
   _repoHotDORef = ns;
 }
 
+// Module-level ref for KV ref caching (set by middleware, used by resolveRepo)
+let _refCacheKvRef: KVNamespace | undefined;
+
+export function setRefCacheKvRef(kv: KVNamespace | undefined) {
+  _refCacheKvRef = kv;
+}
+
 // "_" is safe as null-namespace placeholder: NAMESPACE_REGEX only allows [a-z0-9-], never "_"
 function repoCacheKey(orgId: string, slug: string, namespace?: string | null): string {
   return `repo:${orgId}:${namespace || "_"}:${slug}`;
@@ -71,6 +78,7 @@ export async function resolveRepo(
     if (cached) {
       const storageSuffix = cached.namespace ? `${cached.namespace}/${cached.slug}` : cached.slug;
       const storage = new GitR2Storage(bucket, orgId, storageSuffix);
+      storage.setRefCacheKv(_refCacheKvRef);
       attachRepoHotDO(storage, orgId, storageSuffix, cached.id);
       const scopeKey = cached.namespace ? `${cached.namespace}/${cached.slug}` : cached.slug;
       return { repo: cached, storage, scopeKey, storageSuffix };
@@ -96,6 +104,7 @@ export async function resolveRepo(
 
   const storageSuffix = namespace ? `${namespace}/${slug}` : slug;
   const storage = new GitR2Storage(bucket, orgId, storageSuffix);
+  storage.setRefCacheKv(_refCacheKvRef);
   attachRepoHotDO(storage, orgId, storageSuffix, found.id);
   const scopeKey = namespace ? `${namespace}/${slug}` : slug;
 

@@ -56,6 +56,18 @@ export class GitR2Storage {
     try { this._edgeCache = caches.default; } catch { /* not available in tests */ }
   }
 
+  /** KV namespace for caching refs (write-through: KV read → R2 fallback) */
+  private _refCacheKv: KVNamespace | undefined;
+  private static readonly REF_CACHE_TTL = 60; // 60s — refs change on push/commit
+
+  setRefCacheKv(kv: KVNamespace | undefined) {
+    this._refCacheKv = kv;
+  }
+
+  private refCacheKey(refName: string): string {
+    return `ref:${this.basePath}/${refName}`;
+  }
+
   setPackIndexKv(kv: KVNamespace | undefined) {
     this._packIndexKv = kv;
   }
@@ -504,11 +516,24 @@ export class GitR2Storage {
       }
     }
 
-    // R2 (Level 1 writes refs directly to R2 — no DO fallback needed)
+    // KV cache (~5ms vs R2 ~100ms)
+    if (this._refCacheKv) {
+      const cached = await this._refCacheKv.get(this.refCacheKey(name), "text");
+      if (cached) return cached;
+    }
+
+    // R2 fallback
     const key = `${this.basePath}/${name}`;
     const obj = await this.bucket.get(key);
     if (!obj) return null;
-    return (await obj.text()).trim();
+    const sha = (await obj.text()).trim();
+
+    // Populate KV cache (fire-and-forget)
+    if (this._refCacheKv) {
+      this._refCacheKv.put(this.refCacheKey(name), sha, { expirationTtl: GitR2Storage.REF_CACHE_TTL }).catch(() => {});
+    }
+
+    return sha;
   }
 
   /**
@@ -521,14 +546,27 @@ export class GitR2Storage {
         method: "POST",
         body: JSON.stringify({ repoKey: this.basePath, refName: name, sha }),
       });
+      // Update KV cache so subsequent reads hit KV
+      if (this._refCacheKv) {
+        this._refCacheKv.put(this.refCacheKey(name), sha, { expirationTtl: GitR2Storage.REF_CACHE_TTL }).catch(() => {});
+      }
       return;
     }
 
-    // Level 1 (RepoDO) or no session: always write to R2 (durable, immediate read)
+    // Write-through: KV (fast reads) + R2 (durable) in parallel
     const key = `${this.basePath}/${name}`;
-    await this.bucket.put(key, sha + "\n", {
+    const r2Write = this.bucket.put(key, sha + "\n", {
       httpMetadata: { contentType: "text/plain" },
     });
+
+    if (this._refCacheKv) {
+      await Promise.all([
+        r2Write,
+        this._refCacheKv.put(this.refCacheKey(name), sha, { expirationTtl: GitR2Storage.REF_CACHE_TTL }),
+      ]);
+    } else {
+      await r2Write;
+    }
   }
 
   /**
@@ -554,7 +592,12 @@ export class GitR2Storage {
       httpMetadata: { contentType: "text/plain" },
       onlyIf: { etagMatches: expectedEtag },
     });
-    return result !== null;
+    const ok = result !== null;
+    // Update KV cache on success
+    if (ok && this._refCacheKv) {
+      this._refCacheKv.put(this.refCacheKey(name), sha, { expirationTtl: GitR2Storage.REF_CACHE_TTL }).catch(() => {});
+    }
+    return ok;
   }
 
   /**
@@ -563,6 +606,10 @@ export class GitR2Storage {
   async deleteRef(name: string): Promise<void> {
     const key = `${this.basePath}/${name}`;
     await this.bucket.delete(key);
+    // Invalidate KV cache
+    if (this._refCacheKv) {
+      this._refCacheKv.delete(this.refCacheKey(name)).catch(() => {});
+    }
   }
 
   /**
