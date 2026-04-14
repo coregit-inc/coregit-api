@@ -10,10 +10,15 @@ import * as schema from "./schema";
  * The wrapper adds .rows for backward compatibility at runtime.
  * TypeScript is satisfied via the type override below.
  */
+const clientCache = new Map<string, postgres.Sql>();
+
 export function createDb(connectionString: string) {
-  const client = postgres(connectionString);
-  const db = drizzlePostgresCompat(client);
-  return db;
+  let client = clientCache.get(connectionString);
+  if (!client) {
+    client = postgres(connectionString);
+    clientCache.set(connectionString, client);
+  }
+  return drizzlePostgresCompat(client);
 }
 
 function drizzlePostgresCompat(client: postgres.Sql) {

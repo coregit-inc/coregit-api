@@ -299,8 +299,10 @@ export async function createApiCommit(
   changes: FileChange[],
   parentSha?: string
 ): Promise<{ sha: string; treeSha: string; parentSha: string; changedBlobs: Map<string, string> }> {
-  // 1. Get current branch HEAD
-  const currentSha = await storage.getRef(`refs/heads/${branch}`);
+  // 1. Get current branch HEAD (with etag for CAS — avoids a second R2 read later)
+  const headRef = await storage.getRefWithEtag(`refs/heads/${branch}`);
+  const currentSha = headRef?.sha ?? null;
+  const initialEtag = headRef?.etag;
   const effectiveParent = parentSha || currentSha;
 
   if (parentSha && currentSha && parentSha !== currentSha) {
@@ -386,23 +388,16 @@ export async function createApiCommit(
   });
   const commitSha = await hashGitObject("commit", commitContent);
 
-  // 6. Write commit + read ref etag in parallel (~25ms saved)
-  if (currentSha) {
-    const [, ref] = await Promise.all([
-      storage.putObject(commitSha, "commit", commitContent),
-      storage.getRefWithEtag(`refs/heads/${branch}`),
-    ]);
-    if (ref) {
-      const ok = await storage.setRefConditional(
-        `refs/heads/${branch}`,
-        commitSha,
-        ref.etag
-      );
-      if (!ok) {
-        throw new ConflictError("Concurrent branch update. Retry.");
-      }
-    } else {
-      await storage.setRef(`refs/heads/${branch}`, commitSha);
+  // 6. Write commit + update ref with CAS (reuse etag from initial read)
+  if (currentSha && initialEtag) {
+    await storage.putObject(commitSha, "commit", commitContent);
+    const ok = await storage.setRefConditional(
+      `refs/heads/${branch}`,
+      commitSha,
+      initialEtag
+    );
+    if (!ok) {
+      throw new ConflictError("Concurrent branch update. Retry.");
     }
   } else {
     // First commit — no CAS needed, write commit + ref in parallel
