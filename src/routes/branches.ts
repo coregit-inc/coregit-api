@@ -69,26 +69,29 @@ const createBranchHandler = async (c: any) => {
   }
 
   try {
-    // Determine source SHA
+    // Parallel: resolve source + check if target branch already exists (2 R2 reads → 1 round-trip)
     let sourceSha: string | null = null;
     if (from_sha) {
-      // Create from specific commit
-      const exists = await storage.hasObject(from_sha);
+      // from_sha: verify existence + check target in parallel
+      const [exists, existing] = await Promise.all([
+        storage.hasObject(from_sha),
+        storage.getRef(`refs/heads/${name}`),
+      ]);
       if (!exists) return c.json({ error: "from_sha not found" }, 404);
+      if (existing) return c.json({ error: `Branch '${name}' already exists` }, 409);
       sourceSha = from_sha;
     } else {
-      // Create from branch (default: repo's default branch)
+      // from branch: resolve source ref + check target in parallel
       const sourceBranch = from || found.defaultBranch;
-      sourceSha = await storage.getRef(`refs/heads/${sourceBranch}`);
-      if (!sourceSha) {
+      const [sourceRef, existing] = await Promise.all([
+        storage.getRef(`refs/heads/${sourceBranch}`),
+        storage.getRef(`refs/heads/${name}`),
+      ]);
+      if (!sourceRef) {
         return c.json({ error: `Source branch '${sourceBranch}' not found` }, 404);
       }
-    }
-
-    // Check if branch already exists
-    const existing = await storage.getRef(`refs/heads/${name}`);
-    if (existing) {
-      return c.json({ error: `Branch '${name}' already exists` }, 409);
+      if (existing) return c.json({ error: `Branch '${name}' already exists` }, 409);
+      sourceSha = sourceRef;
     }
 
     await storage.setRef(`refs/heads/${name}`, sourceSha);

@@ -77,8 +77,15 @@ repos.post("/", apiKeyAuth, async (c) => {
   }
 
   try {
-    // Free tier: check repo limit
-    const repoLimit = await checkFreeLimits(db, orgId, c.get("orgTier"), "repo_created");
+    const ns = namespace || null;
+
+    // Parallel: check free limits + uniqueness + pre-fetch org slug (3 DB/KV ops → 1 round-trip)
+    const [repoLimit, existingRepo, orgSlug] = await Promise.all([
+      checkFreeLimits(db, orgId, c.get("orgTier"), "repo_created"),
+      resolveRepo(db, bucket, { orgId, slug, namespace: ns }),
+      getOrgSlug(db, orgId),
+    ]);
+
     if (!repoLimit.allowed) {
       return c.json({
         error: "Free tier limit exceeded: repositories",
@@ -87,20 +94,38 @@ repos.post("/", apiKeyAuth, async (c) => {
         upgrade_url: "https://app.coregit.dev/dashboard/billing",
       }, 429);
     }
-
-    // Check uniqueness (use resolver which handles namespace correctly)
-    const ns = namespace || null;
-    const existingRepo = await resolveRepo(db, bucket, { orgId, slug, namespace: ns });
     if (existingRepo) {
       return c.json({ error: "A repository with this slug already exists" }, 409);
     }
 
     const repoId = nanoid();
 
-    // Create DB record
-    const [newRepo] = await db
-      .insert(repo)
-      .values({
+    // Pre-compute git objects (CPU-only, no I/O) before DB+R2 parallel writes
+    const storageSuffix = ns ? `${ns}/${slug}` : slug;
+    let treeSha: string | undefined;
+    let commitSha: string | undefined;
+    let emptyTree: Uint8Array | undefined;
+    let commitContent: Uint8Array | undefined;
+
+    if (init) {
+      emptyTree = createTree([]);
+      treeSha = await hashGitObject("tree", emptyTree);
+      const timestamp = Math.floor(Date.now() / 1000);
+      const identity = `CoreGit <noreply@coregit.dev> ${timestamp} +0000`;
+      commitContent = createCommit({
+        tree: treeSha,
+        parents: [],
+        author: identity,
+        committer: identity,
+        message: "Initial commit",
+      });
+      commitSha = await hashGitObject("commit", commitContent);
+    }
+
+    // Parallel: DB insert + R2 storage init (independent operations)
+    const storage = new GitR2Storage(bucket, orgId, storageSuffix);
+    const [dbResult] = await Promise.all([
+      db.insert(repo).values({
         id: repoId,
         orgId,
         namespace: ns,
@@ -109,48 +134,26 @@ repos.post("/", apiKeyAuth, async (c) => {
         defaultBranch: default_branch,
         visibility,
         isTemplate: is_template,
-      })
-      .returning();
+      }).returning(),
+      init
+        ? Promise.all([
+            storage.setHead(`refs/heads/${default_branch}`),
+            storage.putObject(treeSha!, "tree", emptyTree!),
+            storage.putObject(commitSha!, "commit", commitContent!),
+            storage.setRef(`refs/heads/${default_branch}`, commitSha!),
+          ])
+        : storage.setHead(`refs/heads/${default_branch}`),
+    ]);
 
-    // Initialize R2 storage
-    const storageSuffix = ns ? `${ns}/${slug}` : slug;
-    const storage = new GitR2Storage(bucket, orgId, storageSuffix);
-    if (init) {
-      // Hash objects locally (CPU-only, no R2), then write all 4 R2 keys in parallel
-      const emptyTree = createTree([]);
-      const treeSha = await hashGitObject("tree", emptyTree);
+    const [newRepo] = dbResult;
 
-      const timestamp = Math.floor(Date.now() / 1000);
-      const identity = `CoreGit <noreply@coregit.dev> ${timestamp} +0000`;
-      const commitContent = createCommit({
-        tree: treeSha,
-        parents: [],
-        author: identity,
-        committer: identity,
-        message: "Initial commit",
-      });
-      const commitSha = await hashGitObject("commit", commitContent);
-
-      // Parallel R2 writes (~60-90ms saved vs sequential)
-      await Promise.all([
-        storage.setHead(`refs/heads/${default_branch}`),
-        storage.putObject(treeSha, "tree", emptyTree),
-        storage.putObject(commitSha, "commit", commitContent),
-        storage.setRef(`refs/heads/${default_branch}`, commitSha),
-      ]);
-    } else {
-      await storage.setHead(`refs/heads/${default_branch}`);
-    }
-
-    // Track usage + audit
+    // Track usage + audit (fire-and-forget, already non-blocking)
     recordUsage(c.executionCtx, db, orgId, "repo_created", 1, { repo_id: repoId }, c.env.DODO_PAYMENTS_API_KEY, c.get("dodoCustomerId"));
     recordAudit(c.executionCtx, db, {
       orgId, actorId: c.get("apiKeyId"), actorType: "master_key",
       action: "repo.create", resourceType: "repo", resourceId: repoId,
       metadata: { slug, namespace: ns }, requestId: c.get("requestId"),
     });
-
-    const orgSlug = await getOrgSlug(db, orgId);
 
     return c.json(
       {

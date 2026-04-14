@@ -132,9 +132,11 @@ const diffHandler = async (c: any) => {
     if (!baseTreeSha) return c.json({ error: "Invalid base commit" }, 500);
     if (!headTreeSha) return c.json({ error: "Invalid head commit" }, 500);
 
+    // Shared treeCache: subtrees common to both base and head are fetched once
+    const treeCache = new Map();
     const [baseFlat, headFlat] = await Promise.all([
-      flattenTree(storage, baseTreeSha),
-      flattenTree(storage, headTreeSha),
+      flattenTree(storage, baseTreeSha, "", treeCache),
+      flattenTree(storage, headTreeSha, "", treeCache),
     ]);
 
     const diffs = diffFlattenedTrees(baseFlat, headFlat);
