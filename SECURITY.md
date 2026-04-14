@@ -4,7 +4,7 @@
 
 If you discover a security vulnerability, please report it privately:
 
-**Email:** security@coregit.dev
+**Email:** alemzhan@strayl.dev
 
 Please do **not** open a public GitHub issue for security vulnerabilities.
 

@@ -166,7 +166,7 @@ See [Self-Hosting Guide](https://docs.coregit.dev/docs/guides/self-hosting) for 
 |---------|-------------|---------|
 | [@coregit/sdk](https://www.npmjs.com/package/@coregit/sdk) | TypeScript SDK | `npm install @coregit/sdk` |
 | [@coregit/cli](https://www.npmjs.com/package/@coregit/cli) | CLI tool | `npm install -g @coregit/cli` |
-| [Coregit Skill](https://github.com/Strayl-Inc/skills) | Claude Code skill | Install via skill marketplace |
+| [Coregit Skill](https://github.com/coregit-inc/skills) | Claude Code skill | `npx skills add coregit-inc/skills` |
 
 ## Documentation
 
