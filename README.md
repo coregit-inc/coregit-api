@@ -16,7 +16,7 @@
 
 ## Why Coregit?
 
-- **3.1x faster than GitHub** — 100-file commit: 24.5s vs 74.8s. One API call vs 103. ([see benchmarks](https://docs.coregit.dev/docs/guides/scalability-benchmarks))
+- **3.6x faster than GitHub** — 100-file commit: 19.8s vs 72.1s. One API call vs 105. ([see benchmarks](https://docs.coregit.dev/docs/guides/scalability-benchmarks))
 - **394x more write throughput** — 15,000 commits/hour vs GitHub's 38 (rate-limited to 500 writes/hr)
 - **AI-native** — Semantic code search (Voyage AI + Pinecone), code graph (Tree-sitter, 30+ languages), LLM Wiki (Karpathy pattern)
 - **Serverless** — Cloudflare Workers + R2 + KV + Durable Objects. No servers, no ops, scales to zero
@@ -123,12 +123,14 @@ Measured April 2026, private repos with authentication.
 
 | Operation | GitHub | Coregit | Winner |
 |-----------|--------|---------|--------|
-| Commit 5 files | 6,475 ms (8 calls) | **3,106 ms** (1 call) | **Coregit 2.1x** |
-| Commit 10 files | 7,945 ms (13 calls) | **3,829 ms** (1 call) | **Coregit 2.1x** |
-| Commit 100 files | 74,836 ms (103 calls) | **24,494 ms** (1 call) | **Coregit 3.1x** |
-| Read file (warm) | 726 ms | 800 ms | GitHub 1.1x |
-| List tree | 1,057 ms | **744 ms** | **Coregit 1.4x** |
-| List commits (warm) | 829 ms | **753 ms** | **Coregit 1.1x** |
+| Commit 1 file | 2,217 ms (4 calls) | **2,148 ms** (1 call) | **~Parity** |
+| Commit 5 files | 4,829 ms (8 calls) | **3,456 ms** (1 call) | **Coregit 1.4x** |
+| Commit 10 files | 8,387 ms (13 calls) | **4,183 ms** (1 call) | **Coregit 2.0x** |
+| Commit 100 files | 72,064 ms (105 calls) | **19,769 ms** (1 call) | **Coregit 3.6x** |
+| Read file (warm) | 735 ms | 800 ms | GitHub 1.1x |
+| List tree | 797 ms | **752 ms** | **Coregit 1.1x** |
+| List commits (warm) | 829 ms | **474 ms** | **Coregit 1.7x** |
+| Diff branches (warm) | 738 ms | 752 ms | **~Parity** |
 | Write throughput | 38 commits/hr | **15,000 commits/hr** | **Coregit 394x** |
 
 [Full benchmark methodology](https://docs.coregit.dev/docs/guides/scalability-benchmarks)
