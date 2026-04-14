@@ -2,4 +2,10 @@ node_modules/
 dist/
 .wrangler/
 .dev.vars
+.env
+.env.*
 *.log
+
+# Benchmark files (may contain API keys)
+bench*.mjs
+bench*.ts
