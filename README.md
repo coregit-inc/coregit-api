@@ -17,7 +17,7 @@
 ## Why Coregit?
 
 - **3.6x faster than GitHub** — 100-file commit: 19.8s vs 72.1s. One API call vs 105. ([see benchmarks](https://docs.coregit.dev/docs/guides/scalability-benchmarks))
-- **394x more write throughput** — 15,000 commits/hour vs GitHub's 38 (rate-limited to 500 writes/hr)
+- **~40x more write throughput** — 15,000 commits/hour vs GitHub's ~370 (limited by secondary rate limit of 80 writes/min)
 - **AI-native** — Semantic code search (Voyage AI + Pinecone), code graph (Tree-sitter, 30+ languages), LLM Wiki (Karpathy pattern)
 - **Serverless** — Cloudflare Workers + R2 + KV + Durable Objects. No servers, no ops, scales to zero
 - **Standard Git protocol** — `git clone`, `push`, `pull` work. Plus 40+ REST API endpoints, TypeScript SDK, and CLI
@@ -131,7 +131,7 @@ Measured April 2026, private repos with authentication.
 | List tree | 797 ms | **752 ms** | **Coregit 1.1x** |
 | List commits (warm) | 829 ms | **474 ms** | **Coregit 1.7x** |
 | Diff branches (warm) | 738 ms | 752 ms | **~Parity** |
-| Write throughput | 38 commits/hr | **15,000 commits/hr** | **Coregit 394x** |
+| Write throughput | ~370 commits/hr | **15,000 commits/hr** | **Coregit ~40x** |
 
 [Full benchmark methodology](https://docs.coregit.dev/docs/guides/scalability-benchmarks)
 
