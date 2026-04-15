@@ -137,16 +137,68 @@ Measured April 2026, private repos with authentication.
 
 ## Architecture
 
+```mermaid
+flowchart TB
+    clients(["SDK &nbsp;·&nbsp; CLI &nbsp;·&nbsp; git clone/push &nbsp;·&nbsp; cURL"])
+
+    clients -->|HTTPS| router
+
+    subgraph cf ["Cloudflare Edge"]
+        router["<b>Hono v4.7</b><br/>Auth · Rate Limiting"]
+
+        subgraph do ["Durable Objects"]
+            direction LR
+            rl["RateLimiter<br/><i>600 req/min</i>"]
+            session["SessionDO<br/><i>zero-wait protocol</i>"]
+            repodo["RepoDO<br/><i>~2 ms hot writes</i>"]
+        end
+
+        subgraph routes ["40+ API Routes"]
+            direction LR
+            git["Git Smart HTTP<br/><i>clone · push · pull</i>"]
+            rest["REST API<br/><i>repos · commits · branches<br/>diff · merge · cherry-pick</i>"]
+            search["Search<br/><i>semantic · graph · hybrid</i>"]
+            wiki["LLM Wiki<br/><i>11 endpoints</i>"]
+        end
+
+        kv["<b>KV Cache</b><br/>auth · trees · refs · embeddings · search · graph"]
+        edge["<b>Edge Cache</b><br/>immutable SHA objects · 1 yr TTL"]
+        queue["<b>Queues</b><br/>async indexing"]
+    end
+
+    subgraph storage ["Storage"]
+        direction LR
+        r2["<b>Cloudflare R2</b><br/>git objects · packfiles · LFS<br/><i>$0 egress</i>"]
+        neon["<b>Neon PostgreSQL</b><br/>repos · code graph · usage<br/><i>via Hyperdrive</i>"]
+    end
+
+    subgraph ai ["AI &amp; Search Pipeline"]
+        direction LR
+        voyage["<b>Voyage AI</b><br/>voyage-code-3<br/>rerank-2.5"]
+        pinecone["<b>Pinecone</b><br/>vector store"]
+        treesitter["<b>Tree-sitter</b><br/>AST → code graph<br/><i>30+ languages</i>"]
+    end
+
+    router --> do
+    router --> routes
+    routes --> kv --> edge
+    routes --> r2 & neon
+    repodo -->|"write-through"| r2
+    routes --> queue
+    queue --> voyage --> pinecone
+    queue --> treesitter --> neon
 ```
-Cloudflare Workers (Hono)
-├── R2 — Git object storage (content-addressed, zero egress)
-├── KV — Caching (auth, trees, embeddings, search results)
-├── Durable Objects — Rate limiting, session state, per-repo hot layer
-├── Hyperdrive — PostgreSQL connection pooling (Neon)
-├── Queues — Async indexing (semantic + code graph)
-├── Pinecone — Vector search
-└── Voyage AI — Code embeddings + reranking
-```
+
+### Caching hierarchy
+
+| Layer | Latency | What's cached | TTL |
+|-------|---------|---------------|-----|
+| In-memory (per-request) | 0 ms | Git objects (32 MB cap) | Request lifetime |
+| Durable Objects (RepoDO) | ~2 ms | Hot writes, pending flushes | 30s flush interval |
+| KV (global edge) | 5–15 ms | Auth, trees, refs, embeddings | 60s – forever |
+| Edge Cache API | < 5 ms | Immutable git objects (by SHA) | 1 year |
+| Hyperdrive | 0–5 ms | DB query results | 60s |
+| R2 | 50–200 ms | All git objects, refs, packfiles | Permanent |
 
 ## Self-Hosting
 
