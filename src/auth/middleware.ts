@@ -12,6 +12,7 @@ import { createMiddleware } from "hono/factory";
 import { sql } from "drizzle-orm";
 import type { Env, Variables } from "../types";
 import { getOrgPlan } from "../services/limits";
+import { preloadOrgSlug } from "../services/repo-resolver";
 import { recordUsage } from "../services/usage";
 import { checkRateLimit, rateLimitHeaders, checkOrgRateLimit, orgRateLimitHeaders, type RateLimitResult } from "../services/rate-limit";
 import type { Scopes } from "./scopes";
@@ -37,7 +38,7 @@ function timingSafeEqual(a: string, b: string): boolean {
   return result === 0;
 }
 
-const AUTH_CACHE_TTL = 300; // 5 minutes — keys rarely change mid-session, revocation checked in JS
+const AUTH_CACHE_TTL = 600; // 10 minutes — keys rarely change mid-session, revocation checked in JS
 
 interface CachedAuth {
   orgId: string;
@@ -45,6 +46,7 @@ interface CachedAuth {
   tokenId: string;
   tier: "free" | "usage";
   dodoCustomerId: string | null;
+  orgSlug?: string; // populated on cache miss, saves a separate getOrgSlug() lookup
 }
 
 /**
@@ -78,9 +80,11 @@ export async function verifyWithCache(
     const result = await db.execute(
       sql`SELECT st.id, st.org_id, st.scopes, st.expires_at, st.revoked_at,
                  COALESCE(op.tier, 'free') AS tier,
-                 op.dodo_customer_id
+                 op.dodo_customer_id,
+                 org.slug AS org_slug
           FROM scoped_token st
           LEFT JOIN org_plan op ON op.org_id = st.org_id
+          LEFT JOIN organization org ON org.id = st.org_id
           WHERE st.key_hash = ${keyHash}
           LIMIT 1`
     );
@@ -97,15 +101,18 @@ export async function verifyWithCache(
         tokenId: row.id,
         tier: row.tier ?? "free",
         dodoCustomerId: row.dodo_customer_id ?? null,
+        orgSlug: row.org_slug || undefined,
       };
     }
   } else {
     const result = await db.execute(
       sql`SELECT ak.id, ak.org_id, ak.expires_at,
                  COALESCE(op.tier, 'free') AS tier,
-                 op.dodo_customer_id
+                 op.dodo_customer_id,
+                 org.slug AS org_slug
           FROM api_key ak
           LEFT JOIN org_plan op ON op.org_id = ak.org_id
+          LEFT JOIN organization org ON org.id = ak.org_id
           WHERE ak.key_hash = ${keyHash}
           LIMIT 1`
     );
@@ -120,6 +127,7 @@ export async function verifyWithCache(
         tokenId: row.id,
         tier: row.tier ?? "free",
         dodoCustomerId: row.dodo_customer_id ?? null,
+        orgSlug: row.org_slug || undefined,
       };
     }
   }
@@ -246,6 +254,9 @@ export const apiKeyAuth = createMiddleware<{
   c.set("apiKeyId", auth.tokenId);
   c.set("orgTier", auth.tier);
   c.set("dodoCustomerId", auth.dodoCustomerId);
+
+  // Preload org slug so getOrgSlug() skips KV + DB lookups
+  if (auth.orgSlug) preloadOrgSlug(auth.orgId, auth.orgSlug);
 
   // ── Rate limiting: per-key + per-org in parallel (via Durable Objects) ──
   const [rl, orgRl] = await Promise.all([

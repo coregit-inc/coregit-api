@@ -14,7 +14,7 @@ import { eq, and, or, isNull, sql, desc } from "drizzle-orm";
 import { apiKeyAuth } from "../auth/middleware";
 import { repo } from "../db/schema";
 import { GitR2Storage } from "../git/storage";
-import { createTree, createCommit, hashGitObject, parseGitObject, parseCommit } from "../git/objects";
+import { createTree, createCommit, hashGitObject, createGitObjectRaw, parseGitObject, parseCommit } from "../git/objects";
 import { recordUsage } from "../services/usage";
 import { recordAudit } from "../services/audit";
 import { deleteNamespace } from "../services/pinecone";
@@ -27,6 +27,11 @@ import type { Env, Variables } from "../types";
 const repos = new Hono<{ Bindings: Env; Variables: Variables }>();
 
 const SLUG_REGEX = /^[a-z0-9][a-z0-9-]{0,98}[a-z0-9]$|^[a-z0-9]$/;
+
+// Git empty tree SHA — well-known constant: SHA-1("tree 0\0") = 4b825dc...
+// Avoids an async crypto.subtle.digest call on every repo creation.
+const EMPTY_TREE_SHA = "4b825dc642cb6eb9a060e54bf899d15006ef8a2f";
+const EMPTY_TREE_BYTES = createTree([]);
 
 function validateSlug(slug: string): boolean {
   return SLUG_REGEX.test(slug) && !slug.includes("--");
@@ -102,18 +107,16 @@ repos.post("/", apiKeyAuth, async (c) => {
 
     // Pre-compute git objects (CPU-only, no I/O) before DB+R2 parallel writes
     const storageSuffix = ns ? `${ns}/${slug}` : slug;
-    let treeSha: string | undefined;
     let commitSha: string | undefined;
-    let emptyTree: Uint8Array | undefined;
     let commitContent: Uint8Array | undefined;
 
     if (init) {
-      emptyTree = createTree([]);
-      treeSha = await hashGitObject("tree", emptyTree);
+      // Tree SHA is a well-known constant (empty tree), no need to hash.
+      // Only the commit needs async SHA-1 (timestamp varies per call).
       const timestamp = Math.floor(Date.now() / 1000);
       const identity = `CoreGit <noreply@coregit.dev> ${timestamp} +0000`;
       commitContent = createCommit({
-        tree: treeSha,
+        tree: EMPTY_TREE_SHA,
         parents: [],
         author: identity,
         committer: identity,
@@ -139,7 +142,7 @@ repos.post("/", apiKeyAuth, async (c) => {
       init
         ? Promise.all([
             storage.setHead(`refs/heads/${default_branch}`),
-            storage.putObject(treeSha!, "tree", emptyTree!),
+            storage.putObject(EMPTY_TREE_SHA, "tree", EMPTY_TREE_BYTES),
             storage.putObject(commitSha!, "commit", commitContent!),
             storage.setRef(`refs/heads/${default_branch}`, commitSha!),
           ])

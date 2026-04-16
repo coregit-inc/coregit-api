@@ -59,6 +59,7 @@ export class GitR2Storage {
   /** KV namespace for caching refs (write-through: KV read → R2 fallback) */
   private _refCacheKv: KVNamespace | undefined;
   private static readonly REF_CACHE_TTL = 60; // 60s — refs change on push/commit
+  private static readonly HEAD_CACHE_TTL = 300; // 300s — HEAD rarely changes (only on default branch switch)
 
   setRefCacheKv(kv: KVNamespace | undefined) {
     this._refCacheKv = kv;
@@ -66,6 +67,10 @@ export class GitR2Storage {
 
   private refCacheKey(refName: string): string {
     return `ref:${this.basePath}/${refName}`;
+  }
+
+  private headCacheKey(): string {
+    return `head:${this.basePath}`;
   }
 
   setPackIndexKv(kv: KVNamespace | undefined) {
@@ -650,8 +655,21 @@ export class GitR2Storage {
   /**
    * Get HEAD reference
    * Returns either a ref name (e.g., "refs/heads/main") or a SHA
+   * Uses KV cache (HEAD rarely changes — only on default branch switch).
    */
   async getHead(): Promise<{ type: "ref" | "sha"; value: string } | null> {
+    // KV cache (~5ms vs R2 ~100ms). HEAD = "ref: refs/heads/main" almost always.
+    if (this._refCacheKv) {
+      const cached = await this._refCacheKv.get(this.headCacheKey(), "text");
+      if (cached) {
+        if (cached.startsWith("ref: ")) {
+          return { type: "ref", value: cached.slice(5) };
+        }
+        return { type: "sha", value: cached };
+      }
+    }
+
+    // R2 fallback
     const key = `${this.basePath}/HEAD`;
     const obj = await this.bucket.get(key);
 
@@ -660,6 +678,11 @@ export class GitR2Storage {
     }
 
     const content = (await obj.text()).trim();
+
+    // Populate KV cache (fire-and-forget)
+    if (this._refCacheKv) {
+      this._refCacheKv.put(this.headCacheKey(), content, { expirationTtl: GitR2Storage.HEAD_CACHE_TTL }).catch(() => {});
+    }
 
     if (content.startsWith("ref: ")) {
       return { type: "ref", value: content.slice(5) };
@@ -688,22 +711,43 @@ export class GitR2Storage {
 
   /**
    * Set HEAD to point to a ref
+   * Write-through: R2 (durable) + KV cache (fast reads) in parallel.
    */
   async setHead(ref: string): Promise<void> {
     const key = `${this.basePath}/HEAD`;
-    await this.bucket.put(key, `ref: ${ref}\n`, {
+    const content = `ref: ${ref}`;
+    const r2Write = this.bucket.put(key, content + "\n", {
       httpMetadata: { contentType: "text/plain" },
     });
+
+    if (this._refCacheKv) {
+      await Promise.all([
+        r2Write,
+        this._refCacheKv.put(this.headCacheKey(), content, { expirationTtl: GitR2Storage.HEAD_CACHE_TTL }),
+      ]);
+    } else {
+      await r2Write;
+    }
   }
 
   /**
    * Set HEAD to a direct SHA (detached HEAD)
+   * Write-through: R2 (durable) + KV cache (fast reads) in parallel.
    */
   async setHeadDetached(sha: string): Promise<void> {
     const key = `${this.basePath}/HEAD`;
-    await this.bucket.put(key, sha + "\n", {
+    const r2Write = this.bucket.put(key, sha + "\n", {
       httpMetadata: { contentType: "text/plain" },
     });
+
+    if (this._refCacheKv) {
+      await Promise.all([
+        r2Write,
+        this._refCacheKv.put(this.headCacheKey(), sha, { expirationTtl: GitR2Storage.HEAD_CACHE_TTL }),
+      ]);
+    } else {
+      await r2Write;
+    }
   }
 
   // ============ Repository Operations ============

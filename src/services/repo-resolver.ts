@@ -27,7 +27,7 @@ export interface ResolvedRepo {
   storageSuffix: string;
 }
 
-const REPO_CACHE_TTL = 300; // 5 minutes — repos rarely change metadata, invalidated on PATCH/DELETE
+const REPO_CACHE_TTL = 600; // 10 minutes — repos rarely change metadata, invalidated on PATCH/DELETE
 
 // Module-level ref for per-repo hot layer DO
 let _repoHotDORef: DurableObjectNamespace | undefined;
@@ -135,14 +135,35 @@ export async function invalidateRepoCache(
   await authCache.delete(repoCacheKey(orgId, slug, namespace)).catch(() => {});
 }
 
-const ORG_SLUG_CACHE_TTL = 300; // 5 minutes — org slugs never change
+const ORG_SLUG_CACHE_TTL = 1800; // 30 minutes — org slugs never change
+
+/**
+ * In-memory org slug preload — populated by auth middleware from CachedAuth.orgSlug.
+ * Saves a KV lookup (~5ms) on every request that calls getOrgSlug().
+ * Safe with concurrent requests: org slugs are immutable, so stale entries are fine.
+ */
+const _orgSlugPreload = new Map<string, string>();
+const ORG_SLUG_PRELOAD_MAX = 500;
+
+export function preloadOrgSlug(orgId: string, slug: string): void {
+  if (_orgSlugPreload.size >= ORG_SLUG_PRELOAD_MAX && !_orgSlugPreload.has(orgId)) {
+    // Evict oldest entry
+    const first = _orgSlugPreload.keys().next().value;
+    if (first) _orgSlugPreload.delete(first);
+  }
+  _orgSlugPreload.set(orgId, slug);
+}
 
 /**
  * Look up an organization's slug by ID.
- * Uses AUTH_CACHE (key: orgslug:{orgId}, TTL 300s) when available.
+ * Check order: in-memory preload → AUTH_CACHE KV → DB.
  * Falls back to orgId if the org record is missing.
  */
 export async function getOrgSlug(db: Database, orgId: string): Promise<string> {
+  // In-memory preload (populated by auth middleware, ~0ms)
+  const preloaded = _orgSlugPreload.get(orgId);
+  if (preloaded) return preloaded;
+
   const authCache = _authCacheRef;
   const cacheKey = `orgslug:${orgId}`;
 
