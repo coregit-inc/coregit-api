@@ -328,26 +328,23 @@ export class GitR2Storage {
       }
     }
 
-    // Level 1 (RepoDO): write-through — R2 in background, return after DO ack.
-    // DO write is fast (~2ms), R2 write runs in parallel via fire-and-forget.
-    // Reads go to R2 directly — no DO fallback needed.
+    // Level 1 (RepoDO): write to R2 (required for reads) + DO (hot cache) concurrently.
+    // R2 write MUST complete before returning — getObject reads from R2, not DO.
     if (this._repoDOStub) {
       const r2Key = this.objectKey(sha);
-      // Fire-and-forget R2 write (durability) — don't await
-      this.bucket.put(r2Key, compressed, {
+      // R2 write (required for read consistency) — MUST await
+      const r2Write = this.bucket.put(r2Key, compressed, {
         httpMetadata: { contentType: "application/x-git-object" },
-      }).catch(() => {});
-      // DO write (fast ack) — await for in-request consistency
-      const res = await this._repoDOStub.fetch(
+      });
+      // DO write (hot cache for future commits) — fire-and-forget
+      this._repoDOStub.fetch(
         `https://repo-hot/put-object?sha=${sha}&basePath=${encodeURIComponent(this.basePath)}`,
         { method: "POST", body: compressed }
-      );
-      if (res.status === 202) {
-        this._addToCache(sha, fullObject);
-        this._putObjCache(sha, compressed);
-        return;
-      }
-      // DO full — R2 write already in flight, just wait for it
+      ).catch(() => {});
+      await r2Write;
+      this._addToCache(sha, fullObject);
+      this._putObjCache(sha, compressed);
+      return;
     }
 
     // No session, no RepoDO: direct R2 write
@@ -588,7 +585,7 @@ export class GitR2Storage {
   /**
    * Set a reference to point to a SHA
    */
-  async setRef(name: string, sha: string): Promise<void> {
+  async setRef(name: string, sha: string, treeSha?: string): Promise<void> {
     // Session (Level 2): write to DO only — flushed on session close
     if (this._sessionStub) {
       await this._sessionStub.fetch("https://session/put-ref", {
@@ -607,6 +604,7 @@ export class GitR2Storage {
     const writes: Promise<unknown>[] = [
       this.bucket.put(key, sha + "\n", {
         httpMetadata: { contentType: "text/plain" },
+        customMetadata: treeSha ? { treeSha } : undefined,
       }),
     ];
 
@@ -619,9 +617,9 @@ export class GitR2Storage {
     // RepoDO: fire-and-forget write for hot layer (DO flushes to R2 on alarm too)
     if (this._repoDOStub) {
       writes.push(
-        this._repoDOStub.fetch("https://repo/put-ref", {
+        this._repoDOStub.fetch("https://repo-hot/put-ref", {
           method: "POST",
-          body: JSON.stringify({ refName: name, sha }),
+          body: JSON.stringify({ refName: name, sha, treeSha }),
         }).catch(() => {})
       );
     }
@@ -633,12 +631,29 @@ export class GitR2Storage {
    * Get a reference along with its R2 etag (for conditional updates).
    * Returns null if the ref doesn't exist.
    */
-  async getRefWithEtag(name: string): Promise<{ sha: string; etag: string } | null> {
+  async getRefWithEtag(name: string): Promise<{ sha: string; etag: string; treeSha?: string } | null> {
+    // RepoDO path: DO is colocated with Worker (~5ms vs R2 ~200-500ms)
+    if (this._repoDOStub) {
+      try {
+        const res = await this._repoDOStub.fetch(
+          `https://repo-hot/get-ref-versioned?refName=${encodeURIComponent(name)}`
+        );
+        if (res.ok) {
+          const data = (await res.json()) as { sha: string; version: number; treeSha?: string };
+          return { sha: data.sha, etag: `do:${data.version}`, treeSha: data.treeSha };
+        }
+        // 404 = ref not in DO (new repo or first access) — fall through to R2
+      } catch {
+        // DO error — fall through to R2
+      }
+    }
+
+    // R2 fallback
     const key = `${this.basePath}/${name}`;
     const obj = await this.bucket.get(key);
     if (!obj) return null;
     const sha = (await obj.text()).trim();
-    return { sha, etag: obj.etag };
+    return { sha, etag: obj.etag, treeSha: obj.customMetadata?.treeSha };
   }
 
   /**
@@ -646,10 +661,53 @@ export class GitR2Storage {
    * Only writes if the current object's etag matches expectedEtag.
    * Returns true if the write succeeded, false if CAS failed (concurrent update).
    */
-  async setRefConditional(name: string, sha: string, expectedEtag: string): Promise<boolean> {
+  async setRefConditional(name: string, sha: string, expectedEtag: string, treeSha?: string): Promise<boolean> {
+    // DO-based CAS: etag = "do:{version}" from getRefWithEtag DO path
+    if (expectedEtag.startsWith("do:") && this._repoDOStub) {
+      const expectedVersion = parseInt(expectedEtag.slice(3), 10);
+      try {
+        const res = await this._repoDOStub.fetch("https://repo-hot/cas-ref", {
+          method: "POST",
+          body: JSON.stringify({
+            refName: name,
+            newSha: sha,
+            expectedVersion,
+            treeSha,
+            basePath: this.basePath,
+          }),
+        });
+        if (res.ok) {
+          const data = (await res.json()) as { ok: boolean };
+          if (data.ok) {
+            // Write ref to R2 (required — getRef reads from KV→R2) + KV in parallel
+            const durabilityWrites: Promise<unknown>[] = [
+              this.bucket.put(`${this.basePath}/${name}`, sha + "\n", {
+                httpMetadata: { contentType: "text/plain" },
+                customMetadata: treeSha ? { treeSha } : undefined,
+              }),
+            ];
+            if (this._refCacheKv) {
+              durabilityWrites.push(
+                this._refCacheKv.put(this.refCacheKey(name), sha, { expirationTtl: GitR2Storage.REF_CACHE_TTL })
+              );
+            }
+            await Promise.all(durabilityWrites);
+            return true;
+          }
+          return false; // CAS conflict
+        }
+      } catch {
+        // DO error — fall through to R2 CAS would fail (wrong etag format)
+        // Return false to trigger retry, which will fall back to R2 path
+        return false;
+      }
+    }
+
+    // R2-based CAS (fallback or non-DO path)
     const key = `${this.basePath}/${name}`;
     const result = await this.bucket.put(key, sha + "\n", {
       httpMetadata: { contentType: "text/plain" },
+      customMetadata: treeSha ? { treeSha } : undefined,
       onlyIf: { etagMatches: expectedEtag },
     });
     const ok = result !== null;
@@ -884,6 +942,35 @@ export class GitR2Storage {
     }
 
     return { count: copied };
+  }
+
+  // ============ Edge Cache: Flat Commit Tree ============
+
+  /** Read cached flat tree from per-colo edge cache (Cache API, <5ms). */
+  async getCachedCommitTree(branch: string): Promise<{
+    commitSha: string;
+    flatTree: [string, { sha: string; mode: string }][];
+  } | null> {
+    if (!this._edgeCache) return null;
+    const cacheKey = `${GitR2Storage.CACHE_BASE}/${this.basePath}/committree/refs/heads/${branch}`;
+    try {
+      const cached = await this._edgeCache.match(cacheKey);
+      if (!cached) return null;
+      return await cached.json();
+    } catch { return null; }
+  }
+
+  /** Write flat tree to per-colo edge cache (fire-and-forget). Validated by commitSha on read. */
+  putCachedCommitTree(branch: string, commitSha: string, flatTree: Map<string, { sha: string; mode: string }>): void {
+    if (!this._edgeCache) return;
+    const cacheKey = `${GitR2Storage.CACHE_BASE}/${this.basePath}/committree/refs/heads/${branch}`;
+    const response = new Response(JSON.stringify({
+      commitSha,
+      flatTree: [...flatTree.entries()],
+    }), {
+      headers: { "Cache-Control": "public, s-maxage=3600", "Content-Type": "application/json" },
+    });
+    this._edgeCache.put(cacheKey, response).catch(() => {});
   }
 
   // ============ Private Helpers ============

@@ -40,6 +40,8 @@ export class RepoHotDO implements DurableObject {
     if (path === "/get-object") return this.handleGetObject(url);
     if (path === "/put-ref" && request.method === "POST") return this.handlePutRef(request);
     if (path === "/get-ref") return this.handleGetRef(url);
+    if (path === "/get-ref-versioned") return this.handleGetRefVersioned(url);
+    if (path === "/cas-ref" && request.method === "POST") return this.handleCasRef(request);
     if (path === "/flush" && request.method === "POST") return this.handleFlush();
     if (path === "/status") return this.handleStatus();
 
@@ -101,8 +103,16 @@ export class RepoHotDO implements DurableObject {
   // ── Put Ref ──
 
   private async handlePutRef(request: Request): Promise<Response> {
-    const body = (await request.json()) as { refName: string; sha: string };
-    await this.state.storage.put(`ref:${body.refName}`, body.sha);
+    const body = (await request.json()) as { refName: string; sha: string; treeSha?: string };
+    const ver = ((await this.state.storage.get(`refver:${body.refName}`)) as number) ?? 0;
+    const newVer = ver + 1;
+    // Atomic batch: ref value + version + treeSha (if provided)
+    const entries: Record<string, string | number> = {
+      [`ref:${body.refName}`]: body.sha,
+      [`refver:${body.refName}`]: newVer,
+    };
+    if (body.treeSha) entries[`reftree:${body.refName}`] = body.treeSha;
+    await this.state.storage.put(entries);
 
     const currentAlarm = await this.state.storage.getAlarm();
     if (!currentAlarm) {
@@ -122,6 +132,73 @@ export class RepoHotDO implements DurableObject {
     if (!sha) return new Response(null, { status: 404 });
 
     return Response.json({ sha });
+  }
+
+  // ── Get Ref Versioned (for DO-based CAS) ──
+
+  private async handleGetRefVersioned(url: URL): Promise<Response> {
+    const refName = url.searchParams.get("refName");
+    if (!refName) return new Response("refName required", { status: 400 });
+
+    const sha = await this.state.storage.get(`ref:${refName}`) as string | undefined;
+    if (!sha) return new Response(null, { status: 404 });
+
+    const version = ((await this.state.storage.get(`refver:${refName}`)) as number) ?? 0;
+    const treeSha = (await this.state.storage.get(`reftree:${refName}`)) as string | undefined;
+
+    return Response.json({ sha, version, treeSha });
+  }
+
+  // ── CAS Ref (compare-and-swap via DO single-thread) ──
+
+  private async handleCasRef(request: Request): Promise<Response> {
+    const body = (await request.json()) as {
+      refName: string;
+      newSha: string;
+      expectedVersion: number;
+      treeSha?: string;
+      basePath?: string;
+    };
+
+    // Store basePath on first write (needed for R2 flush)
+    if (body.basePath) {
+      const stored = await this.state.storage.get("basePath");
+      if (!stored) await this.state.storage.put("basePath", body.basePath);
+    }
+
+    const currentVersion = ((await this.state.storage.get(`refver:${body.refName}`)) as number) ?? 0;
+    if (currentVersion !== body.expectedVersion) {
+      return Response.json({ ok: false, currentVersion }, { status: 409 });
+    }
+
+    const newVer = currentVersion + 1;
+    const entries: Record<string, string | number> = {
+      [`ref:${body.refName}`]: body.newSha,
+      [`refver:${body.refName}`]: newVer,
+    };
+    if (body.treeSha) entries[`reftree:${body.refName}`] = body.treeSha;
+    await this.state.storage.put(entries);
+
+    // Fire-and-forget R2 write for durability
+    const basePath = (await this.state.storage.get("basePath")) as string | undefined;
+    if (basePath) {
+      const bucket = this.env.REPOS_BUCKET as R2Bucket;
+      if (bucket) {
+        const r2Key = `${basePath}/${body.refName}`;
+        bucket.put(r2Key, body.newSha + "\n", {
+          httpMetadata: { contentType: "text/plain" },
+          customMetadata: body.treeSha ? { treeSha: body.treeSha } : undefined,
+        }).catch(() => {});
+      }
+    }
+
+    // Schedule flush alarm for remaining objects
+    const currentAlarm = await this.state.storage.getAlarm();
+    if (!currentAlarm) {
+      this.state.storage.setAlarm(Date.now() + FLUSH_INTERVAL_MS);
+    }
+
+    return Response.json({ ok: true, version: newVer });
   }
 
   // ── Status ──
@@ -144,9 +221,7 @@ export class RepoHotDO implements DurableObject {
   async alarm(): Promise<void> {
     await this.ensureLoaded();
     if (this.objectCount === 0) {
-      // Check refs too
-      const refEntries = await this.state.storage.list({ prefix: "ref:" });
-      if (refEntries.size === 0) return; // nothing to flush
+      return; // no pending objects to flush (refs stay cached in DO)
     }
 
     try {
@@ -192,21 +267,23 @@ export class RepoHotDO implements DurableObject {
       flushedObjects += batch.length;
     }
 
-    // Flush refs
+    // Flush refs (keep in DO as cache — refs are tiny, serve as read-through cache)
     const refEntries = await this.state.storage.list({ prefix: "ref:" });
     for (const [key, sha] of refEntries) {
       const refName = key.slice(4); // remove "ref:"
       const r2Key = `${basePath}/${refName}`;
+      // Include treeSha in R2 customMetadata if available
+      const treeSha = (await this.state.storage.get(`reftree:${refName}`)) as string | undefined;
       await bucket.put(r2Key, (sha as string) + "\n", {
         httpMetadata: { contentType: "text/plain" },
+        customMetadata: treeSha ? { treeSha } : undefined,
       });
       flushedRefs++;
     }
 
-    // Clear flushed entries
+    // Clear flushed entries (only objects — refs stay as cache for fast DO reads)
     const keysToDelete = [
       ...objArray.map(([k]) => k),
-      ...[...refEntries.keys()],
     ];
     if (keysToDelete.length > 0) {
       await this.state.storage.delete(keysToDelete);

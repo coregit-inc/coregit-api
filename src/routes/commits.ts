@@ -172,6 +172,7 @@ const createCommitHandler = async (c: any) => {
         tree_sha: result.treeSha,
         branch,
         parent: result.parentSha,
+        _timing: result.timing,
       },
       201
     );

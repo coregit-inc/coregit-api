@@ -262,9 +262,16 @@ export async function createApiCommit(
   author: CommitAuthor,
   changes: FileChange[],
   parentSha?: string
-): Promise<{ sha: string; treeSha: string; parentSha: string; changedBlobs: Map<string, string> }> {
-  // 1. Get current branch HEAD (with etag for CAS — avoids a second R2 read later)
-  const headRef = await storage.getRefWithEtag(`refs/heads/${branch}`);
+): Promise<{ sha: string; treeSha: string; parentSha: string; changedBlobs: Map<string, string>; timing?: Record<string, number> }> {
+  const t: Record<string, number> = {};
+  const t0 = performance.now();
+
+  // 1. Read ref + edge cache IN PARALLEL (both resolve in ~200ms max)
+  const [headRef, cachedTree] = await Promise.all([
+    storage.getRefWithEtag(`refs/heads/${branch}`),
+    storage.getCachedCommitTree(branch),
+  ]);
+  t.refRead = Math.round(performance.now() - t0);
   const currentSha = headRef?.sha ?? null;
   const initialEtag = headRef?.etag;
   const effectiveParent = parentSha || currentSha;
@@ -275,11 +282,26 @@ export async function createApiCommit(
     );
   }
 
-  // 2. Read current tree (or start with empty tree for first commit)
+  // 2. Read current tree — 3 strategies, each falling through to the next
   let currentTree = new Map<string, { sha: string; mode: string }>();
+  let treeStrategy = "none";
+  const t1 = performance.now();
   if (effectiveParent) {
-    currentTree = await flattenTreeFromCommit(storage, effectiveParent);
+    if (cachedTree && cachedTree.commitSha === effectiveParent) {
+      // Strategy 1: Edge cache HIT → zero R2 reads (per-colo, immediate consistency)
+      currentTree = new Map(cachedTree.flatTree);
+      treeStrategy = "edge_cache";
+    } else if (headRef?.treeSha && effectiveParent === currentSha) {
+      // Strategy 2: treeSha from ref metadata → skip getObject(commit), read tree directly
+      currentTree = await flattenTreeFromSha(storage, headRef.treeSha, "", undefined, _treeCacheRef);
+      treeStrategy = "treeSha_meta";
+    } else {
+      // Strategy 3: Full R2 flow (fallback for old refs without metadata or explicit parentSha)
+      currentTree = await flattenTreeFromCommit(storage, effectiveParent);
+      treeStrategy = "full_r2";
+    }
   }
+  t.treeLoad = Math.round(performance.now() - t1);
 
   // 3. Apply changes — collect blobs first, then batch-write to R2
   const pendingBlobs: { sha: string; type: "blob"; data: Uint8Array }[] = [];
@@ -333,12 +355,16 @@ export async function createApiCommit(
   }
 
   // Batch-write all blobs in parallel
+  const t2 = performance.now();
   if (pendingBlobs.length > 0) {
     await storage.putObjectBatch(pendingBlobs);
   }
+  t.blobWrite = Math.round(performance.now() - t2);
 
   // 4. Build nested tree objects
+  const t3 = performance.now();
   const rootTreeSha = await buildTreeFromFlat(storage, currentTree);
+  t.treeWrite = Math.round(performance.now() - t3);
 
   // 5. Create commit
   const timestamp = Math.floor(Date.now() / 1000);
@@ -352,13 +378,15 @@ export async function createApiCommit(
   });
   const commitSha = await hashGitObject("commit", commitContent);
 
-  // 6. Write commit + update ref with CAS (reuse etag from initial read)
+  // 6. Write commit + update ref with CAS (reuse etag from initial read) + treeSha metadata
+  const t4 = performance.now();
   if (currentSha && initialEtag) {
     await storage.putObject(commitSha, "commit", commitContent);
     const ok = await storage.setRefConditional(
       `refs/heads/${branch}`,
       commitSha,
-      initialEtag
+      initialEtag,
+      rootTreeSha
     );
     if (!ok) {
       throw new ConflictError("Concurrent branch update. Retry.");
@@ -367,11 +395,16 @@ export async function createApiCommit(
     // First commit — no CAS needed, write commit + ref in parallel
     await Promise.all([
       storage.putObject(commitSha, "commit", commitContent),
-      storage.setRef(`refs/heads/${branch}`, commitSha),
+      storage.setRef(`refs/heads/${branch}`, commitSha, rootTreeSha),
     ]);
   }
 
-  // Cache the new commit's flat tree for the next commit (fire-and-forget)
+  t.commitRefWrite = Math.round(performance.now() - t4);
+  t.total = Math.round(performance.now() - t0);
+  t.strategy = treeStrategy === "edge_cache" ? 1 : treeStrategy === "treeSha_meta" ? 2 : treeStrategy === "full_r2" ? 3 : 0;
+
+  // 7. Cache flat tree for next commit — edge cache (immediate, per-colo) + KV (eventual, global)
+  storage.putCachedCommitTree(branch, commitSha, currentTree);
   const kv = _treeCacheRef;
   if (kv) {
     kv.put(`ftree:${commitSha}`, JSON.stringify([...currentTree.entries()])).catch(() => {});
@@ -382,6 +415,7 @@ export async function createApiCommit(
     treeSha: rootTreeSha,
     parentSha: effectiveParent || "",
     changedBlobs,
+    timing: t,
   };
 }
 
