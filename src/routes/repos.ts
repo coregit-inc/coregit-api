@@ -20,7 +20,7 @@ import { recordAudit } from "../services/audit";
 import { deleteNamespace } from "../services/pinecone";
 import { checkFreeLimits } from "../services/limits";
 import { isMasterKey, hasRepoAccess, getAccessibleRepoKeys } from "../auth/scopes";
-import { resolveRepo, buildGitUrl, buildApiUrl, invalidateRepoCache, getOrgSlug } from "../services/repo-resolver";
+import { resolveRepo, buildGitUrl, buildApiUrl, invalidateRepoCache, getOrgSlug, attachRepoHotDO } from "../services/repo-resolver";
 import { extractRepoParams, validateNamespace } from "./helpers";
 import type { Env, Variables } from "../types";
 
@@ -128,6 +128,7 @@ repos.post("/", apiKeyAuth, async (c) => {
     // Parallel: DB insert + R2 storage init (independent operations)
     const storage = new GitR2Storage(bucket, orgId, storageSuffix);
     storage.setRefCacheKv(c.env.AUTH_CACHE as KVNamespace | undefined);
+    attachRepoHotDO(storage, orgId, storageSuffix, repoId);
     const [dbResult] = await Promise.all([
       db.insert(repo).values({
         id: repoId,
@@ -200,28 +201,40 @@ function decodeCursor(cursor: string): { updatedAt: Date; id: string } | null {
 }
 
 // GET /v1/repos
+const LIST_REPOS_CACHE_TTL = 30; // 30s — short TTL, no invalidation needed
+
 repos.get("/", apiKeyAuth, async (c) => {
   const orgId = c.get("orgId");
   const db = c.get("db");
   const limit = Math.min(parseInt(c.req.query("limit") || "50", 10), 100);
   const cursor = c.req.query("cursor");
   const nsFilter = c.req.query("namespace");
+  const templateFilter = c.req.query("is_template");
 
   // Backward compat: offset still works when no cursor provided
   const offset = cursor ? 0 : Math.max(parseInt(c.req.query("offset") || "0", 10), 0);
+
+  // KV cache for master key (non-scoped) requests
+  const accessibleKeys = getAccessibleRepoKeys(c.get("apiKeyPermissions"));
+  const authCache = c.env.AUTH_CACHE as KVNamespace | undefined;
+  const isCacheable = accessibleKeys === null && authCache; // only cache master key requests
+
+  if (isCacheable) {
+    const cacheKey = `repos:${orgId}:${limit}:${cursor || ""}:${nsFilter || ""}:${templateFilter || ""}:${offset}`;
+    const cached = await authCache.get(cacheKey, "json");
+    if (cached) return c.json(cached);
+  }
 
   try {
     let conditions: ReturnType<typeof eq> | ReturnType<typeof and> = eq(repo.orgId, orgId);
     if (nsFilter) {
       conditions = and(conditions, eq(repo.namespace, nsFilter))!;
     }
-    const templateFilter = c.req.query("is_template");
     if (templateFilter === "true") {
       conditions = and(conditions, eq(repo.isTemplate, true))!;
     }
 
     // Scoped tokens: push scope filter to SQL for correct pagination
-    const accessibleKeys = getAccessibleRepoKeys(c.get("apiKeyPermissions"));
     if (accessibleKeys !== null && accessibleKeys.length > 0) {
       const scopeConditions = accessibleKeys.map((key) => {
         const slashIdx = key.indexOf("/");
@@ -264,7 +277,7 @@ repos.get("/", apiKeyAuth, async (c) => {
       ? encodeCursor(results[results.length - 1].updatedAt, results[results.length - 1].id)
       : null;
 
-    return c.json({
+    const response = {
       repos: results.map((r) => ({
         id: r.id,
         namespace: r.namespace,
@@ -280,7 +293,15 @@ repos.get("/", apiKeyAuth, async (c) => {
       limit,
       next_cursor: nextCursor,
       ...(cursor ? {} : { offset }),
-    });
+    };
+
+    // Cache result (fire-and-forget)
+    if (isCacheable) {
+      const cacheKey = `repos:${orgId}:${limit}:${cursor || ""}:${nsFilter || ""}:${templateFilter || ""}:${offset}`;
+      authCache.put(cacheKey, JSON.stringify(response), { expirationTtl: LIST_REPOS_CACHE_TTL }).catch(() => {});
+    }
+
+    return c.json(response);
   } catch (error) {
     console.error("Failed to list repos:", error);
     return c.json({ error: "Failed to list repositories" }, 500);

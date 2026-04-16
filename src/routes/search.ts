@@ -78,7 +78,8 @@ async function searchRepo(
   pathFilter: RegExp | null,
   contextLines: number,
   maxResults: number,
-  deadline: number
+  deadline: number,
+  kvCache?: KVNamespace
 ): Promise<{ matches: SearchMatch[]; truncated: boolean }> {
   const matches: SearchMatch[] = [];
 
@@ -95,8 +96,8 @@ async function searchRepo(
   if (obj.type !== "commit") return { matches: [], truncated: false };
   const treeSha = parseCommit(obj.content).tree;
 
-  // Flatten tree to get all file paths
-  const flat = await flattenTree(storage, treeSha);
+  // Flatten tree to get all file paths (KV-cached by treeSha)
+  const flat = await flattenTree(storage, treeSha, "", undefined, kvCache);
 
   // Collect blob SHAs to search (filter by path, skip dirs)
   const toSearch: { path: string; sha: string }[] = [];
@@ -106,34 +107,44 @@ async function searchRepo(
     toSearch.push({ path, sha: entry.sha });
   }
 
-  // Search blobs in batches
-  for (const { path, sha } of toSearch) {
+  // Search blobs in parallel batches (50 files per batch)
+  const SEARCH_BATCH_SIZE = 50;
+
+  for (let batchStart = 0; batchStart < toSearch.length; batchStart += SEARCH_BATCH_SIZE) {
     if (Date.now() > deadline) return { matches, truncated: true };
     if (matches.length >= maxResults) return { matches, truncated: true };
 
-    const blobRaw = await storage.getObject(sha);
-    if (!blobRaw) continue;
+    const batch = toSearch.slice(batchStart, batchStart + SEARCH_BATCH_SIZE);
+    const shas = batch.map(b => b.sha);
+    const blobMap = await storage.getObjectBatch(shas, 20);
 
-    const blobObj = parseGitObject(blobRaw);
-    if (blobObj.type !== "blob") continue;
-    if (blobObj.content.byteLength > MAX_BLOB_SIZE) continue;
-    if (isBinary(blobObj.content)) continue;
-
-    const text = new TextDecoder().decode(blobObj.content);
-    const lines = text.split("\n");
-
-    for (let i = 0; i < lines.length; i++) {
+    for (const { path, sha } of batch) {
       if (matches.length >= maxResults) return { matches, truncated: true };
-      if (query.test(lines[i])) {
-        matches.push({
-          repo_slug: repoSlug,
-          repo_namespace: repoNamespace,
-          path,
-          line: i + 1,
-          content: lines[i],
-          context_before: lines.slice(Math.max(0, i - contextLines), i),
-          context_after: lines.slice(i + 1, i + 1 + contextLines),
-        });
+
+      const blobRaw = blobMap.get(sha);
+      if (!blobRaw) continue;
+
+      const blobObj = parseGitObject(blobRaw);
+      if (blobObj.type !== "blob") continue;
+      if (blobObj.content.byteLength > MAX_BLOB_SIZE) continue;
+      if (isBinary(blobObj.content)) continue;
+
+      const text = new TextDecoder().decode(blobObj.content);
+      const lines = text.split("\n");
+
+      for (let i = 0; i < lines.length; i++) {
+        if (matches.length >= maxResults) return { matches, truncated: true };
+        if (query.test(lines[i])) {
+          matches.push({
+            repo_slug: repoSlug,
+            repo_namespace: repoNamespace,
+            path,
+            line: i + 1,
+            content: lines[i],
+            context_before: lines.slice(Math.max(0, i - contextLines), i),
+            context_after: lines.slice(i + 1, i + 1 + contextLines),
+          });
+        }
       }
     }
   }
@@ -224,6 +235,7 @@ search.post("/search", apiKeyAuth, async (c) => {
   const allMatches: SearchMatch[] = [];
   let truncated = false;
   let reposSearched = 0;
+  const kvCache = c.env.TREE_CACHE as KVNamespace | undefined;
 
   for (const r of repos) {
     if (Date.now() > deadline || allMatches.length >= maxResults) {
@@ -248,7 +260,8 @@ search.post("/search", apiKeyAuth, async (c) => {
       pathFilter,
       contextLines,
       maxResults - allMatches.length,
-      deadline
+      deadline,
+      kvCache
     );
 
     allMatches.push(...result.matches);

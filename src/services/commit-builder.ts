@@ -11,10 +11,10 @@ import {
   createCommit,
   parseGitObject,
   parseCommit,
-  parseTree,
   createTree,
   type TreeEntry,
 } from "../git/objects";
+import { flattenTree as flattenTreeFromSha } from "../git/cherry-pick";
 
 export interface EditOperation {
   /** Replace lines [start, end] (1-based, inclusive). Use same start/end to insert before that line. */
@@ -58,8 +58,9 @@ export function setTreeCacheRef(kv: KVNamespace | undefined) {
 }
 
 /**
- * Recursively flatten a git tree into a Map<path, {sha, mode}>.
- * Uses KV cache keyed by commitSha — tree is immutable, so no TTL needed.
+ * Flatten a commit's tree into a Map<path, {sha, mode}>.
+ * Uses commit-level KV cache (ftree:{commitSha}) + delegates to cherry-pick's
+ * flattenTree for the actual tree walk (with tree-level KV cache).
  */
 async function flattenTreeFromCommit(
   storage: GitR2Storage,
@@ -75,13 +76,13 @@ async function flattenTreeFromCommit(
     }
   }
 
-  // Cache miss — flatten from R2
+  // Cache miss — flatten from R2 using shared flattenTree (gets tree-level KV cache too)
   const raw = await storage.getObject(commitSha);
   if (!raw) throw new Error(`Commit not found: ${commitSha}`);
   const obj = parseGitObject(raw);
   if (obj.type !== "commit") throw new Error(`Expected commit, got ${obj.type}`);
   const commit = parseCommit(obj.content);
-  const tree = await flattenTree(storage, commit.tree);
+  const tree = await flattenTreeFromSha(storage, commit.tree, "", undefined, kv);
 
   // Write to KV cache (fire-and-forget, no TTL — immutable)
   if (kv) {
@@ -89,43 +90,6 @@ async function flattenTreeFromCommit(
   }
 
   return tree;
-}
-
-async function flattenTree(
-  storage: GitR2Storage,
-  treeSha: string,
-  prefix = ""
-): Promise<Map<string, { sha: string; mode: string }>> {
-  const raw = await storage.getObject(treeSha);
-  if (!raw) throw new Error(`Tree not found: ${treeSha}`);
-  const obj = parseGitObject(raw);
-  if (obj.type !== "tree") throw new Error(`Expected tree, got ${obj.type}`);
-  const entries = parseTree(obj.content);
-  const result = new Map<string, { sha: string; mode: string }>();
-
-  const dirs = entries.filter((e) => e.mode === "40000");
-  const files = entries.filter((e) => e.mode !== "40000");
-
-  for (const entry of files) {
-    const fullPath = prefix ? `${prefix}/${entry.name}` : entry.name;
-    result.set(fullPath, { sha: entry.sha, mode: entry.mode });
-  }
-
-  if (dirs.length > 0) {
-    const subtrees = await Promise.all(
-      dirs.map((entry) => {
-        const fullPath = prefix ? `${prefix}/${entry.name}` : entry.name;
-        return flattenTree(storage, entry.sha, fullPath);
-      })
-    );
-    for (const subtree of subtrees) {
-      for (const [path, val] of subtree) {
-        result.set(path, val);
-      }
-    }
-  }
-
-  return result;
 }
 
 /**

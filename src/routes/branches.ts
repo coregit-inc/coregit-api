@@ -391,9 +391,10 @@ const mergeBranchHandler = async (c: any) => {
       }
 
       // Diff: what changed in source since merge-base
+      const kvCache = c.env.TREE_CACHE as KVNamespace | undefined;
       const [mergeBaseFlat, sourceFlat] = await Promise.all([
-        flattenTree(storage, mergeBaseTreeSha, "", treeCache),
-        flattenTree(storage, sourceTreeSha, "", treeCache),
+        flattenTree(storage, mergeBaseTreeSha, "", treeCache, kvCache),
+        flattenTree(storage, sourceTreeSha, "", treeCache, kvCache),
       ]);
       const diffs = diffFlattenedTrees(mergeBaseFlat, sourceFlat);
 

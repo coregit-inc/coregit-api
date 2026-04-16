@@ -115,7 +115,7 @@ export async function resolveRepo(
  * Attach per-repo hot layer DO to storage instance.
  * Called automatically by resolveRepo — every request gets hot layer for free.
  */
-function attachRepoHotDO(storage: GitR2Storage, orgId: string, storageSuffix: string, repoId: string) {
+export function attachRepoHotDO(storage: GitR2Storage, orgId: string, storageSuffix: string, repoId: string) {
   if (!_repoHotDORef) return;
   const doId = _repoHotDORef.idFromName(repoId);
   const stub = _repoHotDORef.get(doId);

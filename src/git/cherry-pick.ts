@@ -166,18 +166,34 @@ export async function walkFirstParentChain(
 /**
  * Recursively flatten a git tree into a Map<path, {sha, mode}>.
  * All sibling directories are fetched in parallel (BFS per level).
+ *
+ * Caching layers:
+ *   L1: in-memory `treeCache` Map (per-request, cross-call dedup)
+ *   L2: KV `kvCache` (cross-request, keyed by root treeSha — immutable)
  */
 export async function flattenTree(
   storage: GitR2Storage,
   treeSha: string,
   prefix: string = "",
-  treeCache?: Map<string, FlatTree>
+  treeCache?: Map<string, FlatTree>,
+  kvCache?: KVNamespace
 ): Promise<FlatTree> {
   // Check cross-call cache for this exact subtree
   const cacheKey = `${treeSha}:${prefix}`;
   if (treeCache) {
     const cached = treeCache.get(cacheKey);
     if (cached) return cached;
+  }
+
+  // L2: KV cache — only on root call (prefix === "") to avoid per-subtree KV lookups
+  if (prefix === "" && kvCache) {
+    const kvKey = `ftree:${treeSha}`;
+    const cached = await kvCache.get(kvKey, "json") as Array<[string, FlatEntry]> | null;
+    if (cached) {
+      const result: FlatTree = new Map(cached);
+      if (treeCache) treeCache.set(cacheKey, result);
+      return result;
+    }
   }
 
   const entries = await getTreeEntries(storage, treeSha);
@@ -207,9 +223,15 @@ export async function flattenTree(
     }
   }
 
-  // Store in cache for reuse
+  // Store in L1 cache for reuse
   if (treeCache) {
     treeCache.set(cacheKey, result);
+  }
+
+  // Store in L2 KV — only root call, fire-and-forget (tree SHA is immutable, no TTL)
+  if (prefix === "" && kvCache) {
+    const kvKey = `ftree:${treeSha}`;
+    kvCache.put(kvKey, JSON.stringify([...result.entries()])).catch(() => {});
   }
 
   return result;

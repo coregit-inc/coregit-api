@@ -142,9 +142,10 @@ const compareHandler = async (c: any) => {
     }
 
     const treeCache = new Map<string, FlatTree>();
+    const kvCache = c.env.TREE_CACHE as KVNamespace | undefined;
     const [mergeBaseFlat, headFlat] = await Promise.all([
-      flattenTree(storage, mergeBaseTreeSha, "", treeCache),
-      flattenTree(storage, headTreeSha, "", treeCache),
+      flattenTree(storage, mergeBaseTreeSha, "", treeCache, kvCache),
+      flattenTree(storage, headTreeSha, "", treeCache, kvCache),
     ]);
 
     const diffs = diffFlattenedTrees(mergeBaseFlat, headFlat);

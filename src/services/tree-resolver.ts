@@ -58,13 +58,13 @@ export async function getTreeBlobShas(
     }
   }
 
-  // Cache miss — flatten tree from R2
+  // Cache miss — flatten tree from R2 (pass kv as L2 tree cache)
   const raw = await storage.getObject(commitSha);
   if (!raw) throw new Error(`Commit not found: ${commitSha}`);
   const obj = parseGitObject(raw);
   if (obj.type !== "commit") throw new Error(`Not a commit: ${commitSha}`);
   const commit = parseCommit(obj.content);
-  const tree = await flattenTree(storage, commit.tree);
+  const tree = await flattenTree(storage, commit.tree, "", undefined, kv);
 
   // Build blobSha → filePath map (skip dirs)
   const blobMap = new Map<string, string>();

@@ -58,7 +58,7 @@ export class GitR2Storage {
 
   /** KV namespace for caching refs (write-through: KV read → R2 fallback) */
   private _refCacheKv: KVNamespace | undefined;
-  private static readonly REF_CACHE_TTL = 60; // 60s — refs change on push/commit
+  private static readonly REF_CACHE_TTL = 300; // 300s — CAS protects writes, KV updated on setRef()
   private static readonly HEAD_CACHE_TTL = 300; // 300s — HEAD rarely changes (only on default branch switch)
 
   setRefCacheKv(kv: KVNamespace | undefined) {
@@ -521,6 +521,9 @@ export class GitR2Storage {
       }
     }
 
+    // Note: RepoDO NOT checked here — cold DO startup (~50-100ms) is slower than KV (~5ms).
+    // setRef() writes to KV in parallel with DO, so KV is always up-to-date.
+
     // KV cache (~5ms vs R2 ~100ms)
     if (this._refCacheKv) {
       const cached = await this._refCacheKv.get(this.refCacheKey(name), "text");
@@ -558,20 +561,31 @@ export class GitR2Storage {
       return;
     }
 
-    // Write-through: KV (fast reads) + R2 (durable) in parallel
+    // Write-through: R2 (durable, required for CAS) + KV (fast reads) + RepoDO (hot layer)
     const key = `${this.basePath}/${name}`;
-    const r2Write = this.bucket.put(key, sha + "\n", {
-      httpMetadata: { contentType: "text/plain" },
-    });
+    const writes: Promise<unknown>[] = [
+      this.bucket.put(key, sha + "\n", {
+        httpMetadata: { contentType: "text/plain" },
+      }),
+    ];
 
     if (this._refCacheKv) {
-      await Promise.all([
-        r2Write,
-        this._refCacheKv.put(this.refCacheKey(name), sha, { expirationTtl: GitR2Storage.REF_CACHE_TTL }),
-      ]);
-    } else {
-      await r2Write;
+      writes.push(
+        this._refCacheKv.put(this.refCacheKey(name), sha, { expirationTtl: GitR2Storage.REF_CACHE_TTL })
+      );
     }
+
+    // RepoDO: fire-and-forget write for hot layer (DO flushes to R2 on alarm too)
+    if (this._repoDOStub) {
+      writes.push(
+        this._repoDOStub.fetch("https://repo/put-ref", {
+          method: "POST",
+          body: JSON.stringify({ refName: name, sha }),
+        }).catch(() => {})
+      );
+    }
+
+    await Promise.all(writes);
   }
 
   /**

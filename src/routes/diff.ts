@@ -134,9 +134,10 @@ const diffHandler = async (c: any) => {
 
     // Shared treeCache: subtrees common to both base and head are fetched once
     const treeCache = new Map();
+    const kvCache = c.env.TREE_CACHE as KVNamespace | undefined;
     const [baseFlat, headFlat] = await Promise.all([
-      flattenTree(storage, baseTreeSha, "", treeCache),
-      flattenTree(storage, headTreeSha, "", treeCache),
+      flattenTree(storage, baseTreeSha, "", treeCache, kvCache),
+      flattenTree(storage, headTreeSha, "", treeCache, kvCache),
     ]);
 
     const diffs = diffFlattenedTrees(baseFlat, headFlat);
