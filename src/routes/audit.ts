@@ -44,7 +44,7 @@ audit.get("/audit-log", apiKeyAuth, async (c) => {
     query = sql`${query} AND created_at <= ${until}::timestamptz`;
   }
   if (cursor) {
-    const cursorId = parseInt(cursor, 10);
+    const cursorId = Number(cursor);
     if (!Number.isSafeInteger(cursorId) || cursorId <= 0) {
       return c.json({ error: "Invalid cursor" }, 400);
     }
