@@ -67,6 +67,11 @@ id = "b1ab293bd0934871bf9369b024ed9b74"
 binding = "AUTH_CACHE"
 id = "2e8b19027dac46aea1920850f594188c"
 
+# Git object cache (immutable SHA-addressed, no TTL)
+[[kv_namespaces]]
+binding = "GIT_OBJ_CACHE"
+id = "0d6c6341b99e415e9c89a2cac2a65bcc"
+
 # Semantic search indexing queue
 [[queues.producers]]
 queue = "coregit-indexing"

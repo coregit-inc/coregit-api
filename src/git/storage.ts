@@ -65,6 +65,24 @@ export class GitR2Storage {
     this._refCacheKv = kv;
   }
 
+  /** KV cache for immutable git objects (commits, trees, small blobs) */
+  private _objCacheKv: KVNamespace | undefined;
+  private static readonly MAX_KV_OBJECT_BYTES = 25 * 1024; // 25KB compressed — covers commits + trees + most source files
+
+  setObjCacheKv(kv: KVNamespace | undefined) {
+    this._objCacheKv = kv;
+  }
+
+  private objCacheKey(sha: string): string {
+    return `obj:${sha}`;
+  }
+
+  /** Fire-and-forget KV cache write for small objects */
+  private _putObjCache(sha: string, compressed: Uint8Array): void {
+    if (!this._objCacheKv || compressed.byteLength > GitR2Storage.MAX_KV_OBJECT_BYTES) return;
+    this._objCacheKv.put(this.objCacheKey(sha), compressed).catch(() => {});
+  }
+
   private refCacheKey(refName: string): string {
     return `ref:${this.basePath}/${refName}`;
   }
@@ -113,13 +131,28 @@ export class GitR2Storage {
       }
     }
 
+    // 2.5. KV object cache (global, <5ms — between per-colo edge cache and R2)
+    if (this._objCacheKv) {
+      const kvHit = await this._objCacheKv.get(this.objCacheKey(sha), "arrayBuffer");
+      if (kvHit) {
+        const compressed = new Uint8Array(kvHit);
+        const result = this._decompressAndCache(sha, compressed);
+        // Promote to edge cache (fire-and-forget) so next read from same colo is <1ms
+        this._putEdgeCache(edgeCacheKey, result);
+        return result;
+      }
+    }
+
     // 3. Try loose object in R2 (most objects live here)
     const key = this.objectKey(sha);
     const looseObj = await this.bucket.get(key);
 
     if (looseObj) {
-      const result = this._decompressAndCache(sha, new Uint8Array(await looseObj.arrayBuffer()));
+      const compressed = new Uint8Array(await looseObj.arrayBuffer());
+      const result = this._decompressAndCache(sha, compressed);
       this._putEdgeCache(edgeCacheKey, result);
+      // Write-through to KV (fire-and-forget) — next read from ANY colo hits KV
+      this._putObjCache(sha, compressed);
       return result;
     }
 
@@ -130,6 +163,11 @@ export class GitR2Storage {
       const fullObject = createGitObjectRaw(type, data);
       this._addToCache(sha, fullObject);
       this._putEdgeCache(edgeCacheKey, fullObject);
+      // KV write-through for pack objects too
+      if (this._objCacheKv) {
+        const compressed = zlibSync(fullObject);
+        this._putObjCache(sha, compressed);
+      }
       return fullObject;
     }
 
@@ -285,6 +323,7 @@ export class GitR2Storage {
       );
       if (res.status === 202) {
         this._addToCache(sha, fullObject);
+        this._putObjCache(sha, compressed);
         return;
       }
     }
@@ -305,6 +344,7 @@ export class GitR2Storage {
       );
       if (res.status === 202) {
         this._addToCache(sha, fullObject);
+        this._putObjCache(sha, compressed);
         return;
       }
       // DO full — R2 write already in flight, just wait for it
@@ -315,6 +355,7 @@ export class GitR2Storage {
     await this.bucket.put(key, compressed, {
       httpMetadata: { contentType: "application/x-git-object" },
     });
+    this._putObjCache(sha, compressed);
   }
 
   /**

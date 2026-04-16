@@ -25,6 +25,8 @@ export interface Env {
   EMBEDDING_CACHE?: KVNamespace;
   // Auth + repo cache
   AUTH_CACHE?: KVNamespace;
+  // Git object cache (immutable SHA-addressed)
+  GIT_OBJ_CACHE?: KVNamespace;
   // Code graph
   GRAPH_CACHE?: KVNamespace;
   HYBRID_CACHE?: KVNamespace;
