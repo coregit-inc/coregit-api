@@ -171,9 +171,27 @@ export class GitR2Storage {
       return fullObject;
     }
 
-    // 5. Session DO (Level 2 only) — unflushed writes from active session
-    // RepoDO (Level 1) flushes to R2 every 30s, so objects are always in R2.
-    // Only sessions defer writes — check DO only when session is active.
+    // 5. RepoDO (Level 1) — recently committed objects not yet flushed to R2.
+    // putObject writes to DO + fire-and-forget R2. R2 write may not complete before
+    // next read. DO is already warm from the commit, so this is fast (~5ms).
+    if (this._repoDOStub) {
+      try {
+        const doRes = await this._repoDOStub.fetch(
+          `https://repo-hot/get-object?sha=${sha}`
+        );
+        if (doRes.ok) {
+          const compressed = new Uint8Array(await doRes.arrayBuffer());
+          const result = this._decompressAndCache(sha, compressed);
+          // Promote to edge cache for future reads
+          this._putEdgeCache(edgeCacheKey, result);
+          return result;
+        }
+      } catch {
+        // DO error — object truly doesn't exist
+      }
+    }
+
+    // 6. Session DO (Level 2 only) — unflushed writes from active session
     if (this._sessionStub) {
       const hotRes = await this._sessionStub.fetch(
         `https://session/get-object?sha=${sha}&repoKey=${encodeURIComponent(this.basePath)}`
@@ -328,23 +346,25 @@ export class GitR2Storage {
       }
     }
 
-    // Level 1 (RepoDO): write to R2 (required for reads) + DO (hot cache) concurrently.
-    // R2 write MUST complete before returning — getObject reads from R2, not DO.
+    // Level 1 (RepoDO): write to DO (fast ack) + R2 (fire-and-forget durability).
+    // Reads check DO as fallback if R2 miss (see getObject).
     if (this._repoDOStub) {
       const r2Key = this.objectKey(sha);
-      // R2 write (required for read consistency) — MUST await
-      const r2Write = this.bucket.put(r2Key, compressed, {
+      // Fire-and-forget R2 write (durability — may be cancelled after response)
+      this.bucket.put(r2Key, compressed, {
         httpMetadata: { contentType: "application/x-git-object" },
-      });
-      // DO write (hot cache for future commits) — fire-and-forget
-      this._repoDOStub.fetch(
+      }).catch(() => {});
+      // DO write (fast ack, ~2ms) — objects survive in DO until alarm flush
+      const res = await this._repoDOStub.fetch(
         `https://repo-hot/put-object?sha=${sha}&basePath=${encodeURIComponent(this.basePath)}`,
         { method: "POST", body: compressed }
-      ).catch(() => {});
-      await r2Write;
-      this._addToCache(sha, fullObject);
-      this._putObjCache(sha, compressed);
-      return;
+      );
+      if (res.status === 202) {
+        this._addToCache(sha, fullObject);
+        this._putObjCache(sha, compressed);
+        return;
+      }
+      // DO full (507) — R2 write already in flight, fall through to await it
     }
 
     // No session, no RepoDO: direct R2 write
@@ -679,19 +699,16 @@ export class GitR2Storage {
         if (res.ok) {
           const data = (await res.json()) as { ok: boolean };
           if (data.ok) {
-            // Write ref to R2 (required — getRef reads from KV→R2) + KV in parallel
-            const durabilityWrites: Promise<unknown>[] = [
-              this.bucket.put(`${this.basePath}/${name}`, sha + "\n", {
-                httpMetadata: { contentType: "text/plain" },
-                customMetadata: treeSha ? { treeSha } : undefined,
-              }),
-            ];
+            // Await KV write (fast, ~5ms) — getRef reads KV first, so ref MUST be in KV
             if (this._refCacheKv) {
-              durabilityWrites.push(
-                this._refCacheKv.put(this.refCacheKey(name), sha, { expirationTtl: GitR2Storage.REF_CACHE_TTL })
-              );
+              await this._refCacheKv.put(this.refCacheKey(name), sha, { expirationTtl: GitR2Storage.REF_CACHE_TTL });
             }
-            await Promise.all(durabilityWrites);
+            // Fire-and-forget R2 write (backup for cross-colo reads where KV hasn't propagated)
+            // Note: DO's handleCasRef also fires R2 write — belt and suspenders
+            this.bucket.put(`${this.basePath}/${name}`, sha + "\n", {
+              httpMetadata: { contentType: "text/plain" },
+              customMetadata: treeSha ? { treeSha } : undefined,
+            }).catch(() => {});
             return true;
           }
           return false; // CAS conflict

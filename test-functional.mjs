@@ -130,7 +130,8 @@ async function run() {
   console.log('\n8. Commit history');
   const log = await api('GET', `/v1/repos/${slug}/commits?limit=10`);
   assert(log.status === 200, `Commit log: ${log.status}`);
-  assert(log.body?.commits?.length === 3, `3 commits in history: ${log.body?.commits?.length}`, log.body?.commits?.map(c => c.message));
+  // Repo creation auto-adds "Initial commit", so we expect 4 (1 auto + 3 manual)
+  assert(log.body?.commits?.length === 4, `4 commits in history: ${log.body?.commits?.length}`, log.body?.commits?.map(c => c.message));
 
   // 9. Diff
   console.log('\n9. Diff between commit 1 and 2');
@@ -166,7 +167,8 @@ async function run() {
   assert(finalRead.body?.content === 'export const version = 14;\n', `Final content correct`, finalRead.body?.content);
 
   const finalLog = await api('GET', `/v1/repos/${slug}/commits?limit=20`);
-  assert(finalLog.body?.commits?.length === 8, `8 total commits: ${finalLog.body?.commits?.length}`);
+  // 1 auto + 3 manual + 5 rapid = 9
+  assert(finalLog.body?.commits?.length === 9, `9 total commits: ${finalLog.body?.commits?.length}`);
 
   // 11. Branch create + commit on branch
   console.log('\n11. Branch operations');
