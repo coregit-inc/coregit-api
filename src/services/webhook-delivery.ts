@@ -8,6 +8,7 @@
 import { sql } from "drizzle-orm";
 import type { Database } from "../db";
 import { decryptSecret } from "./secret-manager";
+import { isPrivateUrl } from "./url-validator";
 
 const encoder = new TextEncoder();
 
@@ -90,6 +91,12 @@ async function doDeliver(
     .filter((wh) => wh.events.includes(event) || wh.events.includes("*"))
     .map(async (wh) => {
       try {
+        // Re-validate URL at delivery time to prevent DNS rebinding SSRF
+        if (isPrivateUrl(wh.url)) {
+          console.error(`[webhook] ${wh.id} → ${wh.url} blocked: resolves to private address`);
+          return;
+        }
+
         // Decrypt secret if encryption key is available (new encrypted format contains ':')
         let secret = wh.secret;
         if (encryptionKey && wh.secret.includes(":")) {

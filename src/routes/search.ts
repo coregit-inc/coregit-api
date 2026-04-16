@@ -61,6 +61,26 @@ function globToRegex(glob: string): RegExp {
   return new RegExp(`^${escaped}$`);
 }
 
+/**
+ * Reject regex patterns with star height > 1 (nested quantifiers)
+ * to prevent catastrophic backtracking (ReDoS).
+ */
+function isSafeRegex(pattern: string): boolean {
+  if (pattern.length > 200) return false;
+
+  // Strip escapes and character classes (they're atomic, safe)
+  const s = pattern.replace(/\\./g, "a").replace(/\[[^\]]*\]/g, "a");
+
+  // Find quantified groups and check if they contain inner quantifiers
+  const re = /\(([^)]*)\)([+*?]|\{\d+,)/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(s)) !== null) {
+    if (/[+*]|\{\d+,/.test(m[1])) return false;
+  }
+
+  return true;
+}
+
 function isBinary(content: Uint8Array): boolean {
   const len = Math.min(content.length, 8192);
   for (let i = 0; i < len; i++) {
@@ -189,9 +209,14 @@ search.post("/search", apiKeyAuth, async (c) => {
   let query: RegExp;
   try {
     const flags = caseSensitive ? "g" : "gi";
-    query = body.regex
-      ? new RegExp(body.q, flags)
-      : new RegExp(body.q.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), flags);
+    if (body.regex) {
+      if (!isSafeRegex(body.q)) {
+        return c.json({ error: "Regex pattern rejected: nested quantifiers or excessive length" }, 400);
+      }
+      query = new RegExp(body.q, flags);
+    } else {
+      query = new RegExp(body.q.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), flags);
+    }
   } catch {
     return c.json({ error: "Invalid regex pattern" }, 400);
   }

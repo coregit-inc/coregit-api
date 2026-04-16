@@ -15,6 +15,7 @@ import { repo } from "../db/schema";
 import { GitR2Storage } from "../git/storage";
 import { parseGitObject, parseTree, parseCommit, type TreeEntry } from "../git/objects";
 import { getTreeBlobShas } from "../services/tree-resolver";
+import { validateFilePath } from "../git/validation";
 import type { Env, Variables } from "../types";
 
 const files = new Hono<{ Bindings: Env; Variables: Variables }>();
@@ -206,6 +207,11 @@ const treeHandler = async (c: any) => {
   const pathStr = parts.slice(1).join("/");
   const pathParts = pathStr.split("/").filter(Boolean);
 
+  if (pathStr) {
+    const pathError = validateFilePath(pathStr);
+    if (pathError) return c.json({ error: pathError }, 400);
+  }
+
   const recursive = c.req.query("recursive") === "true";
 
   try {
@@ -304,6 +310,9 @@ const blobHandler = async (c: any) => {
   const pathStr = pathParts.join("/");
 
   if (!pathStr) return c.json({ error: "File path is required" }, 400);
+
+  const pathError = validateFilePath(pathStr);
+  if (pathError) return c.json({ error: pathError }, 400);
 
   try {
     // 1. Resolve ref → commitSha (1 R2 read)

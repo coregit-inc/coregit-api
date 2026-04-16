@@ -27,6 +27,7 @@ import { GitR2Storage } from "../git/storage";
 import { parseGitObject, parseCommit, parseTree } from "../git/objects";
 import { flattenTree, diffFlattenedTrees, computeDiffStatsFromDiffs } from "../git/cherry-pick";
 import { resolveRef, getTreeFromCommit, navigateToPath, isBinaryContent, flattenTreeRecursive } from "./files";
+import { validateFilePath } from "../git/validation";
 import { parseAuthorString } from "./commits";
 import { checkIpRateLimit, ipRateLimitHeaders } from "../services/rate-limit";
 import type { Env, Variables } from "../types";
@@ -99,7 +100,7 @@ publicRoutes.get("/orgs/:orgSlug/repos", async (c) => {
 
   const db = c.get("db");
   const limit = Math.min(parseInt(c.req.query("limit") || "50", 10), 100);
-  const offset = Math.max(parseInt(c.req.query("offset") || "0", 10), 0);
+  const offset = Math.min(Math.max(parseInt(c.req.query("offset") || "0", 10), 0), 10000);
   const nsFilter = c.req.query("namespace");
 
   try {
@@ -233,6 +234,11 @@ const treeHandler = async (c: any) => {
   const pathStr = parts.slice(1).join("/");
   const pathParts = pathStr.split("/").filter(Boolean);
 
+  if (pathStr) {
+    const pathError = validateFilePath(pathStr);
+    if (pathError) return c.json({ error: pathError }, 400);
+  }
+
   const recursive = c.req.query("recursive") === "true";
 
   try {
@@ -315,6 +321,9 @@ const blobHandler = async (c: any) => {
   const pathStr = pathParts.join("/");
 
   if (!pathStr) return c.json({ error: "File path is required" }, 400);
+
+  const pathError = validateFilePath(pathStr);
+  if (pathError) return c.json({ error: pathError }, 400);
 
   try {
     const commitSha = await resolveRef(storage, ref);

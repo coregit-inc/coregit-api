@@ -346,6 +346,23 @@ const getRepoHandler = async (c: any) => {
 
     const orgSlug = await getOrgSlug(db, orgId);
 
+    // Only expose forked_from if source is same org or public
+    let forkedFrom: { repo_id: string; org_id: string | null } | null = null;
+    if (found.forkedFromRepoId) {
+      if (found.forkedFromOrgId === orgId) {
+        forkedFrom = { repo_id: found.forkedFromRepoId, org_id: found.forkedFromOrgId };
+      } else {
+        const [sourceRepo] = await db
+          .select({ visibility: repo.visibility })
+          .from(repo)
+          .where(eq(repo.id, found.forkedFromRepoId))
+          .limit(1);
+        if (sourceRepo?.visibility === "public") {
+          forkedFrom = { repo_id: found.forkedFromRepoId, org_id: found.forkedFromOrgId };
+        }
+      }
+    }
+
     return c.json({
       id: found.id,
       namespace: found.namespace,
@@ -354,9 +371,7 @@ const getRepoHandler = async (c: any) => {
       default_branch: found.defaultBranch,
       visibility: found.visibility,
       is_template: found.isTemplate,
-      forked_from: found.forkedFromRepoId
-        ? { repo_id: found.forkedFromRepoId, org_id: found.forkedFromOrgId }
-        : null,
+      forked_from: forkedFrom,
       is_empty: isEmpty,
       git_url: buildGitUrl(orgSlug, found.slug, found.namespace, c.get("customDomain")),
       api_url: buildApiUrl(found.slug, found.namespace),
