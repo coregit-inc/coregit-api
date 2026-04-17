@@ -62,6 +62,7 @@ import { hybridSearchRoutes } from "./routes/hybrid-search";
 import { forks } from "./routes/forks";
 import { wiki } from "./routes/wiki";
 import { session } from "./routes/session";
+import { admin } from "./routes/admin";
 import { setRepoCacheRef, setRepoHotDORef, setRefCacheKvRef, setObjCacheKvRef } from "./services/repo-resolver";
 import {
   processIndexFileMessage,
@@ -317,6 +318,7 @@ app.route("/v1", audit);
 app.route("/v1", syncWebhooks);
 app.route("/v1", session);
 app.route("/v1", multiWorkspace);
+app.route("/v1/admin", admin);
 app.route("/v1/usage", usage);
 
 // ── Public read-only routes (no auth required) ──

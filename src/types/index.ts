@@ -13,6 +13,7 @@ export interface Env {
   SYNC_ENCRYPTION_KEY: string;
   WEBHOOK_ENCRYPTION_KEY?: string;
   INTERNAL_SYNC_TOKEN?: string;
+  CRON_SECRET?: string;
   R2_ACCESS_KEY_ID?: string;
   R2_SECRET_ACCESS_KEY?: string;
   R2_ACCOUNT_ID?: string;
