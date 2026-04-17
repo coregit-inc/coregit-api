@@ -28,9 +28,9 @@ const repos = new Hono<{ Bindings: Env; Variables: Variables }>();
 
 const SLUG_REGEX = /^[a-z0-9][a-z0-9-]{0,98}[a-z0-9]$|^[a-z0-9]$/;
 
-// Git empty tree SHA — well-known constant: SHA-1("tree 0\0") = 4b825dc...
+// Git well-known empty tree SHA-1 — hardcoded in git (cache.h EMPTY_TREE_SHA1_HEX).
 // Avoids an async crypto.subtle.digest call on every repo creation.
-const EMPTY_TREE_SHA = "4b825dc642cb6eb9a060e54bf899d15006ef8a2f";
+const EMPTY_TREE_SHA = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 const EMPTY_TREE_BYTES = createTree([]);
 
 function validateSlug(slug: string): boolean {
