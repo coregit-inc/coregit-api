@@ -37,11 +37,11 @@ const LFS_JSON = "application/vnd.git-lfs+json";
 // Max file sizes per tier
 const MAX_FILE_SIZE: Record<string, number> = {
   free: 100 * 1024 * 1024,    // 100 MB
-  usage: 2 * 1024 * 1024 * 1024, // 2 GB
+  paid: 2 * 1024 * 1024 * 1024, // 2 GB
 };
 const MAX_BATCH_OBJECTS: Record<string, number> = {
   free: 20,
-  usage: 100,
+  paid: 100,
 };
 
 interface LfsBatchObject {
