@@ -190,9 +190,9 @@ const forkHandler = async (c: any) => {
     }
 
     // 6. Track usage + audit
-    recordUsage(c.executionCtx, db, orgId, "repo_created", 1, {
+    recordUsage(c.executionCtx, c.env, db, orgId, c.get("dodoCustomerId"), "repo_created", 1, {
       repo_id: repoId, forked_from: source.id,
-    }, c.env.DODO_PAYMENTS_API_KEY, c.get("dodoCustomerId"));
+    });
 
     recordAudit(c.executionCtx, db, {
       orgId,

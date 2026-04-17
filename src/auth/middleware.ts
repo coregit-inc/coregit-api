@@ -44,7 +44,7 @@ interface CachedAuth {
   orgId: string;
   scopes: Scopes;
   tokenId: string;
-  tier: "free" | "usage";
+  tier: "free" | "paid";
   dodoCustomerId: string | null;
   orgSlug?: string; // populated on cache miss, saves a separate getOrgSlug() lookup
 }
@@ -95,11 +95,13 @@ export async function verifyWithCache(
       if (row.expires_at && new Date(row.expires_at) <= now) return null;
       if (row.revoked_at) return null;
 
+      // Legacy 'usage' rows get normalized to 'paid' at read time.
+      const normalizedTier: "free" | "paid" = row.tier === "paid" || row.tier === "usage" ? "paid" : "free";
       auth = {
         orgId: row.org_id,
         scopes: row.scopes,
         tokenId: row.id,
-        tier: row.tier ?? "free",
+        tier: normalizedTier,
         dodoCustomerId: row.dodo_customer_id ?? null,
         orgSlug: row.org_slug || undefined,
       };
@@ -121,11 +123,12 @@ export async function verifyWithCache(
       // Check expiry in JS for Hyperdrive cacheability
       if (row.expires_at && new Date(row.expires_at) <= new Date()) return null;
 
+      const normalizedTier: "free" | "paid" = row.tier === "paid" || row.tier === "usage" ? "paid" : "free";
       auth = {
         orgId: row.org_id,
         scopes: null, // master key = full access
         tokenId: row.id,
-        tier: row.tier ?? "free",
+        tier: normalizedTier,
         dodoCustomerId: row.dodo_customer_id ?? null,
         orgSlug: row.org_slug || undefined,
       };
@@ -172,25 +175,32 @@ export const apiKeyAuth = createMiddleware<{
       orgId: string;
       apiKeyId: string;
       scopes: Record<string, string[]> | null;
-      orgTier: "free" | "usage";
+      orgTier: "free" | "paid";
       dodoCustomerId: string | null;
     };
+
+    // Plan status lookup (tier + dodo_customer_id come from session meta already).
+    const statusRow = await db.execute(
+      sql`SELECT status FROM org_plan WHERE org_id = ${session.orgId} LIMIT 1`
+    );
+    const planStatus = (statusRow.rows[0] as { status: string } | undefined)?.status ?? "active";
 
     c.set("orgId", session.orgId);
     c.set("apiKeyPermissions", session.scopes);
     c.set("apiKeyId", session.apiKeyId);
     c.set("orgTier", session.orgTier);
     c.set("dodoCustomerId", session.dodoCustomerId);
+    c.set("planStatus", planStatus);
     c.set("sessionId", sessionId);
     c.set("sessionStub", stub);
 
     await next();
 
     // Usage tracking (fire-and-forget)
-    recordUsage(c.executionCtx, db, session.orgId, "api_call", 1, {
+    recordUsage(c.executionCtx, c.env, db, session.orgId, c.get("dodoCustomerId"), "api_call", 1, {
       method: c.req.method,
       path: c.req.path,
-    }, c.env.DODO_PAYMENTS_API_KEY, session.dodoCustomerId);
+    });
     return;
   }
 
@@ -217,11 +227,12 @@ export const apiKeyAuth = createMiddleware<{
     const orgPlan = await getOrgPlan(db, orgId);
     c.set("orgTier", orgPlan.tier);
     c.set("dodoCustomerId", orgPlan.dodoCustomerId);
+    c.set("planStatus", orgPlan.status);
     await next();
-    recordUsage(c.executionCtx, db, orgId, "api_call", 1, {
+    recordUsage(c.executionCtx, c.env, db, orgId, c.get("dodoCustomerId"), "api_call", 1, {
       method: c.req.method,
       path: c.req.path,
-    }, c.env.DODO_PAYMENTS_API_KEY, orgPlan.dodoCustomerId);
+    });
     return;
   }
 
@@ -255,11 +266,18 @@ export const apiKeyAuth = createMiddleware<{
     );
   }
 
+  // Fresh plan status lookup (cheap — single-row query, Hyperdrive-cached).
+  const statusRow = await db.execute(
+    sql`SELECT status FROM org_plan WHERE org_id = ${auth.orgId} LIMIT 1`
+  );
+  const planStatus = (statusRow.rows[0] as { status: string } | undefined)?.status ?? "active";
+
   c.set("orgId", auth.orgId);
   c.set("apiKeyPermissions", auth.scopes);
   c.set("apiKeyId", auth.tokenId);
   c.set("orgTier", auth.tier);
   c.set("dodoCustomerId", auth.dodoCustomerId);
+  c.set("planStatus", planStatus);
 
   // Preload org slug so getOrgSlug() skips KV + DB lookups
   if (auth.orgSlug) preloadOrgSlug(auth.orgId, auth.orgSlug);
@@ -294,10 +312,10 @@ export const apiKeyAuth = createMiddleware<{
   }
 
   // Record api_call usage for every authenticated request
-  recordUsage(c.executionCtx, db, auth.orgId, "api_call", 1, {
+  recordUsage(c.executionCtx, c.env, db, auth.orgId, c.get("dodoCustomerId"), "api_call", 1, {
     method: c.req.method,
     path: c.req.path,
-  }, c.env.DODO_PAYMENTS_API_KEY, auth.dodoCustomerId);
+  });
 });
 
 /**

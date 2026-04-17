@@ -7,6 +7,7 @@ export interface Env {
   REPOS_BUCKET: R2Bucket;
   LFS_BUCKET: R2Bucket;
   DODO_PAYMENTS_API_KEY: string;
+  DODO_CREDIT_ENTITLEMENT_ID: string;
   CF_ZONE_ID?: string;
   CF_API_TOKEN?: string;
   SYNC_ENCRYPTION_KEY: string;
@@ -45,8 +46,9 @@ export interface Variables {
   orgId: string;
   apiKeyPermissions: Record<string, string[]> | null;
   apiKeyId: string;
-  orgTier: "free" | "usage";
+  orgTier: "free" | "paid";
   dodoCustomerId: string | null;
+  planStatus: string;
   customDomain: string | null;
   requestId: string;
   sessionId: string | null;

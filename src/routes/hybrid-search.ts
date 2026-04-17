@@ -203,9 +203,8 @@ const hybridSearchHandler = async (c: any) => {
     const cached = await hybridCache.get(cacheKey, "json");
     if (cached) {
       recordUsage(
-        c.executionCtx, db, orgId, "hybrid_search", 1,
-        { repo_id: resolved.repo.id, cache: "hit" },
-        c.env.DODO_PAYMENTS_API_KEY, c.get("dodoCustomerId")
+        c.executionCtx, c.env, db, orgId, c.get("dodoCustomerId"), "hybrid_search", 1,
+        { repo_id: resolved.repo.id, cache: "hit" }
       );
       return c.json(cached, 200, { "X-Cache": "HIT" });
     }
@@ -355,9 +354,8 @@ const hybridSearchHandler = async (c: any) => {
   }
 
   recordUsage(
-    c.executionCtx, db, orgId, "hybrid_search", 1,
-    { repo_id: resolved.repo.id, results_count: topResults.length, strategy: strategyUsed, cache: "miss" },
-    c.env.DODO_PAYMENTS_API_KEY, c.get("dodoCustomerId")
+    c.executionCtx, c.env, db, orgId, c.get("dodoCustomerId"), "hybrid_search", 1,
+    { repo_id: resolved.repo.id, results_count: topResults.length, strategy: strategyUsed, cache: "miss" }
   );
 
   return c.json(responseBody, 200, { "X-Cache": "MISS" });

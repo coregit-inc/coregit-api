@@ -13,7 +13,7 @@ interface SessionMeta {
   orgId: string;
   apiKeyId: string;
   scopes: Record<string, string[]> | null;
-  orgTier: "free" | "usage";
+  orgTier: "free" | "paid";
   dodoCustomerId: string | null;
   createdAt: number;
   lastActivityAt: number;

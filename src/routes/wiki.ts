@@ -391,9 +391,9 @@ const initHandler = async (c: any) => {
     }
 
     // 5. Usage + audit
-    recordUsage(c.executionCtx, db, orgId, "repo_created", 1, {
+    recordUsage(c.executionCtx, c.env, db, orgId, c.get("dodoCustomerId"), "repo_created", 1, {
       repo_id: repoId, wiki: true,
-    }, c.env.DODO_PAYMENTS_API_KEY, c.get("dodoCustomerId"));
+    });
 
     recordAudit(c.executionCtx, db, {
       orgId,
@@ -922,9 +922,8 @@ const searchHandler = async (c: any) => {
   });
 
   recordUsage(
-    c.executionCtx, db, orgId, "semantic_search_query", 1,
+    c.executionCtx, c.env, db, orgId, c.get("dodoCustomerId"), "semantic_search_query", 1,
     { repo_id: resolved.repo.id, wiki: true, scope },
-    c.env.DODO_PAYMENTS_API_KEY, c.get("dodoCustomerId"),
   );
 
   return c.json({ results, query: body.q, scope, ref });

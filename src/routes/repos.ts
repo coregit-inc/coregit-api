@@ -154,7 +154,7 @@ repos.post("/", apiKeyAuth, async (c) => {
     const [newRepo] = dbResult;
 
     // Track usage + audit (fire-and-forget, already non-blocking)
-    recordUsage(c.executionCtx, db, orgId, "repo_created", 1, { repo_id: repoId }, c.env.DODO_PAYMENTS_API_KEY, c.get("dodoCustomerId"));
+    recordUsage(c.executionCtx, c.env, db, orgId, c.get("dodoCustomerId"), "repo_created", 1, { repo_id: repoId });
     recordAudit(c.executionCtx, db, {
       orgId, actorId: c.get("apiKeyId"), actorType: "master_key",
       action: "repo.create", resourceType: "repo", resourceId: repoId,
@@ -514,7 +514,7 @@ const deleteRepoHandler = async (c: any) => {
     // Invalidate repo cache
     c.executionCtx.waitUntil(invalidateRepoCache(c.env.AUTH_CACHE, orgId, found.slug, found.namespace));
 
-    recordUsage(c.executionCtx, db, orgId, "repo_deleted", 1, { repo_id: found.id }, c.env.DODO_PAYMENTS_API_KEY, c.get("dodoCustomerId"));
+    recordUsage(c.executionCtx, c.env, db, orgId, c.get("dodoCustomerId"), "repo_deleted", 1, { repo_id: found.id });
     recordAudit(c.executionCtx, db, {
       orgId, actorId: c.get("apiKeyId"), actorType: "master_key",
       action: "repo.delete", resourceType: "repo", resourceId: found.id,

@@ -130,6 +130,7 @@ app.use("*", async (c, next) => {
     const plan = await getOrgPlan(db, cached.orgId);
     c.set("orgTier", plan.tier);
     c.set("dodoCustomerId", plan.dodoCustomerId);
+    c.set("planStatus", plan.status);
     return next();
   }
 
@@ -157,6 +158,7 @@ app.use("*", async (c, next) => {
   const plan = await getOrgPlan(db, row.org_id);
   c.set("orgTier", plan.tier);
   c.set("dodoCustomerId", plan.dodoCustomerId);
+  c.set("planStatus", plan.status);
   await next();
 });
 

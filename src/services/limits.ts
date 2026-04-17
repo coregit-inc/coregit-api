@@ -1,91 +1,93 @@
 /**
- * Free tier enforcement for CoreGit API.
+ * Free-tier enforcement — no wallet balance checks.
  *
- * Checks whether an org on the free plan has exceeded monthly usage limits.
- * Usage-tier orgs are unlimited (metered by Dodo Payments).
+ * Balance lives in Dodo. Here we only gate on:
+ *   - status: 'frozen' → block all billable ops
+ *   - tier 'free' → max 3 repos, 100 API calls/day
+ *   - tier 'paid' → unlimited (balance enforced by Dodo)
  *
- * Uses a short-lived in-memory cache (60s) to avoid re-summing usage_event
- * on every single API call for the same org.
+ * Short-lived in-memory cache (60s) on counts to avoid re-summing usage_event
+ * on every request for the same org.
  */
 
 import { sql } from "drizzle-orm";
 import type { Database } from "../db";
 
-export const FREE_LIMITS = {
-  api_calls: 10_000,
-  git_transfer_bytes: 5 * 1024 * 1024 * 1024, // 5 GB
-  repos: 5,
-};
+export const FREE_TIER_LIMITS = {
+  maxRepos: 3,
+  maxApiCallsPerDay: 100,
+} as const;
 
-export type OrgTier = "free" | "usage";
+export type OrgTier = "free" | "paid";
 
 export interface OrgPlanInfo {
   tier: OrgTier;
+  status: string;
   dodoCustomerId: string | null;
 }
 
-// ── Usage cache (60s TTL, module-scoped across requests in same isolate) ──
-
+// ── in-memory cache (per-isolate) ──
 const CACHE_TTL_MS = 60_000;
-const usageCache = new Map<string, { value: number; ts: number }>();
+const counterCache = new Map<string, { value: number; ts: number }>();
 
 function getCached(key: string): number | null {
-  const entry = usageCache.get(key);
+  const entry = counterCache.get(key);
   if (!entry) return null;
   if (Date.now() - entry.ts > CACHE_TTL_MS) {
-    usageCache.delete(key);
+    counterCache.delete(key);
     return null;
   }
   return entry.value;
 }
 
 function setCache(key: string, value: number) {
-  // Cap cache size to prevent unbounded growth
-  if (usageCache.size > 500) {
-    const oldest = usageCache.keys().next().value;
-    if (oldest) usageCache.delete(oldest);
+  if (counterCache.size > 500) {
+    const oldest = counterCache.keys().next().value;
+    if (oldest) counterCache.delete(oldest);
   }
-  usageCache.set(key, { value, ts: Date.now() });
+  counterCache.set(key, { value, ts: Date.now() });
 }
 
-/**
- * Get the org's plan tier and Dodo customer ID.
- * Returns free tier defaults if no org_plan row exists.
- */
-export async function getOrgPlan(
-  db: Database,
-  orgId: string
-): Promise<OrgPlanInfo> {
-  const result = await db.execute(
-    sql`SELECT tier, dodo_customer_id FROM org_plan WHERE org_id = ${orgId} LIMIT 1`
-  );
+/** Load org's plan. Returns free-tier defaults if no row exists. */
+export async function getOrgPlan(db: Database, orgId: string): Promise<OrgPlanInfo> {
+  const result = await db.execute(sql`
+    SELECT tier, status, dodo_customer_id FROM org_plan WHERE org_id = ${orgId} LIMIT 1
+  `);
   const row = result.rows[0] as
-    | { tier: string; dodo_customer_id: string | null }
+    | { tier: string; status: string; dodo_customer_id: string | null }
     | undefined;
-
-  return {
-    tier: (row?.tier as OrgTier) ?? "free",
-    dodoCustomerId: row?.dodo_customer_id ?? null,
-  };
+  if (!row) return { tier: "free", status: "active", dodoCustomerId: null };
+  const tier: OrgTier = row.tier === "paid" || row.tier === "usage" ? "paid" : "free";
+  return { tier, status: row.status, dodoCustomerId: row.dodo_customer_id ?? null };
 }
 
+export type LimitEventType = "api_call" | "repo_created" | "git_transfer_bytes" | "storage_bytes";
+
+export type LimitCheckResult =
+  | { allowed: true }
+  | { allowed: false; reason: "repo_limit"; used: number; limit: number }
+  | { allowed: false; reason: "daily_rate_limit"; used: number; limit: number }
+  | { allowed: false; reason: "account_frozen" };
+
 /**
- * Check whether an org on the free tier has exceeded limits for the given event type.
- * Returns { allowed: true } for usage-tier orgs (no limits).
+ * Check whether the org may perform this event.
+ * Balance is NOT checked here — Dodo enforces it via credit entitlement.
  */
-export async function checkFreeLimits(
+export async function checkLimits(
   db: Database,
+  plan: OrgPlanInfo,
   orgId: string,
-  tier: OrgTier,
-  eventType: "api_call" | "git_transfer_bytes" | "repo_created"
-): Promise<{ allowed: boolean; used: number; limit: number }> {
-  if (tier !== "free") {
-    return { allowed: true, used: 0, limit: Infinity };
+  eventType: LimitEventType
+): Promise<LimitCheckResult> {
+  if (plan.status === "frozen") {
+    return { allowed: false, reason: "account_frozen" };
   }
 
-  const now = new Date();
-  const monthKey = `${now.getFullYear()}-${now.getMonth()}`;
+  if (plan.tier === "paid") {
+    return { allowed: true };
+  }
 
+  // ── free tier gates ──
   if (eventType === "repo_created") {
     const cacheKey = `${orgId}:repos`;
     let used = getCached(cacheKey);
@@ -96,15 +98,15 @@ export async function checkFreeLimits(
       used = (result.rows[0] as { count: number } | undefined)?.count ?? 0;
       setCache(cacheKey, used);
     }
-    return {
-      allowed: used < FREE_LIMITS.repos,
-      used,
-      limit: FREE_LIMITS.repos,
-    };
+    if (used >= FREE_TIER_LIMITS.maxRepos) {
+      return { allowed: false, reason: "repo_limit", used, limit: FREE_TIER_LIMITS.maxRepos };
+    }
+    return { allowed: true };
   }
 
   if (eventType === "api_call") {
-    const cacheKey = `${orgId}:api_call:${monthKey}`;
+    const today = new Date().toISOString().slice(0, 10);
+    const cacheKey = `${orgId}:api_day:${today}`;
     let used = getCached(cacheKey);
     if (used === null) {
       const result = await db.execute(sql`
@@ -112,38 +114,40 @@ export async function checkFreeLimits(
         FROM usage_event
         WHERE org_id = ${orgId}
           AND event_type = 'api_call'
-          AND recorded_at >= date_trunc('month', NOW())
+          AND recorded_at >= NOW() - INTERVAL '1 day'
       `);
-      used = Number((result.rows[0] as any)?.total ?? 0);
+      used = Number((result.rows[0] as { total: string } | undefined)?.total ?? 0);
       setCache(cacheKey, used);
     }
-    return {
-      allowed: used < FREE_LIMITS.api_calls,
-      used,
-      limit: FREE_LIMITS.api_calls,
-    };
-  }
-
-  if (eventType === "git_transfer_bytes") {
-    const cacheKey = `${orgId}:git_transfer:${monthKey}`;
-    let used = getCached(cacheKey);
-    if (used === null) {
-      const result = await db.execute(sql`
-        SELECT COALESCE(SUM(quantity), 0)::bigint AS total
-        FROM usage_event
-        WHERE org_id = ${orgId}
-          AND event_type = 'git_transfer_bytes'
-          AND recorded_at >= date_trunc('month', NOW())
-      `);
-      used = Number((result.rows[0] as any)?.total ?? 0);
-      setCache(cacheKey, used);
+    if (used >= FREE_TIER_LIMITS.maxApiCallsPerDay) {
+      return {
+        allowed: false,
+        reason: "daily_rate_limit",
+        used,
+        limit: FREE_TIER_LIMITS.maxApiCallsPerDay,
+      };
     }
-    return {
-      allowed: used < FREE_LIMITS.git_transfer_bytes,
-      used,
-      limit: FREE_LIMITS.git_transfer_bytes,
-    };
+    return { allowed: true };
   }
 
-  return { allowed: true, used: 0, limit: Infinity };
+  return { allowed: true };
+}
+
+/**
+ * Legacy shim — `checkFreeLimits` is still used across ~10 call sites with the
+ * old API. Keep it compatible during the transition.
+ */
+export async function checkFreeLimits(
+  db: Database,
+  orgId: string,
+  _tier: string,
+  eventType: LimitEventType
+): Promise<{ allowed: boolean; used: number; limit: number; reason?: string }> {
+  const plan = await getOrgPlan(db, orgId);
+  const r = await checkLimits(db, plan, orgId, eventType);
+  if (r.allowed) return { allowed: true, used: 0, limit: Infinity };
+  if (r.reason === "repo_limit" || r.reason === "daily_rate_limit") {
+    return { allowed: false, used: r.used, limit: r.limit, reason: r.reason };
+  }
+  return { allowed: false, used: 0, limit: 0, reason: r.reason };
 }

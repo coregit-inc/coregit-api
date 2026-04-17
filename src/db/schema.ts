@@ -76,7 +76,67 @@ export const snapshot = pgTable(
 export type Snapshot = typeof snapshot.$inferSelect;
 export type NewSnapshot = typeof snapshot.$inferInsert;
 
-// Usage events (for billing)
+// Org billing plan (Dodo Credit Entitlements model).
+// Balance & ledger live in Dodo; this table only holds feature gates and
+// the auto-recharge mandate configuration.
+export const orgPlan = pgTable(
+  "org_plan",
+  {
+    id: text("id").primaryKey(),
+    orgId: text("org_id").notNull().unique(),
+    tier: text("tier").notNull().default("free"),            // 'free' | 'paid'
+    dodoCustomerId: text("dodo_customer_id"),
+    status: text("status").notNull().default("active"),       // 'active' | 'suspended' | 'frozen'
+
+    // Auto-recharge: our-side config, Dodo executes via subscriptions.charge().
+    autoRechargeEnabled: boolean("auto_recharge_enabled").notNull().default(false),
+    autoRechargeThresholdCents: integer("auto_recharge_threshold_cents").default(1000),
+    autoRechargeAmountCents: integer("auto_recharge_amount_cents").default(5000),
+    dodoMandateSubscriptionId: text("dodo_mandate_subscription_id"),
+    autoRechargeFailures: integer("auto_recharge_failures").notNull().default(0),
+    autoRechargeLastAttemptAt: timestamp("auto_recharge_last_attempt_at"),
+
+    // Our-side $0 subscription on "Coregit API Access" metered product.
+    // Required for meter events to deduct credits per Dodo architecture.
+    dodoApiSubscriptionId: text("dodo_api_subscription_id"),
+
+    // Legacy subscription columns kept temporarily for migration rollback; drop in Phase 5.
+    dodoSubscriptionId: text("dodo_subscription_id"),
+    currentPeriodEnd: timestamp("current_period_end"),
+
+    createdAt: timestamp("created_at").defaultNow().notNull(),
+    updatedAt: timestamp("updated_at").defaultNow().notNull(),
+  },
+  (t) => [
+    index("org_plan_org_idx").on(t.orgId),
+    index("org_plan_dodo_customer_idx").on(t.dodoCustomerId),
+  ]
+);
+
+export type OrgPlan = typeof orgPlan.$inferSelect;
+
+// Custom domain monthly billing tracker — one row per billable domain
+export const customDomainBilling = pgTable(
+  "custom_domain_billing",
+  {
+    id: text("id").primaryKey(),
+    domainId: text("domain_id").notNull(),                      // references custom_domain.id (FK in DB)
+    orgId: text("org_id").notNull(),
+    lastBilledAt: timestamp("last_billed_at").defaultNow().notNull(),
+    nextBillingAt: timestamp("next_billing_at").notNull(),
+    failures: integer("failures").notNull().default(0),
+    status: text("status").notNull().default("active"),          // 'active' | 'suspended'
+    createdAt: timestamp("created_at").defaultNow().notNull(),
+  },
+  (t) => [
+    index("custom_domain_billing_next_idx").on(t.nextBillingAt),
+    uniqueIndex("custom_domain_billing_domain_idx").on(t.domainId),
+  ]
+);
+
+export type CustomDomainBilling = typeof customDomainBilling.$inferSelect;
+
+// Usage events (analytics only — billing runs through wallet_transaction)
 export const usageEvent = pgTable(
   "usage_event",
   {

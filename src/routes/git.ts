@@ -28,7 +28,6 @@ import {
 import { generatePackfile, parsePackfile, findShallowCommits } from "../git/packfile";
 import { parseCommit, parseGitObject } from "../git/objects";
 import { recordUsage } from "../services/usage";
-import { getDodoCustomerId } from "../services/dodo";
 import { isValidSha, isValidRefPath } from "../git/validation";
 import { decryptSecret } from "../services/secret-manager";
 import { exportToGithub } from "../services/github-export";
@@ -522,10 +521,9 @@ const uploadPackHandler = async (c: any) => {
 
   // Track git transfer
   const db = c.get("db");
-  const dodoCustomerId = await getDodoCustomerId(db, orgId);
-  recordUsage(c.executionCtx, db, orgId, "git_transfer_bytes", totalLength, {
+  recordUsage(c.executionCtx, c.env, db, orgId, c.get("dodoCustomerId"), "git_transfer_bytes", totalLength, {
     operation: "upload-pack",
-  }, c.env.DODO_PAYMENTS_API_KEY, dodoCustomerId);
+  });
 
   return new Response(finalResponse, {
     headers: { "Content-Type": "application/x-git-upload-pack-result" },
@@ -684,10 +682,9 @@ const receivePackHandler = async (c: any) => {
 
   // Track git transfer
   const db = c.get("db");
-  const dodoCustomerIdPush = await getDodoCustomerId(db, orgId);
-  recordUsage(c.executionCtx, db, orgId, "git_transfer_bytes", body.length, {
+  recordUsage(c.executionCtx, c.env, db, orgId, c.get("dodoCustomerId"), "git_transfer_bytes", body.length, {
     operation: "receive-pack",
-  }, c.env.DODO_PAYMENTS_API_KEY, dodoCustomerIdPush);
+  });
 
   // Trigger auto-export if configured
   const successfulRefs = refResults

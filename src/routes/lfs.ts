@@ -53,7 +53,7 @@ interface LfsAuthResult {
   orgId: string;
   repoId: string;
   repoSlug: string;
-  tier: "free" | "usage";
+  tier: "free" | "paid";
   dodoCustomerId: string | null;
   /** Token ID for rate limiting (null for unauthenticated public download) */
   tokenId: string | null;
@@ -329,11 +329,11 @@ async function batchHandler(c: any) {
   if (body.operation === "download") {
     const totalSize = body.objects.reduce((sum, o) => sum + (o.size || 0), 0);
     if (totalSize > 0) {
-      recordUsage(c.executionCtx, db, auth.orgId, "git_transfer_bytes", totalSize, {
+      recordUsage(c.executionCtx, c.env, db, auth.orgId, c.get("dodoCustomerId"), "git_transfer_bytes", totalSize, {
         type: "lfs_download",
         repo: auth.repoSlug,
         objects: body.objects.length,
-      }, c.env.DODO_PAYMENTS_API_KEY, auth.dodoCustomerId);
+      });
     }
   }
 
@@ -402,17 +402,17 @@ async function verifyHandler(c: any) {
     .onConflictDoNothing();
 
   // Track storage + transfer usage (non-blocking)
-  recordUsage(c.executionCtx, db, auth.orgId, "storage_bytes", body.size, {
+  recordUsage(c.executionCtx, c.env, db, auth.orgId, c.get("dodoCustomerId"), "storage_bytes", body.size, {
     type: "lfs_upload",
     repo: auth.repoSlug,
     oid: body.oid,
-  }, c.env.DODO_PAYMENTS_API_KEY, auth.dodoCustomerId);
+  });
 
-  recordUsage(c.executionCtx, db, auth.orgId, "git_transfer_bytes", body.size, {
+  recordUsage(c.executionCtx, c.env, db, auth.orgId, c.get("dodoCustomerId"), "git_transfer_bytes", body.size, {
     type: "lfs_upload",
     repo: auth.repoSlug,
     oid: body.oid,
-  }, c.env.DODO_PAYMENTS_API_KEY, auth.dodoCustomerId);
+  });
 
   return c.body(null, 200, { "Content-Type": LFS_JSON });
 }

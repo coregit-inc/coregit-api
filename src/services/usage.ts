@@ -1,11 +1,18 @@
 /**
- * Usage tracking service.
- * Records usage events to local DB AND forwards to Dodo Payments for billing.
+ * Usage tracking — analytics DB insert + fire-and-forget Dodo meter ingest.
+ *
+ * All billing flows through Dodo Credit Entitlements now:
+ *   recordUsage() → POST /events/ingest → Dodo worker (60s) → meter aggregation
+ *   → credits deducted from (entitlement × customer) balance.
+ *
+ * `dodoCustomerId` must be passed from the Hono context (set in auth middleware).
+ * If null (e.g. internal calls), Dodo ingest is skipped — analytics still recorded.
  */
 
 import { sql } from "drizzle-orm";
 import type { Database } from "../db";
-import { forwardUsageToDodo, DODO_EVENTS } from "./dodo";
+import type { Env } from "../types";
+import { DodoCredits, METER_EVENT_NAMES, type MeterEventKey } from "./dodo-credits";
 
 export type UsageEventType =
   | "api_call"
@@ -19,76 +26,93 @@ export type UsageEventType =
   | "hybrid_search";
 
 /**
- * Record a usage event to local DB and forward to Dodo if the org has a Dodo customer.
+ * Per-event conversion: quantity → Dodo meter units.
+ *   api_call: count aggregation, 1 event = 1 call (metadata-less)
+ *   git_transfer_bytes / storage_bytes: sum on "mb" key, bytes → MB (ceil)
+ *
+ * Non-billable events (repo_*, graph_query, hybrid_search, semantic_*):
+ *   analytics only; we do NOT ingest to Dodo — avoid noisy ledger.
+ */
+function toDodoMeterEvent(
+  eventType: UsageEventType,
+  quantity: number
+): { eventName: string; metadata?: Record<string, unknown> } | null {
+  switch (eventType) {
+    case "api_call":
+      return { eventName: METER_EVENT_NAMES.api_call };
+    case "git_transfer_bytes": {
+      const mb = Math.max(1, Math.ceil(quantity / (1024 * 1024)));
+      return { eventName: METER_EVENT_NAMES.git_transfer_bytes, metadata: { mb, bytes: quantity } };
+    }
+    case "storage_bytes": {
+      const mb = Math.max(1, Math.ceil(quantity / (1024 * 1024)));
+      return { eventName: METER_EVENT_NAMES.storage_bytes, metadata: { mb, bytes: quantity } };
+    }
+    default:
+      return null; // not billable
+  }
+}
+
+/**
+ * Record a usage event. Analytics DB insert + optional Dodo meter ingest,
+ * both fire-and-forget.
  */
 export function recordUsage(
   ctx: ExecutionContext,
+  env: Env,
   db: Database,
   orgId: string,
+  dodoCustomerId: string | null,
   eventType: UsageEventType,
   quantity: number,
-  metadata?: Record<string, unknown>,
-  dodoApiKey?: string,
-  dodoCustomerId?: string | null
-) {
-  // 1. Local DB insert (fire-and-forget)
+  metadata?: Record<string, unknown>
+): void {
+  // 1) analytics: usage_event row
   ctx.waitUntil(
     db
       .execute(
         sql`INSERT INTO usage_event (org_id, event_type, quantity, metadata)
-          VALUES (${orgId}, ${eventType}, ${quantity}, ${metadata ? JSON.stringify(metadata) : null})`
+            VALUES (${orgId}, ${eventType}, ${quantity}, ${metadata ? JSON.stringify(metadata) : null})`
       )
-      .catch((err) => {
-        console.error("Failed to record usage event:", err);
-      })
+      .catch((err) => console.error("[usage] event insert failed:", err))
   );
 
-  // 2. Forward to Dodo Payments for billing (only if org is on usage tier)
-  if (dodoApiKey && dodoCustomerId) {
-    const now = Date.now();
-    const eventId = `${orgId}_${eventType}_${now}`;
+  // 2) Dodo meter ingest — fire-and-forget
+  if (!dodoCustomerId || quantity <= 0) return;
+  if (!env.DODO_PAYMENTS_API_KEY || !env.DODO_CREDIT_ENTITLEMENT_ID) return;
 
-    const dodoEventName = mapToDodoEvent(eventType);
-    if (dodoEventName) {
-      const dodoMetadata =
-        eventType === "git_transfer_bytes"
-          ? { bytes: quantity, ...metadata }
-          : metadata;
+  const meter = toDodoMeterEvent(eventType, quantity);
+  if (!meter) return; // not billable
 
-      forwardUsageToDodo(
-        ctx,
-        dodoApiKey,
-        dodoCustomerId,
-        dodoEventName,
-        eventId,
-        dodoMetadata
-      );
-    }
-  }
+  const dodo = new DodoCredits({
+    apiKey: env.DODO_PAYMENTS_API_KEY,
+    entitlementId: env.DODO_CREDIT_ENTITLEMENT_ID,
+  });
+  const eventId = `${orgId}_${eventType}_${Date.now()}_${crypto.randomUUID().slice(0, 8)}`;
+
+  ctx.waitUntil(
+    dodo
+      .ingestEvents([
+        {
+          event_id: eventId,
+          customer_id: dodoCustomerId,
+          event_name: meter.eventName,
+          timestamp: new Date().toISOString(),
+          metadata: { ...meter.metadata, ...metadata, quantity },
+        },
+      ])
+      .catch((err) => console.error("[dodo ingest]", err))
+  );
 }
 
-function mapToDodoEvent(eventType: UsageEventType): string | null {
-  switch (eventType) {
-    case "api_call":
-      return DODO_EVENTS.apiCall;
-    case "git_transfer_bytes":
-      return DODO_EVENTS.gitTransfer;
-    case "semantic_search_query":
-      return DODO_EVENTS.semanticSearch;
-    case "semantic_index_chunks":
-      return DODO_EVENTS.semanticIndex;
-    case "repo_created":
-    case "repo_deleted":
-      return null; // repos are free — no Dodo billing
-    default:
-      return null;
-  }
-}
-
+/**
+ * Monthly usage summary per event type — used by /api/billing/status
+ * as a sanity check (main balance comes from Dodo).
+ */
 export async function getUsageSummary(
   db: Database,
   orgId: string,
-  period: string // "YYYY-MM"
+  period: string
 ): Promise<Record<string, number>> {
   const startDate = `${period}-01`;
   const [year, month] = period.split("-").map(Number);

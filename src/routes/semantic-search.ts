@@ -156,9 +156,8 @@ const semanticSearchHandler = async (c: any) => {
     const cached = await searchCache.get(cacheKey, "json");
     if (cached) {
       recordUsage(
-        c.executionCtx, db, orgId, "semantic_search_query", 1,
-        { repo_id: resolved.repo.id, results_count: (cached as any).results?.length || 0, cache: "hit" },
-        c.env.DODO_PAYMENTS_API_KEY, c.get("dodoCustomerId")
+        c.executionCtx, c.env, db, orgId, c.get("dodoCustomerId"), "semantic_search_query", 1,
+        { repo_id: resolved.repo.id, results_count: (cached as any).results?.length || 0, cache: "hit" }
       );
       return c.json(cached, 200, { "X-Cache": "HIT" });
     }
@@ -328,9 +327,8 @@ const semanticSearchHandler = async (c: any) => {
   }
 
   recordUsage(
-    c.executionCtx, db, orgId, "semantic_search_query", 1,
-    { repo_id: resolved.repo.id, results_count: results.length, cache: "miss" },
-    c.env.DODO_PAYMENTS_API_KEY, c.get("dodoCustomerId")
+    c.executionCtx, c.env, db, orgId, c.get("dodoCustomerId"), "semantic_search_query", 1,
+    { repo_id: resolved.repo.id, results_count: results.length, cache: "miss" }
   );
 
   return c.json(responseBody, 200, { "X-Cache": "MISS" });

@@ -27,7 +27,6 @@ import {
 import { generatePackfile, parsePackfile, findShallowCommits } from "../git/packfile";
 import { parseCommit, parseGitObject } from "../git/objects";
 import { recordUsage } from "../services/usage";
-import { getDodoCustomerId } from "../services/dodo";
 import { isValidSha, isValidRefPath } from "../git/validation";
 import {
   checkRateLimit,
@@ -292,10 +291,9 @@ const cdUploadPackHandler = async (c: any, next: any) => {
   for (const part of packParts) { finalResponse.set(part, offset); offset += part.length; }
 
   const db = c.get("db");
-  const dodoCustomerId = await getDodoCustomerId(db, orgId);
-  recordUsage(c.executionCtx, db, orgId, "git_transfer_bytes", totalLength, {
+  recordUsage(c.executionCtx, c.env, db, orgId, c.get("dodoCustomerId"), "git_transfer_bytes", totalLength, {
     operation: "upload-pack",
-  }, c.env.DODO_PAYMENTS_API_KEY, dodoCustomerId);
+  });
 
   return new Response(finalResponse, {
     headers: { "Content-Type": "application/x-git-upload-pack-result" },
@@ -434,10 +432,9 @@ const cdReceivePackHandler = async (c: any, next: any) => {
   for (const part of reportParts) { responseBytes.set(part, pos); pos += part.length; }
 
   const db = c.get("db");
-  const dodoCustomerIdPush = await getDodoCustomerId(db, orgId);
-  recordUsage(c.executionCtx, db, orgId, "git_transfer_bytes", body.length, {
+  recordUsage(c.executionCtx, c.env, db, orgId, c.get("dodoCustomerId"), "git_transfer_bytes", body.length, {
     operation: "receive-pack",
-  }, c.env.DODO_PAYMENTS_API_KEY, dodoCustomerIdPush);
+  });
 
   return new Response(responseBytes, {
     headers: { "Content-Type": "application/x-git-receive-pack-result" },
