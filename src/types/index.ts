@@ -21,6 +21,8 @@ export interface Env {
   PINECONE_API_KEY?: string;
   VOYAGE_API_KEY?: string;
   PINECONE_INDEX_HOST?: string;
+  // Morph Fast Apply — lazy edit merging
+  MORPH_API_KEY?: string;
   INDEXING_QUEUE?: Queue;
   TREE_CACHE?: KVNamespace;
   SEARCH_CACHE?: KVNamespace;

@@ -15,6 +15,7 @@ import {
   type TreeEntry,
 } from "../git/objects";
 import { flattenTree as flattenTreeFromSha } from "../git/cherry-pick";
+import { morphApply } from "./morph";
 
 export interface EditOperation {
   /** Replace lines [start, end] (1-based, inclusive). Use same start/end to insert before that line. */
@@ -31,11 +32,20 @@ export interface FileChange {
   path: string;
   content?: string;
   encoding?: "utf-8" | "base64";
-  action?: "create" | "edit" | "delete" | "rename";
+  action?: "create" | "edit" | "delete" | "rename" | "lazy_edit";
   /** For action: "edit" — array of surgical edits applied in order. */
   edits?: EditOperation[];
   /** For action: "rename" — new path for the file. */
   new_path?: string;
+  /** For action: "lazy_edit" — edit snippet with "// ... existing code ..." markers. */
+  edit_snippet?: string;
+  /** For action: "lazy_edit" — single-line hint for disambiguating the edit. */
+  instruction?: string;
+}
+
+export interface MorphUsageTotals {
+  outputTokens: number;
+  callCount: number;
 }
 
 export interface CommitAuthor {
@@ -261,8 +271,9 @@ export async function createApiCommit(
   message: string,
   author: CommitAuthor,
   changes: FileChange[],
-  parentSha?: string
-): Promise<{ sha: string; treeSha: string; parentSha: string; changedBlobs: Map<string, string>; timing?: Record<string, number> }> {
+  parentSha?: string,
+  morphApiKey?: string
+): Promise<{ sha: string; treeSha: string; parentSha: string; changedBlobs: Map<string, string>; timing?: Record<string, number>; morphUsage?: MorphUsageTotals }> {
   const t: Record<string, number> = {};
   const t0 = performance.now();
 
@@ -306,6 +317,7 @@ export async function createApiCommit(
   // 3. Apply changes — collect blobs first, then batch-write to R2
   const pendingBlobs: { sha: string; type: "blob"; data: Uint8Array }[] = [];
   const changedBlobs = new Map<string, string>(); // path → blobSha for semantic indexing
+  const morphUsage: MorphUsageTotals = { outputTokens: 0, callCount: 0 };
 
   for (const change of changes) {
     const action = change.action || (change.content !== undefined ? "create" : undefined);
@@ -336,6 +348,34 @@ export async function createApiCommit(
       const editedBytes = encoder.encode(edited);
       const blobSha = await hashGitObject("blob", editedBytes);
       pendingBlobs.push({ sha: blobSha, type: "blob", data: editedBytes });
+      currentTree.set(change.path, { sha: blobSha, mode: existing.mode });
+      changedBlobs.set(change.path, blobSha);
+    } else if (action === "lazy_edit") {
+      if (!change.edit_snippet) {
+        throw new Error(`edit_snippet required for action "lazy_edit": ${change.path}`);
+      }
+      if (!morphApiKey) {
+        throw new Error("MORPH_API_KEY not configured on this deployment");
+      }
+      const existing = currentTree.get(change.path);
+      if (!existing) throw new Error(`File not found for lazy_edit: ${change.path}`);
+      const blobRaw = await storage.getObject(existing.sha);
+      if (!blobRaw) throw new Error(`Blob not found: ${existing.sha}`);
+      const decoder = new TextDecoder();
+      const originalContent = decoder.decode(parseGitObject(blobRaw).content);
+
+      // Remote merge via Morph Fast Apply
+      const result = await morphApply(morphApiKey, {
+        originalCode: originalContent,
+        editSnippet: change.edit_snippet,
+        instruction: change.instruction,
+      });
+      morphUsage.outputTokens += result.usage.completion_tokens;
+      morphUsage.callCount += 1;
+
+      const mergedBytes = encoder.encode(result.mergedCode);
+      const blobSha = await hashGitObject("blob", mergedBytes);
+      pendingBlobs.push({ sha: blobSha, type: "blob", data: mergedBytes });
       currentTree.set(change.path, { sha: blobSha, mode: existing.mode });
       changedBlobs.set(change.path, blobSha);
     } else {
@@ -416,6 +456,7 @@ export async function createApiCommit(
     parentSha: effectiveParent || "",
     changedBlobs,
     timing: t,
+    morphUsage: morphUsage.callCount > 0 ? morphUsage : undefined,
   };
 }
 

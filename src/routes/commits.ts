@@ -15,6 +15,8 @@ import { repo } from "../db/schema";
 import { GitR2Storage } from "../git/storage";
 import { parseGitObject, parseCommit } from "../git/objects";
 import { createApiCommit, ConflictError, EditConflictError, InvalidBase64Error, setTreeCacheRef, type FileChange, type CommitAuthor } from "../services/commit-builder";
+import { MorphError } from "../services/morph";
+import { recordUsage } from "../services/usage";
 
 import { checkFreeLimits } from "../services/limits";
 import { isValidRefName, validateFilePath } from "../git/validation";
@@ -89,6 +91,9 @@ const createCommitHandler = async (c: any) => {
     return c.json({ error: "Maximum 1000 file changes per commit" }, 400);
   }
   const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10 MB
+  const MAX_LAZY_EDIT_SNIPPET = 200 * 1024; // 200 KB (~50k tokens, well under Morph's 128k limit)
+  const MAX_LAZY_EDITS_PER_COMMIT = 50; // soft cap — CF Worker subrequest budget + sensible UX
+  let lazyEditCount = 0;
   for (const change of changes) {
     if (change.content && change.content.length > MAX_FILE_SIZE) {
       return c.json({ error: `File content exceeds 10 MB limit: ${change.path}` }, 400);
@@ -114,11 +119,42 @@ const createCommitHandler = async (c: any) => {
         }
       }
     }
+    if (change.action === "lazy_edit") {
+      lazyEditCount += 1;
+      if (!change.edit_snippet || change.edit_snippet.length === 0) {
+        return c.json({ error: `edit_snippet required for action "lazy_edit": ${change.path}` }, 400);
+      }
+      if (change.edit_snippet.length > MAX_LAZY_EDIT_SNIPPET) {
+        return c.json({ error: `edit_snippet exceeds 200 KB: ${change.path}` }, 400);
+      }
+    }
     // Validate base64 content
     if (change.encoding === "base64" && change.content) {
       if (!/^[A-Za-z0-9+/]*={0,2}$/.test(change.content)) {
         return c.json({ error: `Invalid base64 content for file: ${change.path}` }, 400);
       }
+    }
+  }
+
+  // lazy_edit is a paid-tier feature (remote LLM merge via Morph, billed per output token)
+  if (lazyEditCount > 0) {
+    if (c.get("orgTier") === "free") {
+      return c.json(
+        {
+          error: "lazy_edit requires a paid plan",
+          upgrade_url: "https://app.coregit.dev/dashboard/billing",
+        },
+        402
+      );
+    }
+    if (lazyEditCount > MAX_LAZY_EDITS_PER_COMMIT) {
+      return c.json(
+        { error: `Maximum ${MAX_LAZY_EDITS_PER_COMMIT} lazy_edit changes per commit` },
+        400
+      );
+    }
+    if (!c.env.MORPH_API_KEY) {
+      return c.json({ error: "lazy_edit is not configured on this deployment" }, 503);
     }
   }
 
@@ -130,7 +166,33 @@ const createCommitHandler = async (c: any) => {
       storage.setSessionStub(c.get("sessionStub") as DurableObjectStub);
     }
     // Note: RepoDO (Level 1) is attached automatically by resolveRepo
-    const result = await createApiCommit(storage, branch, message, author, changes, parent_sha);
+    const result = await createApiCommit(
+      storage,
+      branch,
+      message,
+      author,
+      changes,
+      parent_sha,
+      c.env.MORPH_API_KEY
+    );
+
+    // Billable: Morph Fast Apply output tokens (only charged on commit success)
+    if (result.morphUsage && result.morphUsage.outputTokens > 0) {
+      recordUsage(
+        c.executionCtx,
+        c.env,
+        db,
+        orgId,
+        c.get("dodoCustomerId"),
+        "lazy_edit_tokens",
+        result.morphUsage.outputTokens,
+        {
+          call_count: result.morphUsage.callCount,
+          model: "morph-v3-fast",
+          commit_sha: result.sha,
+        }
+      );
+    }
 
     // Trigger delta indexing if auto_index enabled
     if (found.autoIndex && c.env.INDEXING_QUEUE) {
@@ -185,6 +247,9 @@ const createCommitHandler = async (c: any) => {
     }
     if (error instanceof InvalidBase64Error) {
       return c.json({ error: error.message }, 400);
+    }
+    if (error instanceof MorphError) {
+      return c.json({ error: `Lazy merge failed: ${error.message}` }, 502);
     }
     console.error("Failed to create commit:", error);
     return c.json({ error: "Failed to create commit" }, 500);

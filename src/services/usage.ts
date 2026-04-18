@@ -23,7 +23,8 @@ export type UsageEventType =
   | "semantic_search_query"
   | "semantic_index_chunks"
   | "graph_query"
-  | "hybrid_search";
+  | "hybrid_search"
+  | "lazy_edit_tokens";
 
 /**
  * Per-event conversion: quantity → Dodo meter units.
@@ -48,6 +49,13 @@ function toDodoMeterEvent(
       const mb = Math.max(1, Math.ceil(quantity / (1024 * 1024)));
       return { eventName: METER_EVENT_NAMES.storage_bytes, metadata: { mb, bytes: quantity } };
     }
+    case "lazy_edit_tokens":
+      // Billed on Morph output (completion) tokens with markup configured in the
+      // Dodo meter price (target: $3.00 / 1M tokens = 2.5x markup over Morph cost).
+      return {
+        eventName: METER_EVENT_NAMES.lazy_edit_tokens,
+        metadata: { output_tokens: quantity },
+      };
     default:
       return null; // not billable
   }
