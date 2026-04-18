@@ -449,7 +449,16 @@ function toolCallToCommand(call: ParsedToolCall): string | null {
       const inc = include && !hasShellInjection(include)
         ? ` --include=${bashQuote(include)}`
         : "";
-      return `grep ${flags}${inc} -- ${bashQuote(pattern)} . 2>/dev/null | head -200`;
+      const pathArg = typeof args.path === "string" ? args.path : ".";
+      if (hasShellInjection(pathArg)) return null;
+      const ctxRaw = args.output_context_lines ?? args.context_lines;
+      const ctx = typeof ctxRaw === "number"
+        ? ctxRaw
+        : typeof ctxRaw === "string" && /^\d{1,2}$/.test(ctxRaw)
+        ? parseInt(ctxRaw, 10)
+        : 0;
+      const ctxFlag = ctx > 0 && ctx <= 10 ? ` -C ${ctx}` : "";
+      return `grep ${flags}${inc}${ctxFlag} -- ${bashQuote(pattern)} ${bashQuote(pathArg)}`;
     }
     case "read": {
       const path = typeof args.path === "string" ? args.path : "";
@@ -465,11 +474,13 @@ function toolCallToCommand(call: ParsedToolCall): string | null {
       return `cat ${bashQuote(path)}`;
     }
     case "list_directory": {
-      // Morph may pass either {command: "ls ..."} or {path: "..."}
+      // Morph abuses this field to send arbitrary read-only shell commands
+      // (find / ls / tree). Accept anything in our whitelist.
       const cmdArg = typeof args.command === "string" ? args.command : null;
       if (cmdArg) {
-        if (!cmdArg.trim().startsWith("ls")) return null;
         if (hasShellInjection(cmdArg)) return null;
+        const head = cmdArg.trim().split(/\s+/)[0];
+        if (!["ls", "find", "tree"].includes(head)) return null;
         return cmdArg;
       }
       const path = typeof args.path === "string" ? args.path : ".";
@@ -479,7 +490,7 @@ function toolCallToCommand(call: ParsedToolCall): string | null {
     case "glob": {
       const pattern = typeof args.pattern === "string" ? args.pattern : "";
       if (!pattern || hasShellInjection(pattern)) return null;
-      return `find . -name ${bashQuote(pattern)} -type f 2>/dev/null | head -200`;
+      return `find . -name ${bashQuote(pattern)} -type f`;
     }
     default:
       return null;
