@@ -12,6 +12,7 @@
 const FLUSH_INTERVAL_MS = 30_000; // flush to R2 every 30 seconds
 const MAX_PENDING_OBJECTS = 2000;
 const FLUSH_BATCH_SIZE = 20;
+const PACK_LOCK_TTL_MS = 5 * 60 * 1000; // background repack lock — long enough for slow cron runs
 
 export class RepoHotDO implements DurableObject {
   private state: DurableObjectState;
@@ -44,8 +45,32 @@ export class RepoHotDO implements DurableObject {
     if (path === "/cas-ref" && request.method === "POST") return this.handleCasRef(request);
     if (path === "/flush" && request.method === "POST") return this.handleFlush();
     if (path === "/status") return this.handleStatus();
+    if (path === "/pack-lock" && request.method === "POST") return this.handlePackLock();
+    if (path === "/pack-unlock" && request.method === "POST") return this.handlePackUnlock();
 
     return new Response("Not found", { status: 404 });
+  }
+
+  // ── Pack Lock ──
+  // Serializes background repack runs for this repo. `packLooseObjects` is not
+  // transactional (it writes pack+index, then deletes loose). Two concurrent runs
+  // on the same repo would double-pack. Scheduled worker acquires the lock; if
+  // already held, skips this repo for this tick.
+
+  private async handlePackLock(): Promise<Response> {
+    const now = Date.now();
+    const expiresAt = (await this.state.storage.get("packLockExpiresAt")) as number | undefined;
+    if (expiresAt && expiresAt > now) {
+      return Response.json({ acquired: false, expiresAt });
+    }
+    const newExpiresAt = now + PACK_LOCK_TTL_MS;
+    await this.state.storage.put("packLockExpiresAt", newExpiresAt);
+    return Response.json({ acquired: true, expiresAt: newExpiresAt });
+  }
+
+  private async handlePackUnlock(): Promise<Response> {
+    await this.state.storage.delete("packLockExpiresAt");
+    return Response.json({ released: true });
   }
 
   // ── Put Object ──

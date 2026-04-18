@@ -27,8 +27,10 @@
 import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { bodyLimit } from "hono/body-limit";
-import { sql } from "drizzle-orm";
+import { sql, gt } from "drizzle-orm";
 import { createDb } from "./db";
+import { repo as repoTable } from "./db/schema";
+import { GitR2Storage, PACK_THRESHOLD } from "./git/storage";
 import { getOrgPlan } from "./services/limits";
 import { repos } from "./routes/repos";
 import { branches } from "./routes/branches";
@@ -355,6 +357,45 @@ app.onError((err, c) => {
 export default {
   fetch: app.fetch,
 
+  async scheduled(_event: ScheduledController, env: Env, ctx: ExecutionContext) {
+    // Background loose-object repack. Runs every 6h per wrangler.toml [triggers].
+    // Finds repos written in the last ~7h (6h cadence + 1h slack), and for each
+    // repo with loose-object count > PACK_THRESHOLD, runs packLooseObjects().
+    // A per-repo DO lock prevents concurrent runs from double-packing.
+    const db = createDb(env.HYPERDRIVE.connectionString);
+    const bucket = env.REPOS_BUCKET;
+    const repoHotNs = env.REPO_HOT_DO;
+    const since = new Date(Date.now() - 7 * 60 * 60 * 1000);
+
+    const recent = await db
+      .select({
+        id: repoTable.id,
+        orgId: repoTable.orgId,
+        namespace: repoTable.namespace,
+        slug: repoTable.slug,
+      })
+      .from(repoTable)
+      .where(gt(repoTable.updatedAt, since));
+
+    // Workers: 6 concurrent subrequest cap. Each per-repo run does one R2 list +
+    // (conditionally) a full packLooseObjects call. Keep outer concurrency low.
+    const OUTER_CONCURRENCY = 3;
+    for (let i = 0; i < recent.length; i += OUTER_CONCURRENCY) {
+      const slice = recent.slice(i, i + OUTER_CONCURRENCY);
+      await Promise.all(
+        slice.map((r) =>
+          packOneRepoIfNeeded(bucket, repoHotNs, r).catch((err) => {
+            console.error(
+              `[cron/pack] repo=${r.orgId}/${r.namespace ?? ""}${r.slug}: ${
+                err instanceof Error ? err.message : String(err)
+              }`,
+            );
+          }),
+        ),
+      );
+    }
+  },
+
   async queue(batch: MessageBatch<IndexingMessage | GraphIndexingMessage>, env: Env, ctx: ExecutionContext) {
     const db = createDb(env.HYPERDRIVE.connectionString);
     for (const message of batch.messages) {
@@ -402,3 +443,45 @@ export default {
     }
   },
 };
+
+/**
+ * For one repo: cheap-check the loose-object count (one R2 list), and if it's over
+ * PACK_THRESHOLD, acquire a per-repo DO lock and run packLooseObjects().
+ * Lock prevents a second cron tick (or stuck previous run) from double-packing.
+ */
+async function packOneRepoIfNeeded(
+  bucket: R2Bucket,
+  repoHotNs: DurableObjectNamespace,
+  r: { id: string; orgId: string; namespace: string | null; slug: string },
+): Promise<void> {
+  const storageSuffix = r.namespace ? `${r.namespace}/${r.slug}` : r.slug;
+  const basePath = `${r.orgId}/${storageSuffix}`;
+
+  // Fast-path check: one R2 list capped at PACK_THRESHOLD + 1. If we don't hit the
+  // limit the repo isn't packable yet — skip without spinning up a DO.
+  const probe = await bucket.list({
+    prefix: `${basePath}/objects/`,
+    limit: PACK_THRESHOLD + 1,
+  });
+  const looseCount = probe.objects.filter((o) => !o.key.endsWith(".gitkeep")).length;
+  if (looseCount <= PACK_THRESHOLD) return;
+
+  // Acquire per-repo lock via RepoHotDO. If held, another tick is handling it.
+  const stub = repoHotNs.get(repoHotNs.idFromName(r.id));
+  const lockRes = await stub.fetch("https://do/pack-lock", { method: "POST" });
+  const lock = (await lockRes.json()) as { acquired: boolean };
+  if (!lock.acquired) return;
+
+  try {
+    const storage = new GitR2Storage(bucket, r.orgId, storageSuffix);
+    const result = await storage.packLooseObjects();
+    if (result) {
+      console.log(
+        `[cron/pack] repo=${r.id} packed=${result.packed} packSha=${result.packSha}`,
+      );
+    }
+  } finally {
+    // Best-effort unlock; lock also auto-expires via TTL if we crash.
+    await stub.fetch("https://do/pack-unlock", { method: "POST" }).catch(() => {});
+  }
+}

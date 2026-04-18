@@ -37,6 +37,12 @@ enabled = true
 enabled = true
 invocation_logs = true
 
+# Background maintenance — loose-object repack sweeper.
+# Every 6h: find repos touched in the last ~6h and, if their loose-object count
+# exceeds PACK_THRESHOLD, run packLooseObjects(). See src/index.ts#scheduled.
+[triggers]
+crons = ["0 */6 * * *"]
+
 # Semantic search tree cache (commit SHA → blob SHAs)
 [[kv_namespaces]]
 binding = "TREE_CACHE"

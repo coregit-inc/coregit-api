@@ -21,8 +21,10 @@ interface SessionMeta {
 }
 
 const SESSION_TTL_MS = 30 * 60 * 1000; // 30 minutes
-const MAX_PENDING_OBJECTS = 1000;
+const MAX_PENDING_OBJECTS = 2000; // matches RepoHotDO; npm-init pushes routinely hit 500–1500
 const FLUSH_BATCH_SIZE = 20;
+const FLUSH_INTERVAL_MS = 30_000; // auto-flush when buffer is filling during a long push
+const FLUSH_TRIGGER_COUNT = 200;  // schedule an intermediate flush once buffer grows past this
 
 export class SessionDO implements DurableObject {
   private state: DurableObjectState;
@@ -47,7 +49,13 @@ export class SessionDO implements DurableObject {
     if (!this.meta) return;
     this.meta.lastActivityAt = Date.now();
     await this.state.storage.put("meta", this.meta);
-    this.state.storage.setAlarm(Date.now() + SESSION_TTL_MS);
+    // Preserve any sooner alarm (e.g. a pending auto-flush). Only extend the alarm out
+    // to the TTL horizon if no earlier alarm is already scheduled.
+    const existing = await this.state.storage.getAlarm();
+    const ttlAlarm = Date.now() + SESSION_TTL_MS;
+    if (existing === null || existing > ttlAlarm) {
+      this.state.storage.setAlarm(ttlAlarm);
+    }
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -146,6 +154,17 @@ export class SessionDO implements DurableObject {
     }
 
     await this.touch();
+
+    // Schedule an intermediate flush while the buffer is actively growing so long
+    // pushes don't sit on thousands of objects in DO storage until /flush or TTL.
+    if (this.objectCount >= FLUSH_TRIGGER_COUNT) {
+      const existingAlarm = await this.state.storage.getAlarm();
+      const flushAt = Date.now() + FLUSH_INTERVAL_MS;
+      if (existingAlarm === null || existingAlarm > flushAt) {
+        this.state.storage.setAlarm(flushAt);
+      }
+    }
+
     return new Response(null, { status: 202 });
   }
 
@@ -299,7 +318,18 @@ export class SessionDO implements DurableObject {
 
     // Check if session is still active
     if (Date.now() - this.meta.lastActivityAt < SESSION_TTL_MS) {
-      // Still active, reschedule
+      // Still active. If we've accumulated pending objects, flush them to R2 now
+      // so a long push doesn't hold thousands of objects in DO storage waiting for
+      // explicit /flush or /close. flushToR2 writes any pending refs too — benign
+      // since refs are SHA pointers and will be re-written at /close.
+      if (this.objectCount > 0) {
+        try {
+          await this.flushToR2();
+        } catch (err) {
+          console.error("Session intermediate flush failed:", err);
+        }
+      }
+      // Reschedule the expiry alarm at the normal TTL horizon.
       this.state.storage.setAlarm(this.meta.lastActivityAt + SESSION_TTL_MS);
       return;
     }

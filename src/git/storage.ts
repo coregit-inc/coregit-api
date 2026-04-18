@@ -27,7 +27,7 @@ import { createMinimalPack, readFromPack, type PackIndex } from "./pack-storage"
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 
-const PACK_THRESHOLD = 256; // pack loose objects when count exceeds this
+export const PACK_THRESHOLD = 256; // pack loose objects when count exceeds this
 
 export class GitR2Storage {
   private bucket: R2Bucket;
@@ -278,12 +278,18 @@ export class GitR2Storage {
   private async _loadPackIndices(): Promise<PackIndex[]> {
     if (this._packIndices !== null) return this._packIndices;
 
-    // List pack index files in R2
+    // List ALL pack index files in R2 — cursor-paginated to handle repos with >100 packs.
+    // Prior code used `limit: 100` and silently dropped anything past the first page.
     const prefix = `${this.basePath}/pack/`;
-    const listed = await this.bucket.list({ prefix, limit: 100 });
-    const idxKeys = listed.objects
-      .filter((o) => o.key.endsWith(".idx"))
-      .map((o) => o.key);
+    const idxKeys: string[] = [];
+    let cursor: string | undefined;
+    do {
+      const listed = await this.bucket.list({ prefix, cursor });
+      for (const o of listed.objects) {
+        if (o.key.endsWith(".idx")) idxKeys.push(o.key);
+      }
+      cursor = listed.truncated ? listed.cursor : undefined;
+    } while (cursor);
 
     if (idxKeys.length === 0) {
       this._packIndices = [];
@@ -937,10 +943,11 @@ export class GitR2Storage {
     } while (cursor);
 
     // 2. Copy in parallel batches
-    // CF Workers limits concurrent subrequests to 6. Each copy = get+put = 2 subrequests,
-    // so effective concurrency is ~3 copies. Batch size of 10 keeps the pipeline full
-    // without excessive queuing.
-    const BATCH_SIZE = 10;
+    // CF Workers caps concurrent subrequests at 6. Each copy = get+put = 2 subrequests,
+    // so 3 parallel copies is the real ceiling. Batching by 3 matches that cap exactly.
+    // Large-repo forks (>~1000 objects) still won't finish in 30s of Worker CPU — those
+    // move to async-fork-via-Queue in a later campaign.
+    const BATCH_SIZE = 3;
     let copied = 0;
 
     for (let i = 0; i < allKeys.length; i += BATCH_SIZE) {
