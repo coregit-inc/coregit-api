@@ -51,15 +51,17 @@ function toDodoMeterEvent(
       return { eventName: METER_EVENT_NAMES.storage_bytes, metadata: { mb, bytes: quantity } };
     }
     case "lazy_edit_tokens":
-      // Billed on Morph output (completion) tokens with markup configured in the
-      // Dodo meter price (target: $3.00 / 1M tokens = 2.5x markup over Morph cost).
+      // Billed on Morph output (completion) tokens with a thin markup configured
+      // in the Dodo meter price (target: $1.32 / 1M tokens = 10% markup over
+      // Morph's $1.20 / 1M). Keep this low — Coregit's value is the commit
+      // pipeline, not an LLM reseller margin.
       return {
         eventName: METER_EVENT_NAMES.lazy_edit_tokens,
         metadata: { output_tokens: quantity },
       };
     case "agentic_search_tokens":
       // Billed on summed Morph WarpGrep completion tokens across all turns.
-      // Dodo meter price target: $3.00 / 1M tokens (×2.5 markup over Morph).
+      // Dodo meter target: $1.32 / 1M tokens (10% markup over Morph).
       return {
         eventName: METER_EVENT_NAMES.agentic_search_tokens,
         metadata: { output_tokens: quantity },

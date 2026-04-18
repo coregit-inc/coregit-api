@@ -7,8 +7,8 @@
  * - stream: false (default) → application/json with final finish payload
  * - stream: true             → text/event-stream with per-turn events
  *
- * Paid-tier only. Billed per Morph WarpGrep completion token (×2.5 markup via
- * Dodo meter `coregit.v2.agentic_search_tokens`).
+ * Paid-tier only. Billed per Morph WarpGrep completion token at a 10% markup
+ * over Morph cost via Dodo meter `coregit.v2.agentic_search_tokens`.
  */
 
 import { Hono } from "hono";

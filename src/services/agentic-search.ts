@@ -231,6 +231,20 @@ export async function runAgenticSearch(
 
       if (parsed.name === "finish") {
         finishPayload = extractFinishPayload(parsed.args);
+        // Fallback: if Morph omitted `answer`, use the assistant content
+        // from this turn, or synthesize from location list.
+        if (!finishPayload.answer) {
+          const assistantContent = response.message.content?.trim() || "";
+          if (assistantContent) {
+            finishPayload.answer = assistantContent;
+          } else if (finishPayload.locations.length > 0) {
+            const paths = finishPayload.locations
+              .map((l) => l.path)
+              .filter((p, i, a) => a.indexOf(p) === i)
+              .join(", ");
+            finishPayload.answer = `Found in: ${paths}`;
+          }
+        }
         sawFinish = true;
         break;
       }
@@ -392,41 +406,57 @@ function parseToolCall(call: WarpGrepToolCall): ParsedToolCall {
   return { name: call.function.name, args };
 }
 
-interface FinishArgs {
-  answer?: string;
-  locations?: Array<Record<string, unknown>>;
-}
-
+/**
+ * Morph's `finish` tool is lax about its argument shape. Accepted forms:
+ *   { answer, locations: [{path, start_line, end_line}] }
+ *   { files: "path" }
+ *   { files: ["path1", "path2"] }
+ *   { files: [{path, start_line?, end_line?}] }
+ *   { locations: [...] }                (without answer)
+ *   { answer }                           (without any files)
+ *
+ * We normalize everything into { answer, locations[] }. Caller fills `answer`
+ * from the assistant content if still empty.
+ */
 function extractFinishPayload(args: Record<string, unknown>): {
   answer: string;
   locations: FinishLocation[];
 } {
-  const f = args as FinishArgs;
   const locations: FinishLocation[] = [];
-  if (Array.isArray(f.locations)) {
-    for (const loc of f.locations) {
-      const path = String((loc as Record<string, unknown>).path ?? "");
-      const start = Number(
-        (loc as Record<string, unknown>).start_line ??
-          (loc as Record<string, unknown>).start ??
-          0
-      );
-      const end = Number(
-        (loc as Record<string, unknown>).end_line ??
-          (loc as Record<string, unknown>).end ??
-          start
-      );
-      if (path) {
-        locations.push({
-          path,
-          start_line: isFinite(start) ? start : 0,
-          end_line: isFinite(end) ? end : 0,
-        });
-      }
+
+  const pushLocation = (val: unknown) => {
+    if (typeof val === "string") {
+      if (val) locations.push({ path: val, start_line: 0, end_line: 0 });
+      return;
     }
+    if (val && typeof val === "object") {
+      const obj = val as Record<string, unknown>;
+      const path =
+        typeof obj.path === "string"
+          ? obj.path
+          : typeof obj.file === "string"
+          ? obj.file
+          : "";
+      if (!path) return;
+      const start = Number(obj.start_line ?? obj.start ?? 0);
+      const end = Number(obj.end_line ?? obj.end ?? start);
+      locations.push({
+        path,
+        start_line: Number.isFinite(start) ? start : 0,
+        end_line: Number.isFinite(end) ? end : 0,
+      });
+    }
+  };
+
+  const locArr = args.locations ?? args.files ?? args.file;
+  if (Array.isArray(locArr)) {
+    for (const item of locArr) pushLocation(item);
+  } else if (locArr !== undefined) {
+    pushLocation(locArr);
   }
+
   return {
-    answer: typeof f.answer === "string" ? f.answer : "",
+    answer: typeof args.answer === "string" ? args.answer : "",
     locations,
   };
 }
@@ -458,7 +488,7 @@ function toolCallToCommand(call: ParsedToolCall): string | null {
         ? parseInt(ctxRaw, 10)
         : 0;
       const ctxFlag = ctx > 0 && ctx <= 10 ? ` -C ${ctx}` : "";
-      return `grep ${flags}${inc}${ctxFlag} -- ${bashQuote(pattern)} ${bashQuote(pathArg)}`;
+      return `grep ${flags}${inc}${ctxFlag} ${bashQuote(pattern)} ${bashQuote(pathArg)}`;
     }
     case "read": {
       const path = typeof args.path === "string" ? args.path : "";
