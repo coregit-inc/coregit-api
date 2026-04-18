@@ -101,6 +101,7 @@ export const METER_EVENT_NAMES = {
   git_transfer_bytes: "coregit.v2.git_transfer",
   storage_bytes: "coregit.v2.storage",
   lazy_edit_tokens: "coregit.v2.lazy_edit_tokens",
+  agentic_search_tokens: "coregit.v2.agentic_search_tokens",
 } as const;
 
 export type MeterEventKey = keyof typeof METER_EVENT_NAMES;

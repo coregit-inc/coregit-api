@@ -24,7 +24,8 @@ export type UsageEventType =
   | "semantic_index_chunks"
   | "graph_query"
   | "hybrid_search"
-  | "lazy_edit_tokens";
+  | "lazy_edit_tokens"
+  | "agentic_search_tokens";
 
 /**
  * Per-event conversion: quantity → Dodo meter units.
@@ -54,6 +55,13 @@ function toDodoMeterEvent(
       // Dodo meter price (target: $3.00 / 1M tokens = 2.5x markup over Morph cost).
       return {
         eventName: METER_EVENT_NAMES.lazy_edit_tokens,
+        metadata: { output_tokens: quantity },
+      };
+    case "agentic_search_tokens":
+      // Billed on summed Morph WarpGrep completion tokens across all turns.
+      // Dodo meter price target: $3.00 / 1M tokens (×2.5 markup over Morph).
+      return {
+        eventName: METER_EVENT_NAMES.agentic_search_tokens,
         metadata: { output_tokens: quantity },
       };
     default:
