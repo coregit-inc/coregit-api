@@ -25,7 +25,10 @@ export type UsageEventType =
   | "graph_query"
   | "hybrid_search"
   | "lazy_edit_tokens"
-  | "agentic_search_tokens";
+  | "agentic_search_tokens"
+  | "wiki_ingest_run"
+  | "wiki_llm_tokens"
+  | "wiki_connector_setup";
 
 /**
  * Per-event conversion: quantity → Dodo meter units.
@@ -66,6 +69,23 @@ function toDodoMeterEvent(
         eventName: METER_EVENT_NAMES.agentic_search_tokens,
         metadata: { output_tokens: quantity },
       };
+    case "wiki_ingest_run":
+      // One event per completed wiki workflow run (ingest/sync/dream/
+      // lint/refresh). Low-volume, flat-rate meter — the LLM token
+      // meter below is the actual variable cost.
+      return { eventName: METER_EVENT_NAMES.wiki_ingest_run };
+    case "wiki_llm_tokens":
+      // Billed on the sum of Mercury-2 prompt + completion tokens
+      // (cached tokens billed separately via metadata). Dodo meter
+      // target: ~2x the Inception raw rate so we clear Inception's
+      // ~$0.25/$0.75 per MTok cost with a small margin.
+      return {
+        eventName: METER_EVENT_NAMES.wiki_llm_tokens,
+        metadata: { total_tokens: quantity },
+      };
+    case "wiki_connector_setup":
+      // Analytics only — connector installation is free, no Dodo meter.
+      return null;
     default:
       return null; // not billable
   }

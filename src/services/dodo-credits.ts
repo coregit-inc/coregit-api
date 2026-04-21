@@ -102,6 +102,8 @@ export const METER_EVENT_NAMES = {
   storage_bytes: "coregit.v2.storage",
   lazy_edit_tokens: "coregit.v2.lazy_edit_tokens",
   agentic_search_tokens: "coregit.v2.agentic_search_tokens",
+  wiki_ingest_run: "coregit.v2.wiki_ingest_run",
+  wiki_llm_tokens: "coregit.v2.wiki_llm_tokens",
 } as const;
 
 export type MeterEventKey = keyof typeof METER_EVENT_NAMES;

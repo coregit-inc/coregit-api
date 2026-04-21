@@ -44,6 +44,8 @@ import {
 } from "./services/commit-builder";
 import { parseGitObject, parseTree, parseCommit, type TreeEntry } from "./git/objects";
 import { GitR2Storage } from "./git/storage";
+import { recordUsage, type UsageEventType } from "./services/usage";
+import { checkFreeLimits, type LimitEventType } from "./services/limits";
 import type { Env } from "./types";
 
 // ── Types returned across the RPC boundary ──
@@ -54,6 +56,22 @@ export interface ResolvedApiKey {
   apiKeyId: string;
   tier: "free" | "paid";
   orgSlug?: string;
+  dodoCustomerId: string | null;
+}
+
+export interface RecordUsageParams {
+  orgId: string;
+  dodoCustomerId: string | null;
+  eventType: UsageEventType;
+  quantity: number;
+  metadata?: Record<string, unknown>;
+}
+
+export interface CheckFreeLimitsResult {
+  allowed: boolean;
+  used?: number;
+  limit?: number;
+  reason?: string;
 }
 
 export interface CommitFilesParams {
@@ -136,7 +154,40 @@ export class CoregitCoreBinding extends WorkerEntrypoint<Env> {
       apiKeyId: verified.auth.tokenId,
       tier: verified.auth.tier,
       orgSlug: verified.auth.orgSlug,
+      dodoCustomerId: verified.auth.dodoCustomerId,
     };
+  }
+
+  /**
+   * Record a usage event. Fire-and-forget: writes to usage_event for
+   * analytics and posts to Dodo /events/ingest if the event type is
+   * billable + the org has a dodoCustomerId.
+   */
+  async recordUsage(params: RecordUsageParams): Promise<void> {
+    const db = createDb(this.env.HYPERDRIVE.connectionString);
+    recordUsage(
+      this.ctx,
+      this.env,
+      db,
+      params.orgId,
+      params.dodoCustomerId,
+      params.eventType,
+      params.quantity,
+      params.metadata,
+    );
+  }
+
+  /**
+   * Free-tier gate. Returns { allowed } + reason/used/limit on denial.
+   * Safe for paid orgs — always allows.
+   */
+  async checkFreeLimits(params: {
+    orgId: string;
+    tier: "free" | "paid";
+    eventType: LimitEventType;
+  }): Promise<CheckFreeLimitsResult> {
+    const db = createDb(this.env.HYPERDRIVE.connectionString);
+    return checkFreeLimits(db, params.orgId, params.tier, params.eventType);
   }
 
   /** Atomic multi-file commit. Used to write `raw/` sources and wiki pages. */
