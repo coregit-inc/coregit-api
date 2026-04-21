@@ -18,7 +18,7 @@
 
 - **3.6x faster than GitHub** — 100-file commit: 19.8s vs 72.1s. One API call vs 105. ([see benchmarks](https://docs.coregit.dev/docs/guides/scalability-benchmarks))
 - **394x more write throughput** — 15,000 commits/hour vs GitHub's 38 (rate-limited to 500 writes/hr)
-- **AI-native** — Semantic code search (Voyage AI + Pinecone), code graph (Tree-sitter, 30+ languages), LLM Wiki (Karpathy pattern)
+- **AI-native** — Semantic code search (Voyage AI + Pinecone), code graph (Tree-sitter, 30+ languages), agentic search
 - **Serverless** — Cloudflare Workers + R2 + KV + Durable Objects. No servers, no ops, scales to zero
 - **Standard Git protocol** — `git clone`, `push`, `pull` work. Plus 40+ REST API endpoints, TypeScript SDK, and CLI
 - **Zero egress** — R2 storage with $0 bandwidth costs
@@ -106,7 +106,6 @@ curl -X POST https://api.coregit.dev/v1/repos/my-project/commits \
 | **Git Smart HTTP** | Standard `git clone/push/pull` protocol |
 | **Semantic search** | AI-powered code search with Voyage AI embeddings |
 | **Code graph** | Tree-sitter AST analysis, 30+ languages, call graphs |
-| **LLM Wiki** | Agent-maintained knowledge bases (Karpathy pattern) |
 | **Branches & merge** | Create, merge, cherry-pick, compare |
 | **Diff & compare** | Unified diff between any two refs |
 | **Snapshots** | Named restore points for instant rollback |
@@ -157,8 +156,7 @@ flowchart TB
             direction LR
             git["Git Smart HTTP<br/><i>clone · push · pull</i>"]
             rest["REST API<br/><i>repos · commits · branches<br/>diff · merge · cherry-pick</i>"]
-            search["Search<br/><i>semantic · graph · hybrid</i>"]
-            wiki["LLM Wiki<br/><i>11 endpoints</i>"]
+            search["Search<br/><i>semantic · graph · hybrid · agentic</i>"]
         end
 
         kv["<b>KV Cache</b><br/>auth · trees · refs · embeddings · search · graph"]
@@ -226,7 +224,6 @@ See [Self-Hosting Guide](https://docs.coregit.dev/docs/guides/self-hosting) for 
 - [Getting Started](https://docs.coregit.dev/docs/getting-started)
 - [TypeScript SDK](https://docs.coregit.dev/docs/getting-started/typescript-sdk)
 - [Scalability Benchmarks](https://docs.coregit.dev/docs/guides/scalability-benchmarks)
-- [LLM Wiki Guide](https://docs.coregit.dev/docs/guides/llm-wiki)
 
 ## Contributing
 
