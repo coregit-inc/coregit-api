@@ -45,7 +45,7 @@ import {
 import { parseGitObject, parseTree, parseCommit, type TreeEntry } from "./git/objects";
 import { GitR2Storage } from "./git/storage";
 import { recordUsage, type UsageEventType } from "./services/usage";
-import { checkFreeLimits, type LimitEventType } from "./services/limits";
+import { checkFreeLimits, getOrgPlan, type LimitEventType } from "./services/limits";
 import type { Env } from "./types";
 
 // ── Types returned across the RPC boundary ──
@@ -162,15 +162,23 @@ export class CoregitCoreBinding extends WorkerEntrypoint<Env> {
    * Record a usage event. Fire-and-forget: writes to usage_event for
    * analytics and posts to Dodo /events/ingest if the event type is
    * billable + the org has a dodoCustomerId.
+   *
+   * If `dodoCustomerId` is null, we look it up from `org_plan` so queue
+   * consumers (which don't have Hono context) can still bill correctly.
    */
   async recordUsage(params: RecordUsageParams): Promise<void> {
     const db = createDb(this.env.HYPERDRIVE.connectionString);
+    let dodoCustomerId = params.dodoCustomerId;
+    if (dodoCustomerId === null) {
+      const plan = await getOrgPlan(db, params.orgId).catch(() => null);
+      dodoCustomerId = plan?.dodoCustomerId ?? null;
+    }
     recordUsage(
       this.ctx,
       this.env,
       db,
       params.orgId,
-      params.dodoCustomerId,
+      dodoCustomerId,
       params.eventType,
       params.quantity,
       params.metadata,

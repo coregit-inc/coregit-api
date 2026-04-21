@@ -213,7 +213,8 @@ export const apiKeyAuth = createMiddleware<{
   if (internalToken && c.env.INTERNAL_SYNC_TOKEN && timingSafeEqual(internalToken, c.env.INTERNAL_SYNC_TOKEN)) {
     const path = c.req.path;
     const isAllowedPath = /^\/v1\/repos\/[^/]+(\/[^/]+)?\/sync(\/|$)/.test(path)
-      || /^\/v1\/connections(\/|$)/.test(path);
+      || /^\/v1\/connections(\/|$)/.test(path)
+      || /^\/v1\/domains(\/|$)/.test(path);
     if (!isAllowedPath) {
       return c.json({ error: "Internal token not authorized for this endpoint" }, 403);
     }

@@ -48,6 +48,7 @@ import { hybridSearchRoutes } from "./routes/hybrid-search";
 import { forks } from "./routes/forks";
 import { session } from "./routes/session";
 import { admin } from "./routes/admin";
+import { domains } from "./routes/domains";
 import { setRepoCacheRef, setRepoHotDORef, setRefCacheKvRef, setObjCacheKvRef } from "./services/repo-resolver";
 import type { Env, Variables } from "./types";
 
@@ -267,6 +268,7 @@ app.route("/v1/repos", semanticIndexRoutes);
 app.route("/v1/repos", forks);
 app.route("/v1/repos", repos);
 app.route("/v1", connections);
+app.route("/v1", domains);
 app.route("/v1", tokens);
 app.route("/v1", webhooks);
 app.route("/v1", search);

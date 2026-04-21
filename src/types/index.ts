@@ -8,8 +8,8 @@ export interface Env {
   LFS_BUCKET: R2Bucket;
   DODO_PAYMENTS_API_KEY: string;
   DODO_CREDIT_ENTITLEMENT_ID: string;
-  CF_ZONE_ID?: string;
-  CF_API_TOKEN?: string;
+  CF_ZONE_ID: string;
+  CF_API_TOKEN: string;
   SYNC_ENCRYPTION_KEY: string;
   WEBHOOK_ENCRYPTION_KEY?: string;
   INTERNAL_SYNC_TOKEN?: string;
