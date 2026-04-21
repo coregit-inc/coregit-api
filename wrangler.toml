@@ -100,6 +100,12 @@ bindings = [
   { name = "REPO_HOT_DO", class_name = "RepoHotDO" }
 ]
 
+# Service binding to the private coregit-api-wiki Worker. AGPL core
+# forwards /v1/repos/:slug/wiki/* requests to the add-on via this binding.
+[[services]]
+binding = "WIKI"
+service = "coregit-api-wiki"
+
 [[migrations]]
 tag = "v1"
 new_classes = ["RateLimiterDO"]

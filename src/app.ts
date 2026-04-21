@@ -230,6 +230,23 @@ app.use("/:org/:namespace/:repo/*", async (c, next) => {
 
 app.route("/", customDomainGit);
 
+// LLM Wiki — forwarded to the adjacent private Worker via Service Binding.
+// Cloudflare route rules can't wildcard mid-path (no "/repos/*/wiki/*"),
+// so we catch these paths here and hand the raw Request to env.WIKI.
+// When WIKI isn't bound (e.g. self-hosted deploys without the add-on),
+// requests fall through to a 404 without leaking internals.
+const WIKI_PATH_RE = /^\/v1\/repos\/[^/]+(?:\/[^/]+)?\/wiki(?:\/|$)/;
+app.all("/v1/repos/:a/wiki/*", async (c) => forwardToWiki(c));
+app.all("/v1/repos/:a/wiki", async (c) => forwardToWiki(c));
+app.all("/v1/repos/:a/:b/wiki/*", async (c) => forwardToWiki(c));
+app.all("/v1/repos/:a/:b/wiki", async (c) => forwardToWiki(c));
+async function forwardToWiki(c: any): Promise<Response> {
+  if (!WIKI_PATH_RE.test(new URL(c.req.url).pathname)) return c.json({ error: "Not found" }, 404);
+  const wiki = (c.env as Env).WIKI;
+  if (!wiki) return c.json({ error: "Wiki worker not configured" }, 503);
+  return wiki.fetch(c.req.raw);
+}
+
 app.route("/v1/repos", branches);
 app.route("/v1/repos", commits);
 app.route("/v1/repos", files);

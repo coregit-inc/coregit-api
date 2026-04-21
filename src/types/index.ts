@@ -42,6 +42,10 @@ export interface Env {
   REPO_HOT_DO: DurableObjectNamespace;
   // Hyperdrive (Neon connection pooling)
   HYPERDRIVE: Hyperdrive;
+  // Optional service binding to the private LLM Wiki Worker. Set only in
+  // deploys that ship the proprietary add-on. When unset, wiki-path
+  // requests return 503 "Wiki worker not configured".
+  WIKI?: { fetch(request: Request): Promise<Response> };
 }
 
 export interface Variables {
