@@ -46,6 +46,8 @@ import { parseGitObject, parseTree, parseCommit, type TreeEntry } from "./git/ob
 import { GitR2Storage } from "./git/storage";
 import { recordUsage, type UsageEventType } from "./services/usage";
 import { checkFreeLimits, getOrgPlan, type LimitEventType } from "./services/limits";
+import type { IndexFileMessage } from "./services/semantic-index";
+import type { GraphIndexFileMessage } from "./services/graph-index";
 import type { Env } from "./types";
 
 // ── Types returned across the RPC boundary ──
@@ -225,6 +227,42 @@ export class CoregitCoreBinding extends WorkerEntrypoint<Env> {
       changes,
       params.parentSha,
     );
+
+    // Trigger delta semantic + graph indexing if auto_index is set on the
+    // repo. Mirrors the same fire-and-forget behaviour as POST /commits
+    // so Service Binding callers (the wiki worker today, anyone tomorrow)
+    // stay consistent with the HTTP route.
+    if (resolved.repo.autoIndex && this.env.INDEXING_QUEUE) {
+      const indexFiles = changes.map((ch) => {
+        const finalPath = ch.action === "rename" ? ch.new_path! : ch.path;
+        return {
+          path: finalPath,
+          action: (ch.action || "create") as "create" | "edit" | "delete" | "rename",
+          blobSha: ch.action === "delete" ? undefined : result.changedBlobs.get(finalPath),
+          oldPath: ch.action === "rename" ? ch.path : undefined,
+        };
+      });
+      const indexMsg: IndexFileMessage = {
+        type: "index_files",
+        orgId: params.orgId,
+        repoId: resolved.repo.id,
+        repoStorageSuffix: resolved.storageSuffix,
+        branch: params.branch,
+        commitSha: result.sha,
+        files: indexFiles,
+      };
+      const graphMsg: GraphIndexFileMessage = {
+        type: "graph_index_files",
+        orgId: params.orgId,
+        repoId: resolved.repo.id,
+        repoStorageSuffix: resolved.storageSuffix,
+        branch: params.branch,
+        commitSha: result.sha,
+        files: indexFiles,
+      };
+      this.ctx.waitUntil(this.env.INDEXING_QUEUE.send(indexMsg));
+      this.ctx.waitUntil(this.env.INDEXING_QUEUE.send(graphMsg));
+    }
 
     return {
       version_id: result.sha,
