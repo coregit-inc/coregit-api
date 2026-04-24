@@ -21,21 +21,49 @@ const connections = new Hono<{ Bindings: Env; Variables: Variables }>();
 const GH_API = "https://api.github.com";
 const GL_API = "https://gitlab.com/api/v4";
 
-/** Validate a GitHub token by fetching the authenticated user. */
-async function validateGithubToken(token: string): Promise<string> {
-  const res = await fetch(`${GH_API}/user`, {
-    headers: {
-      Authorization: `Bearer ${token}`,
-      Accept: "application/vnd.github+json",
-      "User-Agent": "coregit-sync/0.1",
-    },
-  });
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`GitHub token validation failed: ${res.status} ${text}`);
+/**
+ * Validate a GitHub token and return a human-friendly identifier.
+ *
+ * Two acceptable token shapes:
+ *   1. PAT / OAuth user token (`ghp_…` / `gho_…` / fine-grained `github_pat_…`)
+ *      — validated against `GET /user`, returns the user's login.
+ *   2. GitHub App installation access token (`ghs_…`)
+ *      — `/user` returns 403 "Resource not accessible by integration", so we
+ *      fall back to `GET /installation/repositories` and use the first repo's
+ *      owner login as the identifier (or null if the installation has zero
+ *      accessible repos yet).
+ *
+ * Returns null when the token is valid but no public identifier is available.
+ */
+async function validateGithubToken(token: string): Promise<string | null> {
+  const headers = {
+    Authorization: `Bearer ${token}`,
+    Accept: "application/vnd.github+json",
+    "User-Agent": "coregit-sync/0.1",
+  };
+
+  const userRes = await fetch(`${GH_API}/user`, { headers });
+  if (userRes.ok) {
+    const data = (await userRes.json()) as { login: string };
+    return data.login;
   }
-  const data = (await res.json()) as { login: string };
-  return data.login;
+
+  // Installation tokens cannot reach /user. Confirm via the installation-
+  // scoped endpoint before declaring the token bad.
+  if (userRes.status === 401 || userRes.status === 403) {
+    const instRes = await fetch(`${GH_API}/installation/repositories?per_page=1`, {
+      headers,
+    });
+    if (instRes.ok) {
+      const data = (await instRes.json()) as {
+        repositories?: Array<{ owner?: { login?: string } }>;
+      };
+      return data.repositories?.[0]?.owner?.login ?? null;
+    }
+  }
+
+  const text = await userRes.text();
+  throw new Error(`GitHub token validation failed: ${userRes.status} ${text}`);
 }
 
 /** Validate a GitLab token by fetching the authenticated user. */
@@ -76,7 +104,7 @@ connections.post("/connections", apiKeyAuth, async (c) => {
   }
 
   // Validate token with provider API
-  let externalUsername: string;
+  let externalUsername: string | null;
   try {
     externalUsername =
       body.provider === "github"
@@ -180,7 +208,7 @@ connections.patch("/connections/:id", apiKeyAuth, async (c) => {
 
   if (body.access_token) {
     // Validate new token
-    let externalUsername: string;
+    let externalUsername: string | null;
     try {
       externalUsername =
         existing.provider === "github"
