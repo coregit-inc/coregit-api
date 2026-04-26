@@ -3,6 +3,23 @@ import { drizzle } from "drizzle-orm/postgres-js";
 import * as schema from "./schema";
 
 /**
+ * Resolve the Postgres connection string from the Worker env. Preview
+ * deploys pass DATABASE_URL as a secret (no Hyperdrive in preview because
+ * Hyperdrive bindings can't fan out to per-branch Neon clones). Production
+ * uses Hyperdrive's pooled connection.
+ */
+export function dbConnectionString(env: {
+  DATABASE_URL?: string;
+  HYPERDRIVE?: { connectionString: string };
+}): string {
+  // Falsy → empty string preserves the existing `if (!c.env.HYPERDRIVE.connectionString)`
+  // call sites that returned 500 when the DB wasn't wired up.
+  if (env.DATABASE_URL) return env.DATABASE_URL;
+  if (env.HYPERDRIVE?.connectionString) return env.HYPERDRIVE.connectionString;
+  return "";
+}
+
+/**
  * Create a database connection via postgres-js (TCP) for Hyperdrive.
  *
  * postgres-js db.execute() returns a RowList (array-like).
