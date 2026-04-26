@@ -12,7 +12,7 @@
 import { Hono } from "hono";
 import { eq, and } from "drizzle-orm";
 import { nanoid } from "nanoid";
-import { createDb } from "../db";
+import { createDb, dbConnectionString } from "../db";
 import { repoSync, repoSyncRun, externalConnection, repo } from "../db/schema";
 import { decryptSecret } from "../services/secret-manager";
 import { syncFromGithub } from "../services/github-sync";
@@ -208,7 +208,7 @@ syncWebhooks.post("/sync-webhooks/github", async (c) => {
     }
 
     // Find matching sync configs — DB already set by /v1/* middleware
-    const db = c.get("db") || createDb(c.env.HYPERDRIVE.connectionString);
+    const db = c.get("db") || createDb(dbConnectionString(c.env));
 
     const syncConfigs = await db
       .select()
@@ -294,7 +294,7 @@ syncWebhooks.post("/sync-webhooks/gitlab", async (c) => {
       return c.json({ error: "Missing project.path_with_namespace" }, 400);
     }
 
-    const db = c.get("db") || createDb(c.env.HYPERDRIVE.connectionString);
+    const db = c.get("db") || createDb(dbConnectionString(c.env));
 
     const syncConfigs = await db
       .select()

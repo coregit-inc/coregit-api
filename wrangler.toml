@@ -133,3 +133,20 @@ new_classes = ["RepoHotDO"]
 # PINECONE_API_KEY       — Pinecone API key for vector search
 # VOYAGE_API_KEY         — Voyage AI API key for code embeddings & reranking
 # PINECONE_INDEX_HOST    — Pinecone serverless index host URL
+
+# ──────────────────────────────────────────────────────────────────────
+#  PREVIEW DEPLOYMENTS (per-branch via versions upload)
+# ──────────────────────────────────────────────────────────────────────
+# Openhive's GHA workflow runs `wrangler versions upload --preview-alias <slug>`
+# on every push to a non-main branch. The new version inherits ALL prod
+# bindings (KV, queues, DOs, Hyperdrive, services) automatically — only
+# DATABASE_URL is overridden per-deploy via --secrets-file so each task's
+# Neon branch is exposed to the preview without rewriting Hyperdrive's
+# config. The deploy lands at <slug>-coregit-api.<account>.workers.dev.
+#
+# Caveats:
+#   - Preview shares prod KV / queues / RateLimiter DO. For Openhive's
+#     personal-scale tasks this is acceptable; revisit if multiple
+#     concurrent agent tasks ever land.
+#   - DO migrations require `wrangler deploy` (not `versions upload`).
+#     If a task adds a DO class, fall back to a one-off deploy.

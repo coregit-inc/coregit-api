@@ -13,7 +13,7 @@ import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { bodyLimit } from "hono/body-limit";
 import { sql } from "drizzle-orm";
-import { createDb } from "./db";
+import { createDb, dbConnectionString } from "./db";
 import { getOrgPlan } from "./services/limits";
 import { repos } from "./routes/repos";
 import { branches } from "./routes/branches";
@@ -87,8 +87,8 @@ app.use("*", async (c, next) => {
     if (cached.status !== "active") {
       return c.text("Domain is not active", 403);
     }
-    if (!c.env.HYPERDRIVE.connectionString) return c.text("Database not configured", 500);
-    const db = createDb(c.env.HYPERDRIVE.connectionString);
+    if (!dbConnectionString(c.env)) return c.text("Database not configured", 500);
+    const db = createDb(dbConnectionString(c.env));
     c.set("db", db);
     c.set("orgId", cached.orgId);
     c.set("customDomain", host);
@@ -99,8 +99,8 @@ app.use("*", async (c, next) => {
     return next();
   }
 
-  if (!c.env.HYPERDRIVE.connectionString) return c.text("Database not configured", 500);
-  const db = createDb(c.env.HYPERDRIVE.connectionString);
+  if (!dbConnectionString(c.env)) return c.text("Database not configured", 500);
+  const db = createDb(dbConnectionString(c.env));
   c.set("db", db);
 
   const result = await db.execute(
@@ -176,11 +176,11 @@ app.get("/", (c) => {
 });
 
 app.get("/health", async (c) => {
-  if (!c.env.HYPERDRIVE.connectionString) {
+  if (!dbConnectionString(c.env)) {
     return c.json({ status: "degraded", db: "not_configured" }, 503);
   }
   try {
-    const db = createDb(c.env.HYPERDRIVE.connectionString);
+    const db = createDb(dbConnectionString(c.env));
     await db.execute(sql`SELECT 1`);
     return c.json({ status: "ok", db: "ok" });
   } catch {
@@ -190,7 +190,7 @@ app.get("/health", async (c) => {
 
 app.use("/v1/*", async (c, next) => {
   if (!c.get("db")) {
-    const connStr = c.env.HYPERDRIVE.connectionString;
+    const connStr = dbConnectionString(c.env);
     if (!connStr) return c.json({ error: "Database not configured" }, 500);
     c.set("db", createDb(connStr));
   }
@@ -211,8 +211,8 @@ app.use("/:org/:repo/*", async (c, next) => {
     return next();
   }
   if (!c.get("db")) {
-    if (!c.env.HYPERDRIVE.connectionString) return c.text("Database not configured", 500);
-    c.set("db", createDb(c.env.HYPERDRIVE.connectionString));
+    if (!dbConnectionString(c.env)) return c.text("Database not configured", 500);
+    c.set("db", createDb(dbConnectionString(c.env)));
   }
   await next();
 });
@@ -223,8 +223,8 @@ app.use("/:org/:namespace/:repo/*", async (c, next) => {
   const repoParam = c.req.param("repo");
   if (!repoParam?.endsWith(".git") && !repoParam?.includes(".git/")) return next();
   if (!c.get("db")) {
-    if (!c.env.HYPERDRIVE.connectionString) return c.text("Database not configured", 500);
-    c.set("db", createDb(c.env.HYPERDRIVE.connectionString));
+    if (!dbConnectionString(c.env)) return c.text("Database not configured", 500);
+    c.set("db", createDb(dbConnectionString(c.env)));
   }
   await next();
 });

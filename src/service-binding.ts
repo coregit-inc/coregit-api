@@ -26,7 +26,7 @@
 
 import { WorkerEntrypoint } from "cloudflare:workers";
 import { sql } from "drizzle-orm";
-import { createDb } from "./db";
+import { createDb, dbConnectionString } from "./db";
 import { app } from "./app";
 import { verifyWithCache } from "./auth/middleware";
 import {
@@ -144,7 +144,7 @@ export class CoregitCoreBinding extends WorkerEntrypoint<Env> {
   /** Resolve an API key to org/tier. Called once per request by the wiki worker middleware. */
   async resolveApiKey(params: { apiKey: string }): Promise<ResolvedApiKey | null> {
     this.initCaches();
-    const db = createDb(this.env.HYPERDRIVE.connectionString);
+    const db = createDb(dbConnectionString(this.env));
     const verified = await verifyWithCache(
       db,
       params.apiKey,
@@ -169,7 +169,7 @@ export class CoregitCoreBinding extends WorkerEntrypoint<Env> {
    * consumers (which don't have Hono context) can still bill correctly.
    */
   async recordUsage(params: RecordUsageParams): Promise<void> {
-    const db = createDb(this.env.HYPERDRIVE.connectionString);
+    const db = createDb(dbConnectionString(this.env));
     let dodoCustomerId = params.dodoCustomerId;
     if (dodoCustomerId === null) {
       const plan = await getOrgPlan(db, params.orgId).catch(() => null);
@@ -196,14 +196,14 @@ export class CoregitCoreBinding extends WorkerEntrypoint<Env> {
     tier: "free" | "paid";
     eventType: LimitEventType;
   }): Promise<CheckFreeLimitsResult> {
-    const db = createDb(this.env.HYPERDRIVE.connectionString);
+    const db = createDb(dbConnectionString(this.env));
     return checkFreeLimits(db, params.orgId, params.tier, params.eventType);
   }
 
   /** Atomic multi-file commit. Used to write `raw/` sources and wiki pages. */
   async commitFiles(params: CommitFilesParams): Promise<CommitFilesResult> {
     this.initCaches();
-    const db = createDb(this.env.HYPERDRIVE.connectionString);
+    const db = createDb(dbConnectionString(this.env));
     const resolved = await resolveRepo(db, this.env.REPOS_BUCKET, {
       orgId: params.orgId,
       slug: params.slug,
@@ -277,7 +277,7 @@ export class CoregitCoreBinding extends WorkerEntrypoint<Env> {
    */
   async getRef(params: RepoRef & { ref: string }): Promise<{ sha: string; tree_sha?: string } | null> {
     this.initCaches();
-    const db = createDb(this.env.HYPERDRIVE.connectionString);
+    const db = createDb(dbConnectionString(this.env));
     const resolved = await resolveRepo(db, this.env.REPOS_BUCKET, params);
     if (!resolved) return null;
 
@@ -302,7 +302,7 @@ export class CoregitCoreBinding extends WorkerEntrypoint<Env> {
     params: RepoRef & { ref: string; path: string }
   ): Promise<{ content: string; sha: string; size: number } | null> {
     this.initCaches();
-    const db = createDb(this.env.HYPERDRIVE.connectionString);
+    const db = createDb(dbConnectionString(this.env));
     const resolved = await resolveRepo(db, this.env.REPOS_BUCKET, params);
     if (!resolved) return null;
 
@@ -332,7 +332,7 @@ export class CoregitCoreBinding extends WorkerEntrypoint<Env> {
     params: RepoRef & { ref: string; pathPrefix?: string; recursive?: boolean; limit?: number }
   ): Promise<TreeEntryInfo[]> {
     this.initCaches();
-    const db = createDb(this.env.HYPERDRIVE.connectionString);
+    const db = createDb(dbConnectionString(this.env));
     const resolved = await resolveRepo(db, this.env.REPOS_BUCKET, params);
     if (!resolved) return [];
 
@@ -370,7 +370,7 @@ export class CoregitCoreBinding extends WorkerEntrypoint<Env> {
   /** Create a new branch pointing at an existing ref. Used for sandboxes. */
   async createBranch(params: RepoRef & { name: string; fromRef: string }): Promise<{ version_id: string }> {
     this.initCaches();
-    const db = createDb(this.env.HYPERDRIVE.connectionString);
+    const db = createDb(dbConnectionString(this.env));
     const resolved = await resolveRepo(db, this.env.REPOS_BUCKET, params);
     if (!resolved) throw new Error("Repository not found");
 
@@ -387,7 +387,7 @@ export class CoregitCoreBinding extends WorkerEntrypoint<Env> {
   /** Delete a branch. Used for sandbox cleanup. Refuses to delete the repo's default branch. */
   async deleteBranch(params: RepoRef & { name: string }): Promise<void> {
     this.initCaches();
-    const db = createDb(this.env.HYPERDRIVE.connectionString);
+    const db = createDb(dbConnectionString(this.env));
     const resolved = await resolveRepo(db, this.env.REPOS_BUCKET, params);
     if (!resolved) throw new Error("Repository not found");
     if (resolved.repo.defaultBranch === params.name) {
@@ -404,7 +404,7 @@ export class CoregitCoreBinding extends WorkerEntrypoint<Env> {
     params: RepoRef & { ref: string; path?: string; limit?: number }
   ): Promise<HistoryEntry[]> {
     this.initCaches();
-    const db = createDb(this.env.HYPERDRIVE.connectionString);
+    const db = createDb(dbConnectionString(this.env));
     const resolved = await resolveRepo(db, this.env.REPOS_BUCKET, params);
     if (!resolved) return [];
 
@@ -459,7 +459,7 @@ export class CoregitCoreBinding extends WorkerEntrypoint<Env> {
     params: RepoRef & { ref: string; atDate: string }
   ): Promise<{ sha: string } | null> {
     this.initCaches();
-    const db = createDb(this.env.HYPERDRIVE.connectionString);
+    const db = createDb(dbConnectionString(this.env));
     const resolved = await resolveRepo(db, this.env.REPOS_BUCKET, params);
     if (!resolved) return null;
 

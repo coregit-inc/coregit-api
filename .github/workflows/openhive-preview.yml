@@ -1,0 +1,142 @@
+name: Openhive preview
+
+# Triggered by every push to a non-main branch (Openhive pushes branches
+# named `openhive-task-N`). Each push uploads a new VERSION of the Worker
+# (not promoted to prod) aliased at <slug>-coregit-api.<account>.workers.dev.
+# All bindings inherit from prod; only DATABASE_URL is overridden per-deploy
+# so the version talks to its own Neon branch.
+#
+# On `delete` (branch removed): the matching Neon branch is torn down. The
+# Worker version itself ages out as new versions are uploaded — no manual
+# Worker cleanup needed.
+
+on:
+  push:
+    branches-ignore: [main]
+  delete:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: openhive-preview-${{ github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  NEON_PROJECT_ID: ${{ vars.NEON_PROJECT_ID }}
+  NEON_PROD_BRANCH: ${{ vars.NEON_PROD_BRANCH }}
+
+jobs:
+  teardown:
+    if: github.event_name == 'delete' && github.event.ref_type == 'branch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Slugify branch
+        id: slug
+        run: |
+          slug=$(echo "${{ github.event.ref }}" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/-/g' | cut -c1-50)
+          echo "slug=$slug" >> "$GITHUB_OUTPUT"
+
+      - name: Delete Neon branch
+        uses: neondatabase/delete-branch-action@v3
+        with:
+          project_id: ${{ env.NEON_PROJECT_ID }}
+          branch: preview-${{ steps.slug.outputs.slug }}
+          api_key: ${{ secrets.NEON_API_KEY }}
+
+  preview:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - run: npm ci
+
+      - name: Slugify branch
+        id: slug
+        run: |
+          slug=$(echo "${{ github.ref_name }}" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/-/g' | cut -c1-50)
+          echo "slug=$slug" >> "$GITHUB_OUTPUT"
+
+      - name: Create or reuse Neon branch
+        id: neon
+        uses: neondatabase/create-branch-action@v6
+        with:
+          project_id: ${{ env.NEON_PROJECT_ID }}
+          parent_branch: ${{ env.NEON_PROD_BRANCH }}
+          branch_name: preview-${{ steps.slug.outputs.slug }}
+          api_key: ${{ secrets.NEON_API_KEY }}
+
+      # No automatic migrations: schema changes live in prod Neon
+      # (applied via Neon MCP `run_sql`). Each preview branch is a
+      # copy-on-write clone of prod, so it inherits the latest schema
+      # automatically. For preview-only schema experiments, use Neon
+      # MCP against db_url_pooled from the step above.
+      #
+      # Write the per-version DATABASE_URL secret to a file that
+      # `wrangler versions upload --secrets-file` will consume. Other
+      # secrets (BETTER_AUTH_SECRET, OAuth keys, etc.) inherit from prod.
+      - name: Build secrets file
+        run: |
+          umask 077
+          jq -n --arg url "${{ steps.neon.outputs.db_url_pooled }}" \
+            '{DATABASE_URL: $url}' > /tmp/preview-secrets.json
+
+      - name: Upload preview version
+        id: deploy
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: versions upload --preview-alias ${{ steps.slug.outputs.slug }} --tag ${{ github.sha }} --message "openhive ${{ github.ref_name }}@${{ github.sha }}" --secrets-file /tmp/preview-secrets.json
+
+      - name: Cleanup secrets file
+        if: always()
+        run: rm -f /tmp/preview-secrets.json
+
+      # Soft-fail webhook: if OPENHIVE_WEBHOOK_URL isn't set or the
+      # endpoint is unreachable, the preview deploy still counts as a
+      # success — the live URL is reachable and a manually-opened PR
+      # works without Openhive being online.
+      - name: Notify Openhive (best-effort)
+        if: ${{ steps.deploy.outputs.deployment-url != '' }}
+        env:
+          WEBHOOK_URL: ${{ secrets.OPENHIVE_WEBHOOK_URL }}
+          WEBHOOK_SECRET: ${{ secrets.OPENHIVE_PREVIEW_WEBHOOK_SECRET }}
+          PREVIEW_URL: ${{ steps.deploy.outputs.deployment-url }}
+          NEON_BRANCH_URL: ${{ steps.neon.outputs.db_url_pooled }}
+          BRANCH: ${{ github.ref_name }}
+          COMMIT_SHA: ${{ github.sha }}
+          REPO_REMOTE: ${{ github.repository }}
+          DELIVERY_ID: ${{ github.run_id }}-${{ github.run_attempt }}-${{ github.sha }}
+        run: |
+          if [ -z "$WEBHOOK_URL" ] || [ -z "$WEBHOOK_SECRET" ]; then
+            echo "::notice::OPENHIVE_WEBHOOK_URL or _SECRET not configured; skipping notification (preview is live at $PREVIEW_URL)"
+            exit 0
+          fi
+          BODY=$(jq -nc \
+            --arg event 'preview.ready' \
+            --arg preview_url "$PREVIEW_URL" \
+            --arg neon_branch_url "$NEON_BRANCH_URL" \
+            --arg branch "$BRANCH" \
+            --arg commit_sha "$COMMIT_SHA" \
+            --arg repo_remote "$REPO_REMOTE" \
+            '{event:$event, preview_url:$preview_url, neon_branch_url:$neon_branch_url, branch:$branch, commit_sha:$commit_sha, repo_remote:$repo_remote}')
+          SIG="sha256=$(printf '%s' "$BODY" | openssl dgst -sha256 -hmac "$WEBHOOK_SECRET" -hex | awk '{print $2}')"
+          if curl --max-time 10 -fsS -X POST "$WEBHOOK_URL" \
+              -H "Content-Type: application/json" \
+              -H "X-Openhive-Delivery: $DELIVERY_ID" \
+              -H "X-Openhive-Signature-256: $SIG" \
+              -H "X-Openhive-Event: preview.ready" \
+              --data "$BODY"; then
+            echo "::notice::Notified Openhive at $WEBHOOK_URL"
+          else
+            echo "::warning::Openhive webhook failed (offline?). Preview is still live at $PREVIEW_URL"
+          fi

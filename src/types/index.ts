@@ -1,7 +1,9 @@
 import type { Database } from "../db";
 
 export interface Env {
-  DATABASE_URL: string;
+  // Optional — production uses HYPERDRIVE, preview deploys set this as a
+  // secret pointing at the per-task Neon branch.
+  DATABASE_URL?: string;
   CORS_ORIGIN: string;
   ENVIRONMENT?: string;
   REPOS_BUCKET: R2Bucket;
@@ -40,8 +42,10 @@ export interface Env {
   SESSION_DO: DurableObjectNamespace;
   // Per-repo hot layer (Level 1: automatic for all)
   REPO_HOT_DO: DurableObjectNamespace;
-  // Hyperdrive (Neon connection pooling)
-  HYPERDRIVE: Hyperdrive;
+  // Hyperdrive (Neon connection pooling). Optional in preview env where
+  // we connect to a per-branch Neon clone via DATABASE_URL secret instead
+  // (no fan-out support on Hyperdrive). Production always has it.
+  HYPERDRIVE?: Hyperdrive;
   // Optional service binding to the private LLM Wiki Worker. Set only in
   // deploys that ship the proprietary add-on. When unset, wiki-path
   // requests return 503 "Wiki worker not configured".

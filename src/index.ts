@@ -9,7 +9,7 @@
  */
 
 import { sql, gt } from "drizzle-orm";
-import { createDb } from "./db";
+import { createDb, dbConnectionString } from "./db";
 import { repo as repoTable } from "./db/schema";
 import { GitR2Storage, PACK_THRESHOLD } from "./git/storage";
 import {
@@ -39,7 +39,7 @@ export default {
   fetch: app.fetch,
 
   async scheduled(_event: ScheduledController, env: Env, _ctx: ExecutionContext) {
-    const db = createDb(env.HYPERDRIVE.connectionString);
+    const db = createDb(dbConnectionString(env));
     const bucket = env.REPOS_BUCKET;
     const repoHotNs = env.REPO_HOT_DO;
     const since = new Date(Date.now() - 7 * 60 * 60 * 1000);
@@ -72,7 +72,7 @@ export default {
   },
 
   async queue(batch: MessageBatch<IndexingMessage | GraphIndexingMessage>, env: Env, ctx: ExecutionContext) {
-    const db = createDb(env.HYPERDRIVE.connectionString);
+    const db = createDb(dbConnectionString(env));
     for (const message of batch.messages) {
       try {
         const { type } = message.body;
