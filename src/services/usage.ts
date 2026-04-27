@@ -12,7 +12,8 @@
 import { sql } from "drizzle-orm";
 import type { Database } from "../db";
 import type { Env } from "../types";
-import { DodoCredits, METER_EVENT_NAMES, type MeterEventKey } from "./dodo-credits";
+import { DodoCredits } from "./dodo-credits";
+import { toDodoMeterEvent } from "./meter-pricing";
 
 export type UsageEventType =
   | "api_call"
@@ -31,67 +32,6 @@ export type UsageEventType =
   | "wiki_connector_setup";
 
 /**
- * Per-event conversion: quantity → Dodo meter units.
- *   api_call: count aggregation, 1 event = 1 call (metadata-less)
- *   git_transfer_bytes / storage_bytes: sum on "mb" key, bytes → MB (ceil)
- *
- * Non-billable events (repo_*, graph_query, hybrid_search, semantic_*):
- *   analytics only; we do NOT ingest to Dodo — avoid noisy ledger.
- */
-function toDodoMeterEvent(
-  eventType: UsageEventType,
-  quantity: number
-): { eventName: string; metadata?: Record<string, unknown> } | null {
-  switch (eventType) {
-    case "api_call":
-      return { eventName: METER_EVENT_NAMES.api_call };
-    case "git_transfer_bytes": {
-      const mb = Math.max(1, Math.ceil(quantity / (1024 * 1024)));
-      return { eventName: METER_EVENT_NAMES.git_transfer_bytes, metadata: { mb, bytes: quantity } };
-    }
-    case "storage_bytes": {
-      const mb = Math.max(1, Math.ceil(quantity / (1024 * 1024)));
-      return { eventName: METER_EVENT_NAMES.storage_bytes, metadata: { mb, bytes: quantity } };
-    }
-    case "lazy_edit_tokens":
-      // Billed on Morph output (completion) tokens with a thin markup configured
-      // in the Dodo meter price (target: $1.32 / 1M tokens = 10% markup over
-      // Morph's $1.20 / 1M). Keep this low — Coregit's value is the commit
-      // pipeline, not an LLM reseller margin.
-      return {
-        eventName: METER_EVENT_NAMES.lazy_edit_tokens,
-        metadata: { output_tokens: quantity },
-      };
-    case "agentic_search_tokens":
-      // Billed on summed Morph WarpGrep completion tokens across all turns.
-      // Dodo meter target: $1.32 / 1M tokens (10% markup over Morph).
-      return {
-        eventName: METER_EVENT_NAMES.agentic_search_tokens,
-        metadata: { output_tokens: quantity },
-      };
-    case "wiki_ingest_run":
-      // One event per completed wiki workflow run (ingest/sync/dream/
-      // lint/refresh). Low-volume, flat-rate meter — the LLM token
-      // meter below is the actual variable cost.
-      return { eventName: METER_EVENT_NAMES.wiki_ingest_run };
-    case "wiki_llm_tokens":
-      // Billed on the sum of Mercury-2 prompt + completion tokens
-      // (cached tokens billed separately via metadata). Dodo meter
-      // target: ~2x the Inception raw rate so we clear Inception's
-      // ~$0.25/$0.75 per MTok cost with a small margin.
-      return {
-        eventName: METER_EVENT_NAMES.wiki_llm_tokens,
-        metadata: { total_tokens: quantity },
-      };
-    case "wiki_connector_setup":
-      // Analytics only — connector installation is free, no Dodo meter.
-      return null;
-    default:
-      return null; // not billable
-  }
-}
-
-/**
  * Record a usage event. Analytics DB insert + optional Dodo meter ingest,
  * both fire-and-forget.
  */
@@ -105,12 +45,18 @@ export function recordUsage(
   quantity: number,
   metadata?: Record<string, unknown>
 ): void {
+  // Mark whether this event would be billable so the reconciliation /
+  // fallback-debit job in coregit-app can rebuild charges from usage_event
+  // alone, without round-tripping Dodo.
+  const billable = quantity > 0 && toDodoMeterEvent(eventType, quantity) !== null;
+  const eventMetadata = { ...(metadata ?? {}), billable };
+
   // 1) analytics: usage_event row
   ctx.waitUntil(
     db
       .execute(
         sql`INSERT INTO usage_event (org_id, event_type, quantity, metadata)
-            VALUES (${orgId}, ${eventType}, ${quantity}, ${metadata ? JSON.stringify(metadata) : null})`
+            VALUES (${orgId}, ${eventType}, ${quantity}, ${JSON.stringify(eventMetadata)})`
       )
       .catch((err) => console.error("[usage] event insert failed:", err))
   );

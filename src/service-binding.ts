@@ -76,6 +76,12 @@ export interface CheckFreeLimitsResult {
   reason?: string;
 }
 
+export interface ApiSubStatusResult {
+  subscriptionId: string | null;
+  status: string | null;
+  syncedAt: string | null;
+}
+
 export interface CommitFilesParams {
   orgId: string;
   slug: string;
@@ -198,6 +204,31 @@ export class CoregitCoreBinding extends WorkerEntrypoint<Env> {
   }): Promise<CheckFreeLimitsResult> {
     const db = createDb(dbConnectionString(this.env));
     return checkFreeLimits(db, params.orgId, params.tier, params.eventType);
+  }
+
+  /**
+   * Read the org's $0 API Access subscription state. Used by coregit-app's
+   * payment.succeeded handler + cron fallback debit to detect orgs whose
+   * meter ingest is being silently dropped (status != active in Dodo).
+   */
+  async getApiSubStatus(params: { orgId: string }): Promise<ApiSubStatusResult> {
+    const db = createDb(dbConnectionString(this.env));
+    const result = await db.execute(sql`
+      SELECT dodo_api_subscription_id, dodo_api_subscription_status, dodo_api_subscription_synced_at
+      FROM org_plan WHERE org_id = ${params.orgId} LIMIT 1
+    `);
+    const row = (result.rows as Array<{
+      dodo_api_subscription_id: string | null;
+      dodo_api_subscription_status: string | null;
+      dodo_api_subscription_synced_at: Date | string | null;
+    }>)[0];
+    return {
+      subscriptionId: row?.dodo_api_subscription_id ?? null,
+      status: row?.dodo_api_subscription_status ?? null,
+      syncedAt: row?.dodo_api_subscription_synced_at
+        ? new Date(row.dodo_api_subscription_synced_at).toISOString()
+        : null,
+    };
   }
 
   /** Atomic multi-file commit. Used to write `raw/` sources and wiki pages. */

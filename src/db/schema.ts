@@ -98,7 +98,17 @@ export const orgPlan = pgTable(
 
     // Our-side $0 subscription on "Coregit API Access" metered product.
     // Required for meter events to deduct credits per Dodo architecture.
+    // Status mirrors Dodo's sub state: 'pending' until card is on file,
+    // 'active' once activated. Meter events are silently dropped by Dodo
+    // when status != active, so we gate ingest + reconcile on this column.
     dodoApiSubscriptionId: text("dodo_api_subscription_id"),
+    dodoApiSubscriptionStatus: text("dodo_api_subscription_status"),
+    dodoApiSubscriptionSyncedAt: timestamp("dodo_api_subscription_synced_at"),
+
+    // Cron-driven fallback debit cursor — last usage_event.id processed by
+    // the recovery job that aggregates and posts manual ledger debits when
+    // the API sub is stuck pending.
+    fallbackDebitCursor: bigint("fallback_debit_cursor", { mode: "number" }),
 
     // Legacy subscription columns kept temporarily for migration rollback; drop in Phase 5.
     dodoSubscriptionId: text("dodo_subscription_id"),
