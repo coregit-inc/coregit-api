@@ -222,39 +222,39 @@ syncWebhooks.post("/sync-webhooks/github", async (c) => {
         )
       );
 
-  if (syncConfigs.length === 0) {
-    return c.json({ ignored: true, reason: "no matching sync config" });
-  }
-
-  // Verify signature against each matching sync config
-  let matched = false;
-  for (const cfg of syncConfigs) {
-    const expectedSecret = await computeWebhookSecret(c.env.SYNC_ENCRYPTION_KEY, cfg.id);
-    const valid = await verifyGithubSignature(expectedSecret, rawBody, signature);
-    if (valid) {
-      matched = true;
-
-      // Fetch connection
-      const [conn] = await db
-        .select()
-        .from(externalConnection)
-        .where(eq(externalConnection.id, cfg.connectionId))
-        .limit(1);
-
-      if (conn) {
-        c.executionCtx.waitUntil(
-          runImportSync(db, c.env.REPOS_BUCKET, cfg, conn, c.env.SYNC_ENCRYPTION_KEY)
-        );
-      }
-      break;
+    if (syncConfigs.length === 0) {
+      return c.json({ ignored: true, reason: "no matching sync config" });
     }
-  }
 
-  if (!matched) {
-    return c.json({ error: "Signature verification failed" }, 401);
-  }
+    // Verify signature against each matching sync config
+    let matched = false;
+    for (const cfg of syncConfigs) {
+      const expectedSecret = await computeWebhookSecret(c.env.SYNC_ENCRYPTION_KEY, cfg.id);
+      const valid = await verifyGithubSignature(expectedSecret, rawBody, signature);
+      if (valid) {
+        matched = true;
 
-  return c.json({ accepted: true });
+        // Fetch connection
+        const [conn] = await db
+          .select()
+          .from(externalConnection)
+          .where(eq(externalConnection.id, cfg.connectionId))
+          .limit(1);
+
+        if (conn) {
+          c.executionCtx.waitUntil(
+            runImportSync(db, c.env.REPOS_BUCKET, cfg, conn, c.env.SYNC_ENCRYPTION_KEY)
+          );
+        }
+        break;
+      }
+    }
+
+    if (!matched) {
+      return c.json({ error: "Signature verification failed" }, 401);
+    }
+
+    return c.json({ accepted: true });
   } catch (err) {
     console.error("GitHub webhook handler error:", err);
     return c.json({ error: err instanceof Error ? err.message : "Webhook processing failed" }, 500);
