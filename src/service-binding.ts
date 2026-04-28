@@ -93,10 +93,17 @@ export interface CommitFilesParams {
     path: string;
     content?: string;
     encoding?: "utf-8" | "base64";
-    action?: "create" | "edit" | "delete" | "rename";
+    action?: "create" | "edit" | "delete" | "rename" | "lazy_edit";
     new_path?: string;
+    /** For action: "lazy_edit" — partial-file snippet with `// ... existing code ...` markers around unchanged sections. Morph merges it into the file. */
+    edit_snippet?: string;
+    /** For action: "lazy_edit" — single-line hint for disambiguating the edit (e.g. which section to update). */
+    instruction?: string;
   }>;
   parentSha?: string;
+  /** Customer ID used for usage billing on lazy_edit calls. Optional — if
+   * omitted, Morph cost is not billed to any specific user (internal use). */
+  dodoCustomerId?: string | null;
 }
 
 export interface CommitFilesResult {
@@ -248,7 +255,14 @@ export class CoregitCoreBinding extends WorkerEntrypoint<Env> {
       encoding: f.encoding,
       action: f.action ?? "create",
       new_path: f.new_path,
+      edit_snippet: f.edit_snippet,
+      instruction: f.instruction,
     }));
+
+    const hasLazyEdit = changes.some((c) => c.action === "lazy_edit");
+    if (hasLazyEdit && !this.env.MORPH_API_KEY) {
+      throw new Error("lazy_edit requires MORPH_API_KEY on the worker");
+    }
 
     const result = await createApiCommit(
       resolved.storage,
@@ -257,7 +271,35 @@ export class CoregitCoreBinding extends WorkerEntrypoint<Env> {
       params.author,
       changes,
       params.parentSha,
+      this.env.MORPH_API_KEY,
     );
+
+    // Bill Morph Fast Apply output tokens to the caller's org if a customer
+    // ID was supplied. Mirrors the HTTP /commits route's billing — service
+    // binding callers (the wiki worker today) opt in by passing
+    // params.dodoCustomerId; internal use without a customer just absorbs
+    // the cost.
+    if (
+      result.morphUsage &&
+      result.morphUsage.outputTokens > 0 &&
+      params.dodoCustomerId
+    ) {
+      recordUsage(
+        this.ctx,
+        this.env,
+        db,
+        params.orgId,
+        params.dodoCustomerId,
+        "lazy_edit_tokens",
+        result.morphUsage.outputTokens,
+        {
+          call_count: result.morphUsage.callCount,
+          model: "morph-v3-fast",
+          commit_sha: result.sha,
+          source: "service_binding",
+        },
+      );
+    }
 
     // Trigger delta semantic + graph indexing if auto_index is set on the
     // repo. Mirrors the same fire-and-forget behaviour as POST /commits
