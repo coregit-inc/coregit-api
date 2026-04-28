@@ -17,6 +17,7 @@ import {
   createTree,
   type TreeEntry,
 } from "../git/objects";
+import { applyPreApplyChanges, type PreApplyChange } from "./pre-apply";
 
 // ============ Types ============
 
@@ -36,6 +37,7 @@ export interface MultiRepoExecOptions {
   commit?: boolean;
   commitMessage?: string;
   author?: { name: string; email: string };
+  preApplyChanges?: PreApplyChange[];
 }
 
 export interface MultiRepoExecResult {
@@ -72,6 +74,25 @@ export async function execInMultiRepoWorkspace(
     mounts.map((m) => ({ slug: m.slug, fs: m.fs }))
   );
   await multiFs.preload();
+
+  // Apply SDK-buffered changes against the multi-repo overlay. Paths must be
+  // shaped as /<slug>/<rest> — MultiRepoFileSystem.resolve() routes to the
+  // correct sub-fs.
+  if (options.preApplyChanges && options.preApplyChanges.length > 0) {
+    try {
+      await applyPreApplyChanges(multiFs, options.preApplyChanges);
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      return {
+        stdout: "",
+        stderr: `pre-apply failed: ${msg}\n`,
+        exitCode: 1,
+        changedFiles: {},
+        commits: {},
+        executionTimeMs: Date.now() - startTime,
+      };
+    }
+  }
 
   // Create bash instance
   const bash = new Bash({

@@ -17,6 +17,7 @@ import { GitR2FileSystem } from "../workspace/filesystem";
 import { execInWorkspace } from "../workspace/exec";
 import { execInMultiRepoWorkspace, type RepoMount } from "../workspace/multi-repo-exec";
 import { parseGitObject, parseCommit } from "../git/objects";
+import { validatePreApplyChanges, PreApplyError, type PreApplyChange } from "../workspace/pre-apply";
 
 import { checkFreeLimits } from "../services/limits";
 import type { Env, Variables } from "../types";
@@ -68,6 +69,7 @@ const execHandler = async (c: any) => {
     commit?: boolean;
     commit_message?: string;
     author?: { name: string; email: string };
+    pre_apply_changes?: PreApplyChange[];
   };
   try {
     body = await c.req.json();
@@ -87,6 +89,18 @@ const execHandler = async (c: any) => {
   }
   if (body.commit && body.ref && !body.branch) {
     return c.json({ error: "branch is required when using commit=true with ref" }, 400);
+  }
+
+  // Validate optional pre_apply_changes (SDK buffered writes flushed with this exec)
+  if (body.pre_apply_changes !== undefined) {
+    try {
+      validatePreApplyChanges(body.pre_apply_changes);
+    } catch (error) {
+      if (error instanceof PreApplyError) {
+        return c.json({ error: error.message, path: error.path }, 400);
+      }
+      throw error;
+    }
   }
 
   // Validate cwd
@@ -128,6 +142,7 @@ const execHandler = async (c: any) => {
       commit: body.commit,
       commitMessage: body.commit_message,
       author: body.author,
+      preApplyChanges: body.pre_apply_changes,
     });
 
     return c.json({
@@ -182,6 +197,7 @@ multiWorkspace.post("/workspace/exec", apiKeyAuth, async (c) => {
     commit?: boolean;
     commit_message?: string;
     author?: { name: string; email: string };
+    pre_apply_changes?: PreApplyChange[];
   };
   try {
     body = await c.req.json();
@@ -204,6 +220,18 @@ multiWorkspace.post("/workspace/exec", apiKeyAuth, async (c) => {
   }
   if (body.commit && !body.commit_message) {
     return c.json({ error: "commit_message is required when commit=true" }, 400);
+  }
+
+  // Validate optional pre_apply_changes (paths must be /<slug>/<rest> for multi-repo)
+  if (body.pre_apply_changes !== undefined) {
+    try {
+      validatePreApplyChanges(body.pre_apply_changes);
+    } catch (error) {
+      if (error instanceof PreApplyError) {
+        return c.json({ error: error.message, path: error.path }, 400);
+      }
+      throw error;
+    }
   }
 
   // Validate cwd
@@ -314,6 +342,7 @@ multiWorkspace.post("/workspace/exec", apiKeyAuth, async (c) => {
       commit: body.commit,
       commitMessage: body.commit_message,
       author: body.author,
+      preApplyChanges: body.pre_apply_changes,
     });
 
     return c.json({
