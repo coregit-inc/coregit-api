@@ -1,9 +1,16 @@
 import type { Database } from "../db";
 
 export interface Env {
-  // Optional — production uses HYPERDRIVE, preview deploys set this as a
-  // secret pointing at the per-task Neon branch.
-  DATABASE_URL?: string;
+  // Per-version secret injected by the openhive preview workflow only.
+  // Points at the per-task Neon clone for that preview alias. Production
+  // never reads this — see src/db/index.ts for the gate (requires both a
+  // CF version tag AND this secret to take effect).
+  PREVIEW_DATABASE_URL?: string;
+  // Workers version metadata binding (id, tag, timestamp). Used at
+  // runtime to distinguish preview deploys (tagged via `versions upload
+  // --tag <sha>`) from the prod active version (untagged, deployed via
+  // Workers Builds `wrangler deploy`).
+  CF_VERSION_METADATA?: WorkerVersionMetadata;
   CORS_ORIGIN: string;
   ENVIRONMENT?: string;
   REPOS_BUCKET: R2Bucket;
@@ -42,9 +49,11 @@ export interface Env {
   SESSION_DO: DurableObjectNamespace;
   // Per-repo hot layer (Level 1: automatic for all)
   REPO_HOT_DO: DurableObjectNamespace;
-  // Hyperdrive (Neon connection pooling). Optional in preview env where
-  // we connect to a per-branch Neon clone via DATABASE_URL secret instead
-  // (no fan-out support on Hyperdrive). Production always has it.
+  // Hyperdrive (Neon connection pooling). Production always has it.
+  // Preview deploys also inherit it, but the dbConnectionString gate in
+  // src/db/index.ts prefers PREVIEW_DATABASE_URL when this version is a
+  // tagged preview alias, so preview traffic still reaches the per-task
+  // Neon clone instead of prod data.
   HYPERDRIVE?: Hyperdrive;
   // Optional service binding to the private LLM Wiki Worker. Set only in
   // deploys that ship the proprietary add-on. When unset, wiki-path
