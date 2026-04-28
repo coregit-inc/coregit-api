@@ -3,20 +3,35 @@ import { drizzle } from "drizzle-orm/postgres-js";
 import * as schema from "./schema";
 
 /**
- * Resolve the Postgres connection string from the Worker env. Preview
- * deploys pass DATABASE_URL as a secret (no Hyperdrive in preview because
- * Hyperdrive bindings can't fan out to per-branch Neon clones). Production
- * uses Hyperdrive's pooled connection.
+ * Resolve the Postgres connection string from the Worker env.
+ *
+ * Production: HYPERDRIVE only. The active version is deployed by Workers
+ * Builds via `wrangler deploy` (no `--tag`), so `CF_VERSION_METADATA.tag`
+ * is undefined → the PREVIEW_DATABASE_URL branch is unreachable, even if
+ * that secret somehow leaks to the Worker scope.
+ *
+ * Preview deploys (openhive workflow): `versions upload --preview-alias
+ * <slug> --tag <sha> --secrets-file …` injects PREVIEW_DATABASE_URL
+ * pointing at the per-branch Neon clone AND tags the version. The gate
+ * below sees both signals and routes the preview alias to its own clone.
+ *
+ * Why two signals: per-version secrets historically bled to Worker scope
+ * on this account (DATABASE_URL stuck around even after the source Neon
+ * branch was torn down, taking prod with it). Requiring CF_VERSION_METADATA
+ * .tag as a co-signal makes prod immune to a leaked secret.
  */
 export function dbConnectionString(env: {
-  DATABASE_URL?: string;
+  PREVIEW_DATABASE_URL?: string;
   HYPERDRIVE?: { connectionString: string };
+  CF_VERSION_METADATA?: { id: string; tag?: string; timestamp?: string };
 }): string {
+  const isPreviewAlias = !!env.CF_VERSION_METADATA?.tag;
+  if (isPreviewAlias && env.PREVIEW_DATABASE_URL) {
+    return env.PREVIEW_DATABASE_URL;
+  }
   // Falsy → empty string preserves the existing `if (!c.env.HYPERDRIVE.connectionString)`
   // call sites that returned 500 when the DB wasn't wired up.
-  if (env.DATABASE_URL) return env.DATABASE_URL;
-  if (env.HYPERDRIVE?.connectionString) return env.HYPERDRIVE.connectionString;
-  return "";
+  return env.HYPERDRIVE?.connectionString ?? "";
 }
 
 /**

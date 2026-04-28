@@ -80,14 +80,17 @@ jobs:
       # automatically. For preview-only schema experiments, use Neon
       # MCP against db_url_pooled from the step above.
       #
-      # Write the per-version DATABASE_URL secret to a file that
-      # `wrangler versions upload --secrets-file` will consume. Other
-      # secrets (BETTER_AUTH_SECRET, OAuth keys, etc.) inherit from prod.
+      # Write the per-version PREVIEW_DATABASE_URL secret. The Worker's
+      # src/db/index.ts gates this behind CF_VERSION_METADATA.tag so a
+      # secret-scope leak can never reach the prod active version (which
+      # has no tag — Workers Builds runs `wrangler deploy` without one).
+      # Other secrets (BETTER_AUTH_SECRET, OAuth keys, etc.) inherit from
+      # prod via the standard binding inheritance.
       - name: Build secrets file
         run: |
           umask 077
           jq -n --arg url "${{ steps.neon.outputs.db_url_pooled }}" \
-            '{DATABASE_URL: $url}' > /tmp/preview-secrets.json
+            '{PREVIEW_DATABASE_URL: $url}' > /tmp/preview-secrets.json
 
       - name: Upload preview version
         id: deploy
