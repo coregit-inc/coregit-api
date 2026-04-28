@@ -16,6 +16,7 @@ import {
   createTree,
   type TreeEntry,
 } from "../git/objects";
+import { applyPreApplyChanges, type PreApplyChange } from "./pre-apply";
 
 // ============ Types ============
 
@@ -27,6 +28,7 @@ export interface ExecOptions {
   commit?: boolean;
   commitMessage?: string;
   author?: { name: string; email: string };
+  preApplyChanges?: PreApplyChange[];
 }
 
 export interface ExecResult {
@@ -124,6 +126,24 @@ export async function execInWorkspace(
   // 2. Create filesystem and preload path index
   const fs = new GitR2FileSystem(storage, treeSha);
   await fs.preload();
+
+  // 2b. Apply SDK-buffered changes (commitMode: manual / on-exec) so the bash
+  //     command sees them. They land in fs.getChanges() and get committed if
+  //     options.commit === true.
+  if (options.preApplyChanges && options.preApplyChanges.length > 0) {
+    try {
+      await applyPreApplyChanges(fs, options.preApplyChanges);
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      return {
+        stdout: "",
+        stderr: `pre-apply failed: ${msg}\n`,
+        exitCode: 1,
+        changedFiles: [],
+        executionTimeMs: Date.now() - startTime,
+      };
+    }
+  }
 
   // 3. Create bash instance
   const bash = new Bash({
