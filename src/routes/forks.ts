@@ -166,11 +166,17 @@ const forkHandler = async (c: any) => {
       // 2. Snapshot parent refs into fork_snapshot — read-fallback for getRef.
       //    A push to the fork rewrites the ref in R2 (CoW); the snapshot is the
       //    durable point-in-time anchor that survives parent mutations.
+      // Snapshot the literal HEAD content so getHead's fallback parser sees
+      // exactly what R2 would have served. Symbolic HEAD is "ref: <name>";
+      // detached HEAD is a bare 40-char SHA.
+      const parentHeadLiteral = parentHead
+        ? (parentHead.type === "ref" ? `ref: ${parentHead.value}` : parentHead.value)
+        : `ref: refs/heads/${defaultBranch}`;
       await db.insert(forkSnapshot).values({
         repoId,
         parentRepoId: source.id,
         parentRefs: parentRefs,
-        parentHead: parentHead?.value ?? `ref: refs/heads/${defaultBranch}`,
+        parentHead: parentHeadLiteral,
       });
 
       // 3. Materialize blob_repo edges. Probes inline up to SYNC_THRESHOLD,
@@ -198,7 +204,7 @@ const forkHandler = async (c: any) => {
       //    Refs themselves resolve through fork_snapshot until the fork pushes.
       const targetStorageSuffix = ns ? `${ns}/${targetSlug}` : targetSlug;
       const targetStorage = new GitR2Storage(bucket, orgId, targetStorageSuffix);
-      await targetStorage.setHead(`ref: refs/heads/${defaultBranch}`);
+      await targetStorage.setHead(`refs/heads/${defaultBranch}`);
     } catch (forkError) {
       // Rollback: drop the repo row (cascades downstream FKs) + snapshot.
       await db.delete(forkSnapshot).where(eq(forkSnapshot.repoId, repoId)).catch(() => {});

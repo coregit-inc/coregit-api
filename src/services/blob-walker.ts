@@ -40,13 +40,24 @@ export async function* walkReachable(
   let yielded = 0;
   let commitsWalked = 0;
 
+  // Tight predicate — git SHAs are 40 hex chars; anything else is the result
+  // of a malformed object header and would crash storage.getObject's SHA
+  // validator with "Invalid SHA: ".
+  const isSha = (s: string | undefined | null): s is string =>
+    typeof s === "string" && /^[0-9a-f]{40}$/i.test(s);
+
   while (queue.length > 0) {
     const sha = queue.shift()!;
-    if (seen.has(sha)) continue;
+    if (!isSha(sha) || seen.has(sha)) continue;
     seen.add(sha);
 
-    const data = await storage.getObject(sha);
-    if (!data) continue; // missing object — skip rather than throw, fork should still work
+    let data: Uint8Array | null;
+    try {
+      data = await storage.getObject(sha);
+    } catch {
+      continue; // bad sha or transient storage error — keep walking
+    }
+    if (!data) continue;
 
     let parsed;
     try {
@@ -64,15 +75,15 @@ export async function* walkReachable(
       if (options.maxCommits && commitsWalked > options.maxCommits) continue;
       try {
         const commit = parseCommit(parsed.rawContent);
-        queue.push(commit.tree);
-        for (const parentSha of commit.parents) queue.push(parentSha);
+        if (isSha(commit.tree)) queue.push(commit.tree);
+        for (const parentSha of commit.parents) if (isSha(parentSha)) queue.push(parentSha);
       } catch {
         // unparseable commit — skip its descendants
       }
     } else if (parsed.type === "tree") {
       try {
         const entries = parseTree(parsed.rawContent);
-        for (const e of entries) queue.push(e.sha);
+        for (const e of entries) if (isSha(e.sha)) queue.push(e.sha);
       } catch {
         // unparseable tree — skip its descendants
       }
