@@ -342,16 +342,78 @@ const blobHandler = async (c: any) => {
 
     // 4. Read blob (1 R2 read)
     const MAX_BLOB_SIZE = 50 * 1024 * 1024;
+    const rangeHeader = c.req.header("Range");
     const blobData = await storage.getObject(fileSha);
     if (!blobData) return c.json({ error: "Blob not found" }, 500);
-    if (blobData.byteLength > MAX_BLOB_SIZE) {
-      return c.json({ error: "File exceeds 50 MB size limit", size: blobData.byteLength }, 400);
+    // The 50 MB cap protects the worker memory budget on full reads. Range
+    // requests intentionally bypass it so callers can stream big assets;
+    // the worker still loads the whole compressed blob from R2, but only
+    // serializes the requested slice.
+    if (blobData.byteLength > MAX_BLOB_SIZE && !rangeHeader) {
+      return c.json({ error: "File exceeds 50 MB size limit. Use Range header to fetch a slice.", size: blobData.byteLength }, 400);
     }
 
     const parsed = parseGitObject(blobData);
     if (parsed.type !== "blob") return c.json({ error: "Invalid blob" }, 500);
 
     const binary = isBinaryContent(parsed.content);
+    const totalSize = parsed.content.length;
+
+    // Range branch — return 206 with Content-Range and serialize only the slice.
+    if (rangeHeader) {
+      const m = /^bytes=(\d+)-(\d+)?$/.exec(rangeHeader.trim());
+      if (!m) {
+        return c.json({ error: "Invalid Range header. Expected bytes=start-end." }, 416, {
+          "Content-Range": `bytes */${totalSize}`,
+          Vary: "Range",
+        });
+      }
+      const start = parseInt(m[1], 10);
+      const end = m[2] !== undefined && m[2] !== ""
+        ? Math.min(parseInt(m[2], 10), totalSize - 1)
+        : totalSize - 1;
+      if (Number.isNaN(start) || Number.isNaN(end) || start > end || start >= totalSize) {
+        return c.json({ error: "Range not satisfiable" }, 416, {
+          "Content-Range": `bytes */${totalSize}`,
+          Vary: "Range",
+        });
+      }
+      const slice = parsed.content.subarray(start, end + 1);
+      let sliceContent: string;
+      let sliceEncoding: "utf-8" | "base64";
+      if (binary) {
+        const chunkSize = 8192;
+        let s = "";
+        for (let i = 0; i < slice.length; i += chunkSize) {
+          const sub = slice.subarray(i, Math.min(i + chunkSize, slice.length));
+          s += String.fromCharCode.apply(null, sub as unknown as number[]);
+        }
+        sliceContent = btoa(s);
+        sliceEncoding = "base64";
+      } else {
+        sliceContent = new TextDecoder().decode(slice);
+        sliceEncoding = "utf-8";
+      }
+      return c.json(
+        {
+          content: sliceContent,
+          encoding: sliceEncoding,
+          path: pathStr,
+          sha: fileSha,
+          size: totalSize,
+          range: { start, end, length: slice.length },
+        },
+        206,
+        {
+          ETag: `"${fileSha}"`,
+          "Content-Range": `bytes ${start}-${end}/${totalSize}`,
+          "Accept-Ranges": "bytes",
+          Vary: "Range",
+          "Cache-Control": "public, max-age=31536000, immutable",
+        },
+      );
+    }
+
     let content: string;
     let encoding: "utf-8" | "base64";
 
@@ -377,6 +439,7 @@ const blobHandler = async (c: any) => {
       size: parsed.content.length,
     }, 200, {
       "ETag": `"${fileSha}"`,
+      "Accept-Ranges": "bytes",
       "Cache-Control": "public, max-age=31536000, s-maxage=31536000, immutable",
     });
   } catch (error) {
@@ -386,5 +449,121 @@ const blobHandler = async (c: any) => {
 };
 files.get("/:slug/blob/*", apiKeyAuth, blobHandler);
 files.get("/:namespace/:slug/blob/*", apiKeyAuth, blobHandler);
+
+// GET /v1/repos/:slug/raw/:ref/*path
+//
+// Streaming sibling of /blob/. Returns the raw bytes (no JSON envelope, no
+// base64 inflation) with Content-Type sniffed via isBinaryContent. Honors
+// Range requests with 206 + Content-Range, including the full 50 MB cap
+// removed when Range is set.
+const rawHandler = async (c: any) => {
+  const orgId = c.get("orgId");
+  const db = c.get("db");
+  const bucket = c.env.REPOS_BUCKET;
+  const { slug, namespace } = extractRepoParams(c);
+
+  const resolved = await resolveRepo(db, bucket, { orgId, slug, namespace });
+  if (!resolved) return c.json({ error: "Repository not found" }, 404);
+  if (c.get("sessionStub")) resolved.storage.setSessionStub(c.get("sessionStub") as DurableObjectStub);
+
+  if (!hasRepoAccess(c.get("apiKeyPermissions"), resolved.scopeKey, "read")) {
+    return c.json({ error: "Insufficient permissions" }, 403);
+  }
+
+  const found = resolved.repo;
+  const storage = resolved.storage;
+
+  const url = new URL(c.req.url);
+  const repoPath = namespace ? `${namespace}/${slug}` : slug;
+  const rawPrefix = `/v1/repos/${repoPath}/raw/`;
+  const refAndPath = decodeURIComponent(url.pathname.slice(url.pathname.indexOf(rawPrefix) + rawPrefix.length));
+
+  const parts = refAndPath.split("/");
+  const ref = parts[0] || found.defaultBranch;
+  const pathStr = parts.slice(1).join("/");
+  if (!pathStr) return c.json({ error: "File path is required" }, 400);
+  const pathError = validateFilePath(pathStr);
+  if (pathError) return c.json({ error: pathError }, 400);
+
+  try {
+    const commitSha = await resolveRef(storage, ref);
+    if (!commitSha) return c.json({ error: "Ref not found" }, 404);
+
+    const treeBlobMap = await getTreeBlobShas(storage, commitSha, c.env.TREE_CACHE);
+    let fileSha: string | null = null;
+    for (const [sha, p] of treeBlobMap) {
+      if (p === pathStr) { fileSha = sha; break; }
+    }
+    if (!fileSha) return c.json({ error: "File not found" }, 404);
+
+    const ifNoneMatch = c.req.header("If-None-Match");
+    if (ifNoneMatch === `"${fileSha}"`) {
+      return new Response(null, { status: 304 });
+    }
+
+    const MAX_BLOB_SIZE = 50 * 1024 * 1024;
+    const rangeHeader = c.req.header("Range");
+    const blobData = await storage.getObject(fileSha);
+    if (!blobData) return c.json({ error: "Blob not found" }, 500);
+    if (blobData.byteLength > MAX_BLOB_SIZE && !rangeHeader) {
+      return c.json({ error: "File exceeds 50 MB. Use Range header.", size: blobData.byteLength }, 400);
+    }
+
+    const parsed = parseGitObject(blobData);
+    if (parsed.type !== "blob") return c.json({ error: "Invalid blob" }, 500);
+
+    const binary = isBinaryContent(parsed.content);
+    const totalSize = parsed.content.length;
+    const contentType = binary ? "application/octet-stream" : "text/plain; charset=utf-8";
+
+    const baseHeaders: Record<string, string> = {
+      "Content-Type": contentType,
+      "Accept-Ranges": "bytes",
+      ETag: `"${fileSha}"`,
+      "X-Content-Sha": fileSha,
+      "Cache-Control": "public, max-age=31536000, immutable",
+      Vary: "Range",
+    };
+
+    if (rangeHeader) {
+      const m = /^bytes=(\d+)-(\d+)?$/.exec(rangeHeader.trim());
+      if (!m) {
+        return new Response("Invalid Range header. Expected bytes=start-end.", {
+          status: 416,
+          headers: { ...baseHeaders, "Content-Range": `bytes */${totalSize}` },
+        });
+      }
+      const start = parseInt(m[1], 10);
+      const end = m[2] !== undefined && m[2] !== ""
+        ? Math.min(parseInt(m[2], 10), totalSize - 1)
+        : totalSize - 1;
+      if (Number.isNaN(start) || Number.isNaN(end) || start > end || start >= totalSize) {
+        return new Response(null, {
+          status: 416,
+          headers: { ...baseHeaders, "Content-Range": `bytes */${totalSize}` },
+        });
+      }
+      const slice = parsed.content.subarray(start, end + 1);
+      return new Response(slice, {
+        status: 206,
+        headers: {
+          ...baseHeaders,
+          "Content-Range": `bytes ${start}-${end}/${totalSize}`,
+          "Content-Length": String(slice.byteLength),
+        },
+      });
+    }
+
+    return new Response(parsed.content, {
+      status: 200,
+      headers: { ...baseHeaders, "Content-Length": String(totalSize) },
+    });
+  } catch (error) {
+    console.error("Failed to fetch raw blob:", error);
+    return c.json({ error: "Failed to fetch raw blob" }, 500);
+  }
+};
+files.get("/:slug/raw/*", apiKeyAuth, rawHandler);
+files.get("/:namespace/:slug/raw/*", apiKeyAuth, rawHandler);
 
 export { files };
