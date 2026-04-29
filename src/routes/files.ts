@@ -450,6 +450,185 @@ const blobHandler = async (c: any) => {
 files.get("/:slug/blob/*", apiKeyAuth, blobHandler);
 files.get("/:namespace/:slug/blob/*", apiKeyAuth, blobHandler);
 
+// POST /v1/repos/:slug/blobs/batch
+//
+// Body: { ref?, paths: string[], encoding?: "auto"|"binary"|"text", max_size? }
+// Returns: { blobs: [{path, sha, size, encoding, content?, truncated?}], missing: string[] }
+//
+// Reuses the same path: ref → commitSha → KV-cached flat tree → parallel R2 reads
+// (chunked at 25 for the Worker subrequest budget). Hard limits:
+//   - 100 paths per request
+//   - 50 MB per blob (oversized blobs return truncated:true with no content)
+const MAX_BATCH_PATHS = 100;
+const BATCH_MAX_BLOB_SIZE = 50 * 1024 * 1024;
+const BATCH_SUBREQUEST_CHUNK = 25;
+
+interface BatchBlobEntry {
+  path: string;
+  sha: string;
+  size: number;
+  encoding: "utf-8" | "base64";
+  content?: string;
+  truncated?: boolean;
+}
+
+const batchBlobHandler = async (c: any) => {
+  const orgId = c.get("orgId");
+  const db = c.get("db");
+  const bucket = c.env.REPOS_BUCKET;
+  const { slug, namespace } = extractRepoParams(c);
+
+  const resolved = await resolveRepo(db, bucket, { orgId, slug, namespace });
+  if (!resolved) return c.json({ error: "Repository not found" }, 404);
+  if (c.get("sessionStub")) resolved.storage.setSessionStub(c.get("sessionStub") as DurableObjectStub);
+
+  if (!hasRepoAccess(c.get("apiKeyPermissions"), resolved.scopeKey, "read")) {
+    return c.json({ error: "Insufficient permissions" }, 403);
+  }
+
+  const found = resolved.repo;
+  const storage = resolved.storage;
+
+  let body: any;
+  try {
+    body = await c.req.json();
+  } catch {
+    return c.json({ error: "Invalid JSON body" }, 400);
+  }
+
+  const ref: string =
+    typeof body?.ref === "string" && body.ref ? body.ref : found.defaultBranch;
+  const rawPaths: unknown = body?.paths;
+  if (!Array.isArray(rawPaths)) {
+    return c.json({ error: "paths must be an array of strings" }, 400);
+  }
+  if (rawPaths.length === 0) {
+    return c.json({ blobs: [], missing: [] });
+  }
+  if (rawPaths.length > MAX_BATCH_PATHS) {
+    return c.json({ error: `paths array exceeds max ${MAX_BATCH_PATHS}` }, 400);
+  }
+
+  const maxSize: number =
+    typeof body?.max_size === "number" && body.max_size > 0
+      ? Math.min(body.max_size, BATCH_MAX_BLOB_SIZE)
+      : BATCH_MAX_BLOB_SIZE;
+  const encodingPref: "auto" | "binary" | "text" =
+    body?.encoding === "binary" || body?.encoding === "text"
+      ? body.encoding
+      : "auto";
+
+  for (const p of rawPaths) {
+    if (typeof p !== "string" || !p) {
+      return c.json({ error: "paths must contain non-empty strings" }, 400);
+    }
+    const err = validateFilePath(p);
+    if (err) return c.json({ error: `${err}: ${p}` }, 400);
+  }
+  const paths = rawPaths as string[];
+
+  try {
+    const commitSha = await resolveRef(storage, ref);
+    if (!commitSha) return c.json({ error: "Ref not found" }, 404);
+
+    const treeBlobMap = await getTreeBlobShas(storage, commitSha, c.env.TREE_CACHE);
+
+    const pathToSha = new Map<string, string>();
+    for (const [sha, path] of treeBlobMap) {
+      pathToSha.set(path, sha);
+    }
+
+    const missing: string[] = [];
+    const present: { path: string; sha: string }[] = [];
+    for (const p of paths) {
+      const sha = pathToSha.get(p);
+      if (sha) present.push({ path: p, sha });
+      else missing.push(p);
+    }
+
+    const blobs: BatchBlobEntry[] = [];
+    for (let i = 0; i < present.length; i += BATCH_SUBREQUEST_CHUNK) {
+      const chunk = present.slice(i, i + BATCH_SUBREQUEST_CHUNK);
+      const results = await Promise.all(
+        chunk.map(async ({ path, sha }): Promise<BatchBlobEntry | null> => {
+          const blobData = await storage.getObject(sha);
+          if (!blobData) return null;
+          if (blobData.byteLength > maxSize) {
+            return {
+              path,
+              sha,
+              size: blobData.byteLength,
+              encoding: "base64",
+              truncated: true,
+            };
+          }
+          const parsed = parseGitObject(blobData);
+          if (parsed.type !== "blob") return null;
+
+          const wantBinary =
+            encodingPref === "binary" ||
+            (encodingPref === "auto" && isBinaryContent(parsed.content));
+
+          if (wantBinary) {
+            const chunkSize = 8192;
+            let binaryStr = "";
+            for (let j = 0; j < parsed.content.length; j += chunkSize) {
+              const sub = parsed.content.subarray(
+                j,
+                Math.min(j + chunkSize, parsed.content.length),
+              );
+              binaryStr += String.fromCharCode.apply(null, sub as unknown as number[]);
+            }
+            return {
+              path,
+              sha,
+              size: parsed.content.length,
+              encoding: "base64",
+              content: btoa(binaryStr),
+            };
+          }
+          return {
+            path,
+            sha,
+            size: parsed.content.length,
+            encoding: "utf-8",
+            content: new TextDecoder().decode(parsed.content),
+          };
+        }),
+      );
+      for (const r of results) if (r) blobs.push(r);
+    }
+
+    const shaList = present.map((p) => p.sha).sort().join(",");
+    const etag = `W/"batch-${await batchSha256Hex16(shaList)}"`;
+    const ifNoneMatch = c.req.header("If-None-Match");
+    if (ifNoneMatch === etag) {
+      return new Response(null, { status: 304 });
+    }
+
+    return c.json(
+      { blobs, missing },
+      200,
+      { ETag: etag, "Cache-Control": "private, max-age=60" },
+    );
+  } catch (error) {
+    console.error("Failed to batch-fetch blobs:", error);
+    return c.json({ error: "Failed to fetch blobs" }, 500);
+  }
+};
+
+async function batchSha256Hex16(input: string): Promise<string> {
+  const data = new TextEncoder().encode(input);
+  const buf = await crypto.subtle.digest("SHA-256", data);
+  const arr = new Uint8Array(buf);
+  let hex = "";
+  for (let i = 0; i < 8; i++) hex += arr[i].toString(16).padStart(2, "0");
+  return hex;
+}
+
+files.post("/:slug/blobs/batch", apiKeyAuth, batchBlobHandler);
+files.post("/:namespace/:slug/blobs/batch", apiKeyAuth, batchBlobHandler);
+
 // GET /v1/repos/:slug/raw/:ref/*path
 //
 // Streaming sibling of /blob/. Returns the raw bytes (no JSON envelope, no
