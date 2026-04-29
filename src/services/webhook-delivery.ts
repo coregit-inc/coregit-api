@@ -16,6 +16,7 @@ export type WebhookEventType =
   | "push"
   | "repo.created"
   | "repo.deleted"
+  | "repo.forked"
   | "branch.created"
   | "branch.deleted";
 

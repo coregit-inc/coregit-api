@@ -1,28 +1,28 @@
 /**
- * Git R2 Storage Layer
+ * Git R2 Storage Layer — Instant Fork (content-addressed blob store)
  *
- * R2 Key Structure (dual-mode: loose + packfiles):
- * {userId}/{repo}/
- * ├── objects/                      # legacy loose objects (zlib-compressed)
- * │   └── {sha[0:2]}/{sha[2:40]}
- * ├── pack/                         # packfiles (fewer R2 keys, scalable)
- * │   ├── {packId}.pack
- * │   └── {packId}.idx
- * ├── refs/
- * │   ├── heads/
- * │   │   └── main
- * │   └── tags/
- * │       └── v1.0
- * └── HEAD
+ * R2 Key Structure (post-instant-fork):
+ *   _blobs/{sha[0:2]}/{sha[2:40]}   ← global, immutable, dedup-shared across all repos
+ *   {userId}/{repo}/refs/heads/...  ← per-repo, mutable (refs)
+ *   {userId}/{repo}/refs/tags/...
+ *   {userId}/{repo}/HEAD
+ *   {userId}/{repo}/pack/...        ← legacy packfiles (only for repos migrated as 'copied')
  *
- * Object lookup order: in-memory cache → loose → pack indices → R2 pack
- * New writes go to loose. Packing triggered when loose count > PACK_THRESHOLD.
+ * Legacy layout (kept for read-fallback during migration):
+ *   {userId}/{repo}/objects/{sha[0:2]}/{sha[2:]}
+ *
+ * Read order for objects: in-memory → edge cache (key = `_blobs/{sha}`, global)
+ *   → KV (`obj:{sha}`, global) → R2 `_blobs/{sha}` → R2 legacy `{basePath}/objects/{sha}`
+ *   → packfiles → DOs.
+ * Writes ALWAYS go to the global `_blobs/{sha}` keyspace.
  */
 
 import { createGitObjectRaw, type GitObjectType } from "./objects";
 import { zlibSync, unzlibSync } from "fflate";
 import { isValidSha } from "./validation";
 import { createMinimalPack, readFromPack, type PackIndex } from "./pack-storage";
+import { sql } from "drizzle-orm";
+import type { Database } from "../db";
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
@@ -103,6 +103,45 @@ export class GitR2Storage {
     this._repoDOStub = stub;
   }
 
+  /** Owning repo id + org id + db handle for blob_repo refcount upserts.
+   * When set, every successful putObject also records a (sha, repo_id) edge
+   * in `blob_repo`, which drives dedup billing and GC. */
+  private _blobRepoCtx: { db: Database; repoId: string; orgId: string } | undefined;
+  setBlobRepoContext(db: Database, repoId: string, orgId: string) {
+    this._blobRepoCtx = { db, repoId, orgId };
+  }
+
+  /** Frozen view of parent refs at fork-creation time. Used as a read-fallback
+   * by getRef/getHead/listRefs so an instant fork can be cloned without
+   * eager-copying refs into the fork's R2 prefix. The first push to a ref in
+   * the fork writes through to R2 normally; from then on the fork's own write
+   * shadows the snapshot for that name. */
+  private _forkSnapshot: { parentRefs: Record<string, string>; parentHead: string } | undefined;
+  setForkSnapshot(snapshot: { parentRefs: Record<string, string>; parentHead: string } | undefined) {
+    this._forkSnapshot = snapshot;
+  }
+
+  /** Fire-and-forget upsert of (blob, blob_repo) rows. Idempotent via ON CONFLICT.
+   * Idempotent because the blob's content addresses both the R2 key and the
+   * primary key of `blob`, so re-writes converge on the same row. */
+  private _recordBlob(sha: string, type: GitObjectType, sizeBytes: number): void {
+    const ctx = this._blobRepoCtx;
+    if (!ctx) return;
+    // Two upserts in one round-trip via WITH; both use ON CONFLICT DO NOTHING.
+    ctx.db
+      .execute(sql`
+        WITH b AS (
+          INSERT INTO blob (sha, size_bytes, type)
+          VALUES (${sha}, ${sizeBytes}, ${type})
+          ON CONFLICT (sha) DO NOTHING
+        )
+        INSERT INTO blob_repo (sha, repo_id, org_id)
+        VALUES (${sha}, ${ctx.repoId}, ${ctx.orgId})
+        ON CONFLICT (sha, repo_id) DO NOTHING
+      `)
+      .catch((e) => console.error("blob_repo upsert failed:", e));
+  }
+
   /** Get the active hot layer stub — session (Level 2) takes priority over repo DO (Level 1) */
   private get _hotStub(): DurableObjectStub | undefined {
     return this._sessionStub || this._repoDOStub;
@@ -120,8 +159,10 @@ export class GitR2Storage {
     const cached = this._objectCache.get(sha);
     if (cached) return cached;
 
-    // 2. Edge cache hit (per-colo, <5ms vs R2 200-500ms)
-    const edgeCacheKey = `${GitR2Storage.CACHE_BASE}/${this.basePath}/objects/${sha}`;
+    // 2. Edge cache hit (per-colo, <5ms vs R2 200-500ms).
+    // Key is GLOBAL (not per-repo) — content-addressed by SHA only, so all
+    // forks/clones share the same edge cache entry.
+    const edgeCacheKey = `${GitR2Storage.CACHE_BASE}/_blobs/${sha}`;
     if (this._edgeCache) {
       const edgeHit = await this._edgeCache.match(edgeCacheKey);
       if (edgeHit) {
@@ -143,7 +184,7 @@ export class GitR2Storage {
       }
     }
 
-    // 3. Try loose object in R2 (most objects live here)
+    // 3. Try loose object in R2 — global `_blobs/{sha}` first
     const key = this.objectKey(sha);
     const looseObj = await this.bucket.get(key);
 
@@ -152,6 +193,19 @@ export class GitR2Storage {
       const result = this._decompressAndCache(sha, compressed);
       this._putEdgeCache(edgeCacheKey, result);
       // Write-through to KV (fire-and-forget) — next read from ANY colo hits KV
+      this._putObjCache(sha, compressed);
+      return result;
+    }
+
+    // 3.5. Legacy per-repo path (for repos migrated as 'copied' that were
+    // created before the global blob store landed). Once backfill completes
+    // for a repo, this branch never hits.
+    const legacyKey = this.legacyObjectKey(sha);
+    const legacyObj = await this.bucket.get(legacyKey);
+    if (legacyObj) {
+      const compressed = new Uint8Array(await legacyObj.arrayBuffer());
+      const result = this._decompressAndCache(sha, compressed);
+      this._putEdgeCache(edgeCacheKey, result);
       this._putObjCache(sha, compressed);
       return result;
     }
@@ -348,6 +402,7 @@ export class GitR2Storage {
       if (res.status === 202) {
         this._addToCache(sha, fullObject);
         this._putObjCache(sha, compressed);
+        this._recordBlob(sha, type, fullObject.byteLength);
         return;
       }
     }
@@ -368,6 +423,7 @@ export class GitR2Storage {
       if (res.status === 202) {
         this._addToCache(sha, fullObject);
         this._putObjCache(sha, compressed);
+        this._recordBlob(sha, type, fullObject.byteLength);
         return;
       }
       // DO full (507) — R2 write already in flight, fall through to await it
@@ -379,6 +435,7 @@ export class GitR2Storage {
       httpMetadata: { contentType: "application/x-git-object" },
     });
     this._putObjCache(sha, compressed);
+    this._recordBlob(sha, type, fullObject.byteLength);
   }
 
   /**
@@ -396,12 +453,14 @@ export class GitR2Storage {
   }
 
   /**
-   * Check if an object exists
+   * Check if an object exists. Looks in the global blob store first, then the
+   * legacy per-repo prefix (for repos that haven't been backfilled yet).
    */
   async hasObject(sha: string): Promise<boolean> {
-    const key = this.objectKey(sha);
-    const obj = await this.bucket.head(key);
-    return obj !== null;
+    const head = await this.bucket.head(this.objectKey(sha));
+    if (head) return true;
+    const legacy = await this.bucket.head(this.legacyObjectKey(sha));
+    return legacy !== null;
   }
 
   /**
@@ -597,15 +656,22 @@ export class GitR2Storage {
     // R2 fallback
     const key = `${this.basePath}/${name}`;
     const obj = await this.bucket.get(key);
-    if (!obj) return null;
-    const sha = (await obj.text()).trim();
-
-    // Populate KV cache (fire-and-forget)
-    if (this._refCacheKv) {
-      this._refCacheKv.put(this.refCacheKey(name), sha, { expirationTtl: GitR2Storage.REF_CACHE_TTL }).catch(() => {});
+    if (obj) {
+      const sha = (await obj.text()).trim();
+      if (this._refCacheKv) {
+        this._refCacheKv.put(this.refCacheKey(name), sha, { expirationTtl: GitR2Storage.REF_CACHE_TTL }).catch(() => {});
+      }
+      return sha;
     }
 
-    return sha;
+    // Fork-snapshot fallback: an instant fork inherits parent refs by snapshot.
+    // Once the fork pushes to a ref, the R2 read above wins (CoW shadow).
+    if (this._forkSnapshot) {
+      const inherited = this._forkSnapshot.parentRefs[name];
+      if (inherited) return inherited;
+    }
+
+    return null;
   }
 
   /**
@@ -785,6 +851,14 @@ export class GitR2Storage {
     for (const entry of entries) {
       if (entry) refs.set(entry[0], entry[1]);
     }
+
+    // Fork-snapshot union: parent refs not yet shadowed by an own ref.
+    if (this._forkSnapshot) {
+      for (const [name, sha] of Object.entries(this._forkSnapshot.parentRefs)) {
+        if (!refs.has(name)) refs.set(name, sha);
+      }
+    }
+
     return refs;
   }
 
@@ -810,6 +884,14 @@ export class GitR2Storage {
     const obj = await this.bucket.get(key);
 
     if (!obj) {
+      // Fork-snapshot fallback: parent's HEAD value at fork-creation time.
+      if (this._forkSnapshot) {
+        const content = this._forkSnapshot.parentHead;
+        if (content.startsWith("ref: ")) {
+          return { type: "ref", value: content.slice(5) };
+        }
+        return { type: "sha", value: content };
+      }
       return null;
     }
 
@@ -999,7 +1081,16 @@ export class GitR2Storage {
 
   // ============ Private Helpers ============
 
+  /** Global content-addressed key. Shared across all repos — dedup happens here. */
   private objectKey(sha: string): string {
+    if (!isValidSha(sha)) {
+      throw new Error(`Invalid SHA: ${sha}`);
+    }
+    return `_blobs/${sha.slice(0, 2)}/${sha.slice(2)}`;
+  }
+
+  /** Legacy per-repo key. Used as read-fallback for repos migrated as 'copied'. */
+  private legacyObjectKey(sha: string): string {
     if (!isValidSha(sha)) {
       throw new Error(`Invalid SHA: ${sha}`);
     }

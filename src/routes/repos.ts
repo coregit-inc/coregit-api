@@ -466,6 +466,17 @@ repos.patch("/:slug", apiKeyAuth, patchRepoHandler);
 repos.patch("/:namespace/:slug", apiKeyAuth, patchRepoHandler);
 
 // DELETE /v1/repos/:slug  and  DELETE /v1/repos/:namespace/:slug
+//
+// Instant-fork era semantics:
+//   - Blobs in `_blobs/` are NOT deleted here. The GC sweep (hourly cron)
+//     removes blobs whose last `blob_repo` row has gone, after a 7-day grace
+//     period. This is the seam that lets DELETE parent of an instant fork
+//     stay safe — the fork's own blob_repo edges keep blobs alive.
+//   - We DO drop legacy per-repo `{orgId}/{slug}/...` keys eagerly. Those are
+//     not referenced by anyone but this repo (each pre-instant repo had its
+//     own object copy). Once backfill moves them into `_blobs/` they will
+//     be governed by GC instead.
+//   - `forks_count` defenders — none. blob_repo refcount IS the defense.
 const deleteRepoHandler = async (c: any) => {
   if (!isMasterKey(c.get("apiKeyPermissions"))) {
     return c.json({ error: "Only master API keys can delete repositories" }, 403);
@@ -480,7 +491,9 @@ const deleteRepoHandler = async (c: any) => {
     if (!resolved) return c.json({ error: "Repository not found" }, 404);
     const found = resolved.repo;
 
-    // Delete R2 storage
+    // 1. Delete legacy per-repo prefix (refs, HEAD, packs, and any objects/
+    //    not yet migrated to _blobs/). Safe in all modes — these keys belong
+    //    only to this repo.
     const storageSuffix = found.namespace ? `${found.namespace}/${found.slug}` : found.slug;
     const basePath = `${orgId}/${storageSuffix}/`;
     let cursor: string | undefined;
@@ -498,7 +511,12 @@ const deleteRepoHandler = async (c: any) => {
       await bucket.delete(keysToDelete.slice(i, i + 1000));
     }
 
-    // Delete Pinecone namespace (one per repo, content-addressed)
+    // 2. Drop blob_repo edges + fork_snapshot row. blob_repo MUST go before
+    //    the repo row so any concurrent GC sweep sees a consistent state.
+    await db.execute(sql`DELETE FROM blob_repo WHERE repo_id = ${found.id}`);
+    await db.execute(sql`DELETE FROM fork_snapshot WHERE repo_id = ${found.id}`);
+
+    // 3. Pinecone namespace (one per repo, content-addressed by repoId).
     if (c.env.PINECONE_API_KEY && c.env.PINECONE_INDEX_HOST) {
       c.executionCtx.waitUntil(
         deleteNamespace(
@@ -508,10 +526,10 @@ const deleteRepoHandler = async (c: any) => {
       );
     }
 
-    // Delete DB record (cascades to snapshots + semantic_index)
+    // 4. Drop the repo row (cascades to snapshots, semantic_index, code_*).
     await db.delete(repo).where(eq(repo.id, found.id));
 
-    // Invalidate repo cache
+    // 5. Invalidate repo cache.
     c.executionCtx.waitUntil(invalidateRepoCache(c.env.AUTH_CACHE, orgId, found.slug, found.namespace));
 
     recordUsage(c.executionCtx, c.env, db, orgId, c.get("dodoCustomerId"), "repo_deleted", 1, { repo_id: found.id });

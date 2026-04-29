@@ -20,6 +20,7 @@ import { eq, and } from "drizzle-orm";
 import { apiKeyAuth } from "../auth/middleware";
 import { hasRepoAccess } from "../auth/scopes";
 import { resolveRepo } from "../services/repo-resolver";
+import { resolveSearchTargets } from "../services/fork-resolver";
 import { extractRepoParams } from "./helpers";
 import { semanticIndex } from "../db/schema";
 import { parseGitObject } from "../git/objects";
@@ -183,12 +184,10 @@ const semanticSearchHandler = async (c: any) => {
     return c.json({ results: [], query: body.q, repo_slug: slug, ref });
   }
 
-  // 4. Query Pinecone (over-fetch to compensate for post-filtering)
-  // For forks: query both fork namespace AND parent namespace, merge results
-  const forkNs = `${orgId}/${resolved.repo.id}`;
-  const parentNs = resolved.repo.forkedFromRepoId && resolved.repo.forkedFromOrgId
-    ? `${resolved.repo.forkedFromOrgId}/${resolved.repo.forkedFromRepoId}`
-    : null;
+  // 4. Query Pinecone (over-fetch to compensate for post-filtering).
+  // For instant forks: query both fork and parent namespaces, merge with
+  // fork results taking priority.
+  const targets = resolveSearchTargets(resolved.repo);
 
   let filter: Record<string, unknown> | undefined;
   if (body.language) {
@@ -196,9 +195,9 @@ const semanticSearchHandler = async (c: any) => {
   }
 
   const [forkMatches, parentMatches] = await Promise.all([
-    queryVectors(c.env.PINECONE_INDEX_HOST!, c.env.PINECONE_API_KEY!, forkNs, queryVector, PINECONE_OVER_FETCH, filter),
-    parentNs
-      ? queryVectors(c.env.PINECONE_INDEX_HOST!, c.env.PINECONE_API_KEY!, parentNs, queryVector, PINECONE_OVER_FETCH, filter).catch(() => [] as QueryMatch[])
+    queryVectors(c.env.PINECONE_INDEX_HOST!, c.env.PINECONE_API_KEY!, targets.selfNs, queryVector, PINECONE_OVER_FETCH, filter),
+    targets.parentNs
+      ? queryVectors(c.env.PINECONE_INDEX_HOST!, c.env.PINECONE_API_KEY!, targets.parentNs, queryVector, PINECONE_OVER_FETCH, filter).catch(() => [] as QueryMatch[])
       : Promise.resolve([] as QueryMatch[]),
   ]);
 
