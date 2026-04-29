@@ -71,6 +71,13 @@ app.use("*", async (c, next) => {
 const DOMAIN_CACHE = new Map<string, { orgId: string; status: string; ts: number }>();
 const DOMAIN_CACHE_TTL = 60_000;
 
+// Matches preview-alias hosts produced by `wrangler versions upload
+// --preview-alias`. The mandatory dash before `coregit-api` keeps the
+// bare prod workers.dev URL (`coregit-api.<account>.workers.dev`) out
+// of the trusted set — it'll still fall through to custom-domain
+// lookup and return 421.
+const PREVIEW_ALIAS_RE = /^[a-z0-9-]+-coregit-api\.[a-z0-9-]+\.workers\.dev$/;
+
 app.use("*", async (c, next) => {
   const host = (c.req.header("host") || "").split(":")[0];
 
@@ -78,7 +85,8 @@ app.use("*", async (c, next) => {
     host === "api.coregit.dev" ||
     host === "custom.coregit.dev" ||
     host.startsWith("localhost") ||
-    host.startsWith("127.0.0.1")
+    host.startsWith("127.0.0.1") ||
+    PREVIEW_ALIAS_RE.test(host)
   ) {
     c.set("customDomain", null);
     return next();
