@@ -65,6 +65,19 @@ jobs:
           slug=$(echo "${{ github.ref_name }}" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/-/g' | cut -c1-50)
           echo "slug=$slug" >> "$GITHUB_OUTPUT"
 
+      # Drop any stale preview branch so the next step reclones from
+      # the current prod state. Without this, an api-key created in
+      # prod after the preview branch was first cut shows up as 401 in
+      # the smoke step. `delete-branch-action` is a no-op if the branch
+      # doesn't exist.
+      - name: Reset preview Neon branch (force-fresh CoW)
+        uses: neondatabase/delete-branch-action@v3
+        continue-on-error: true
+        with:
+          project_id: ${{ env.NEON_PROJECT_ID }}
+          branch: preview-${{ steps.slug.outputs.slug }}
+          api_key: ${{ secrets.NEON_API_KEY }}
+
       - name: Create or reuse Neon branch
         id: neon
         uses: neondatabase/create-branch-action@v6
