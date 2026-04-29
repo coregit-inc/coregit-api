@@ -18,9 +18,15 @@ interface SessionMeta {
   createdAt: number;
   lastActivityAt: number;
   closed: boolean;
+  /** Configurable per-session TTL in ms. Defaults to 30 min if absent (legacy). */
+  ttlMs?: number;
+  /** When true (default), every authenticated request slides the expiry alarm. */
+  idleExtend?: boolean;
 }
 
-const SESSION_TTL_MS = 30 * 60 * 1000; // 30 minutes
+const DEFAULT_SESSION_TTL_MS = 30 * 60 * 1000; // 30 minutes
+export const SESSION_TTL_CAP_MS_PAID = 8 * 60 * 60 * 1000; // 8 hours
+export const SESSION_TTL_CAP_MS_FREE = 60 * 60 * 1000; // 1 hour
 const MAX_PENDING_OBJECTS = 2000; // matches RepoHotDO; npm-init pushes routinely hit 500–1500
 const FLUSH_BATCH_SIZE = 20;
 const FLUSH_INTERVAL_MS = 30_000; // auto-flush when buffer is filling during a long push
@@ -45,14 +51,21 @@ export class SessionDO implements DurableObject {
     this.initialized = true;
   }
 
+  private get ttlMs(): number {
+    return this.meta?.ttlMs ?? DEFAULT_SESSION_TTL_MS;
+  }
+
   private async touch(): Promise<void> {
     if (!this.meta) return;
+    // Sessions opened with idle_extend:false keep a fixed expiry — only flush
+    // alarms (intermediate, set elsewhere) move; lastActivityAt does not.
+    if (this.meta.idleExtend === false) return;
     this.meta.lastActivityAt = Date.now();
     await this.state.storage.put("meta", this.meta);
     // Preserve any sooner alarm (e.g. a pending auto-flush). Only extend the alarm out
     // to the TTL horizon if no earlier alarm is already scheduled.
     const existing = await this.state.storage.getAlarm();
-    const ttlAlarm = Date.now() + SESSION_TTL_MS;
+    const ttlAlarm = Date.now() + this.ttlMs;
     if (existing === null || existing > ttlAlarm) {
       this.state.storage.setAlarm(ttlAlarm);
     }
@@ -87,6 +100,10 @@ export class SessionDO implements DurableObject {
     const body = (await request.json()) as Omit<SessionMeta, "createdAt" | "lastActivityAt" | "closed">;
     const now = Date.now();
 
+    // Caller-supplied ttlMs is already capped per tier in the route handler.
+    const ttlMs = body.ttlMs && body.ttlMs > 0 ? body.ttlMs : DEFAULT_SESSION_TTL_MS;
+    const idleExtend = body.idleExtend ?? true;
+
     this.meta = {
       orgId: body.orgId,
       apiKeyId: body.apiKeyId,
@@ -96,14 +113,16 @@ export class SessionDO implements DurableObject {
       createdAt: now,
       lastActivityAt: now,
       closed: false,
+      ttlMs,
+      idleExtend,
     };
 
     this.objectCount = 0;
     await this.state.storage.put("meta", this.meta);
     await this.state.storage.put("objcount", 0);
-    this.state.storage.setAlarm(now + SESSION_TTL_MS);
+    this.state.storage.setAlarm(now + ttlMs);
 
-    return Response.json({ ok: true });
+    return Response.json({ ok: true, ttlMs, idleExtend });
   }
 
   // ── Validate ──
@@ -113,7 +132,7 @@ export class SessionDO implements DurableObject {
       return Response.json({ error: "Session expired or closed" }, { status: 401 });
     }
 
-    if (Date.now() - this.meta.lastActivityAt > SESSION_TTL_MS) {
+    if (Date.now() - this.meta.lastActivityAt > this.ttlMs) {
       return Response.json({ error: "Session expired" }, { status: 401 });
     }
 
@@ -221,7 +240,7 @@ export class SessionDO implements DurableObject {
       createdAt: this.meta.createdAt,
       lastActivityAt: this.meta.lastActivityAt,
       closed: this.meta.closed,
-      ttlMs: SESSION_TTL_MS - (Date.now() - this.meta.lastActivityAt),
+      ttlMs: this.ttlMs - (Date.now() - this.meta.lastActivityAt),
     });
   }
 
@@ -317,7 +336,7 @@ export class SessionDO implements DurableObject {
     }
 
     // Check if session is still active
-    if (Date.now() - this.meta.lastActivityAt < SESSION_TTL_MS) {
+    if (Date.now() - this.meta.lastActivityAt < this.ttlMs) {
       // Still active. If we've accumulated pending objects, flush them to R2 now
       // so a long push doesn't hold thousands of objects in DO storage waiting for
       // explicit /flush or /close. flushToR2 writes any pending refs too — benign
@@ -330,7 +349,7 @@ export class SessionDO implements DurableObject {
         }
       }
       // Reschedule the expiry alarm at the normal TTL horizon.
-      this.state.storage.setAlarm(this.meta.lastActivityAt + SESSION_TTL_MS);
+      this.state.storage.setAlarm(this.meta.lastActivityAt + this.ttlMs);
       return;
     }
 

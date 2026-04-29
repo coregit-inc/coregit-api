@@ -65,6 +65,19 @@ jobs:
           slug=$(echo "${{ github.ref_name }}" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/-/g' | cut -c1-50)
           echo "slug=$slug" >> "$GITHUB_OUTPUT"
 
+      # Drop any stale preview branch so the next step reclones from
+      # the current prod state. Without this, an api-key created in
+      # prod after the preview branch was first cut shows up as 401 in
+      # the smoke step. `delete-branch-action` is a no-op if the branch
+      # doesn't exist.
+      - name: Reset preview Neon branch (force-fresh CoW)
+        uses: neondatabase/delete-branch-action@v3
+        continue-on-error: true
+        with:
+          project_id: ${{ env.NEON_PROJECT_ID }}
+          branch: preview-${{ steps.slug.outputs.slug }}
+          api_key: ${{ secrets.NEON_API_KEY }}
+
       - name: Create or reuse Neon branch
         id: neon
         uses: neondatabase/create-branch-action@v6
@@ -103,6 +116,126 @@ jobs:
       - name: Cleanup secrets file
         if: always()
         run: rm -f /tmp/preview-secrets.json
+
+      # Local-mode smoke test. We can't use a CF preview URL (CF doesn't
+      # generate them for Workers binding a Durable Object), and
+      # `wrangler dev --remote` crashes workerd on the kj tunnel before
+      # /health responds. So we run `wrangler dev` in pure local mode:
+      # DOs / R2 / KV are workerd-emulated (empty), but DATABASE_URL is
+      # piped directly to the per-branch Neon clone — postgres-js opens
+      # the connection itself, no Hyperdrive emulation needed.
+      #
+      # We only assert behaviors that don't depend on R2 state: shape
+      # validation (oversize batch → 400, empty globs → 400) and the
+      # session DO life-cycle. Real read/write paths are covered by the
+      # post-merge smoke against api.coregit.dev.
+      - name: Smoke test mount endpoints (wrangler dev, local)
+        env:
+          DATABASE_URL: ${{ steps.neon.outputs.db_url_pooled }}
+          # wrangler dev (local) refuses to bind Hyperdrive without an
+          # explicit local connection string. Point it at the per-branch
+          # Neon clone so postgres-js can connect from inside workerd.
+          CLOUDFLARE_HYPERDRIVE_LOCAL_CONNECTION_STRING_HYPERDRIVE: ${{ steps.neon.outputs.db_url_pooled }}
+          COREGIT_API_KEY: ${{ secrets.COREGIT_API_KEY_DEV }}
+          COREGIT_TEST_REPO_SLUG: ${{ vars.COREGIT_TEST_REPO_SLUG }}
+        run: |
+          set -euo pipefail
+          if [ -z "${COREGIT_API_KEY:-}" ]; then
+            echo "::warning::COREGIT_API_KEY_DEV secret not set; skipping smoke test"
+            exit 0
+          fi
+          if [ -z "${COREGIT_TEST_REPO_SLUG:-}" ]; then
+            echo "::warning::COREGIT_TEST_REPO_SLUG repo var not set; skipping smoke test"
+            exit 0
+          fi
+
+          # `wrangler dev` (no --remote): pure workerd local. We pass
+          # PREVIEW_DATABASE_URL via --var so src/db/index.ts picks it
+          # up. Note: dbConnectionString() also falls through to
+          # env.DATABASE_URL when PREVIEW_DATABASE_URL is unset, but we
+          # lean on the version_metadata gate by also using --var
+          # CF_VERSION_METADATA_TAG (no-op in local mode but documents
+          # intent).
+          npx wrangler dev --port 8787 \
+              --var "DATABASE_URL:$DATABASE_URL" \
+              > /tmp/wrangler-dev.log 2>&1 &
+          DEV_PID=$!
+          trap 'kill $DEV_PID 2>/dev/null || true' EXIT
+
+          # Wait up to 60s for the worker to bind.
+          for i in $(seq 1 60); do
+            if curl -fsS "http://localhost:8787/" > /dev/null 2>&1; then
+              echo "wrangler dev ready after ${i}s"
+              break
+            fi
+            sleep 1
+            if [ "$i" = "60" ]; then
+              echo "::error::wrangler dev did not bind within 60s"
+              tail -100 /tmp/wrangler-dev.log
+              exit 1
+            fi
+          done
+
+          BASE="http://localhost:8787"
+
+          echo "── GET / (no DB required) ──"
+          curl -fsS "$BASE/" | jq .
+
+          # Repo-scoped routes (blobs/batch, prefetch, watch) hit refs
+          # and blobs in R2. `wrangler dev` (without --remote) emulates
+          # R2 locally — the per-branch Neon clone has the repo *row*
+          # but the bucket is empty, so resolveRef → null → 404 before
+          # any of our new validation gates fire. Real coverage for
+          # those routes lives in the post-merge prod smoke that hits
+          # api.coregit.dev (where R2 is populated).
+          #
+          # What we *can* validate locally is the session-DO life cycle
+          # (the biggest behaviour change in this PR — per-session TTL
+          # + idle-extend gate).
+          echo "── M3: POST /v1/session honors custom ttl_seconds ──"
+          SESSION_RES=$(curl -fsS -X POST "$BASE/v1/session" \
+            -H "x-api-key: $COREGIT_API_KEY" \
+            -H "Content-Type: application/json" \
+            -d '{"ttl_seconds":3600,"idle_extend":true}')
+          echo "$SESSION_RES" | jq .
+          [ "$(echo "$SESSION_RES" | jq -r '.ttl_seconds')" = "3600" ] || \
+            { echo "::error::ttl_seconds did not honor request"; exit 1; }
+          [ "$(echo "$SESSION_RES" | jq -r '.idle_extend')" = "true" ] || \
+            { echo "::error::idle_extend missing in response"; exit 1; }
+          SESSION_ID=$(echo "$SESSION_RES" | jq -r '.session_id')
+          [[ "$SESSION_ID" =~ ^ses_ ]] || \
+            { echo "::error::session_id missing or malformed: $SESSION_ID"; exit 1; }
+          echo "ok: session opened with custom ttl=3600s"
+
+          echo "── M3: GET /v1/session/<id>/status ──"
+          STATUS_RES=$(curl -fsS "$BASE/v1/session/$SESSION_ID/status" \
+            -H "x-api-key: $COREGIT_API_KEY")
+          echo "$STATUS_RES" | jq .
+          [ "$(echo "$STATUS_RES" | jq -r '.closed')" = "false" ] || \
+            { echo "::error::session reports closed already"; exit 1; }
+
+          echo "── M3: DELETE /v1/session/<id> ──"
+          curl -fsS -X DELETE "$BASE/v1/session/$SESSION_ID" \
+            -H "x-api-key: $COREGIT_API_KEY" | jq .
+
+          echo "── M3: rejects oversize ttl_seconds (free tier cap = 1h) ──"
+          # Per routes/session.ts: caller-requested ttl is min'd against
+          # tier cap (8h paid / 1h free). Asking for 99h on a free key
+          # should silently downgrade rather than 4xx.
+          BIG_TTL_RES=$(curl -fsS -X POST "$BASE/v1/session" \
+            -H "x-api-key: $COREGIT_API_KEY" \
+            -H "Content-Type: application/json" \
+            -d '{"ttl_seconds":356400}')
+          GOT_TTL=$(echo "$BIG_TTL_RES" | jq -r '.ttl_seconds')
+          [ "$GOT_TTL" -le 28800 ] || \
+            { echo "::error::ttl was not capped, got $GOT_TTL"; exit 1; }
+          echo "ok: oversize ttl capped to $GOT_TTL"
+
+          echo "All smoke checks passed."
+
+      - name: Dump wrangler dev log on failure
+        if: failure()
+        run: tail -200 /tmp/wrangler-dev.log 2>/dev/null || true
 
       # Soft-fail webhook: if OPENHIVE_WEBHOOK_URL isn't set or the
       # endpoint is unreachable, the preview deploy still counts as a

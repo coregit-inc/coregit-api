@@ -15,7 +15,17 @@ import type { Env, Variables } from "../types";
 
 const session = new Hono<{ Bindings: Env; Variables: Variables }>();
 
+const TTL_CAP_PAID_S = 8 * 60 * 60; // 8 hours
+const TTL_CAP_FREE_S = 60 * 60; // 1 hour
+const TTL_DEFAULT_S = 30 * 60; // 30 minutes
+
 // POST /v1/session — Open a new session
+//
+// Body (optional): { ttl_seconds?, idle_extend? }
+//   ttl_seconds  — caller-requested TTL in seconds; capped at 8 h (paid) / 1 h (free).
+//                  Default 30 min when omitted (legacy behaviour).
+//   idle_extend  — when true (default), every authenticated request slides
+//                  the expiry alarm. Set false for a fixed expiry from open().
 session.post("/session", async (c) => {
   const db = c.get("db");
   const key = c.req.header("x-api-key");
@@ -35,6 +45,21 @@ session.post("/session", async (c) => {
   if (!rl.allowed) return c.json({ error: "Rate limit exceeded" }, 429);
   if (!orgRl.allowed) return c.json({ error: "Organization rate limit exceeded" }, 429);
 
+  let body: any = {};
+  try {
+    body = await c.req.json();
+  } catch {
+    body = {};
+  }
+
+  const cap = auth.tier === "paid" ? TTL_CAP_PAID_S : TTL_CAP_FREE_S;
+  const requestedSec =
+    typeof body?.ttl_seconds === "number" && body.ttl_seconds > 0
+      ? Math.min(Math.floor(body.ttl_seconds), cap)
+      : TTL_DEFAULT_S;
+  const idleExtend = body?.idle_extend === false ? false : true;
+  const ttlMs = requestedSec * 1000;
+
   const sessionId = `ses_${nanoid(21)}`;
   const doId = c.env.SESSION_DO.idFromName(sessionId);
   const stub = c.env.SESSION_DO.get(doId);
@@ -47,6 +72,8 @@ session.post("/session", async (c) => {
       scopes: auth.scopes,
       orgTier: auth.tier,
       dodoCustomerId: auth.dodoCustomerId,
+      ttlMs,
+      idleExtend,
     }),
   });
 
@@ -57,8 +84,9 @@ session.post("/session", async (c) => {
 
   return c.json({
     session_id: sessionId,
-    expires_at: new Date(Date.now() + 30 * 60 * 1000).toISOString(),
-    ttl_seconds: 1800,
+    expires_at: new Date(Date.now() + ttlMs).toISOString(),
+    ttl_seconds: requestedSec,
+    idle_extend: idleExtend,
   }, 201);
 });
 
