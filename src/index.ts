@@ -24,6 +24,10 @@ import {
   incrementGraphBatchCounter,
   type GraphIndexingMessage,
 } from "./services/graph-index";
+import {
+  processBlobMaterializationMessage,
+  type BlobMaterializationMessage,
+} from "./services/blob-materialization";
 import { app } from "./app";
 import type { Env } from "./types";
 
@@ -44,6 +48,7 @@ export default {
     const repoHotNs = env.REPO_HOT_DO;
     const since = new Date(Date.now() - 7 * 60 * 60 * 1000);
 
+    // Step 1: pack loose objects on recently-touched repos.
     const recent = await db
       .select({
         id: repoTable.id,
@@ -69,9 +74,16 @@ export default {
         ),
       );
     }
+
+    // Step 2: blob garbage collection. Selects blobs with no remaining
+    // blob_repo edges, older than the 7-day grace window. Limited per run
+    // so a long sweep doesn't starve the pack loop above.
+    await sweepOrphanBlobs(db, bucket).catch((err) => {
+      console.error(`[cron/gc] orphan sweep failed: ${err instanceof Error ? err.message : String(err)}`);
+    });
   },
 
-  async queue(batch: MessageBatch<IndexingMessage | GraphIndexingMessage>, env: Env, ctx: ExecutionContext) {
+  async queue(batch: MessageBatch<IndexingMessage | GraphIndexingMessage | BlobMaterializationMessage>, env: Env, ctx: ExecutionContext) {
     const db = createDb(dbConnectionString(env));
     for (const message of batch.messages) {
       try {
@@ -93,19 +105,24 @@ export default {
           }
         } else if (type === "graph_full_reindex") {
           await processGraphFullReindex(message.body as GraphIndexingMessage & { type: "graph_full_reindex" }, env, db);
+        } else if (type === "blob_materialization") {
+          await processBlobMaterializationMessage(message.body as BlobMaterializationMessage, env, db);
         }
 
         message.ack();
       } catch (err) {
-        console.error(`Indexing failed (attempt ${message.attempts}):`, err);
+        console.error(`Queue task failed (attempt ${message.attempts}):`, err);
         if (message.attempts >= 3) {
-          const body = message.body;
-          const table = body.type.startsWith("graph_") ? "code_graph_index" : "semantic_index";
-          ctx.waitUntil(
-            db.execute(
-              sql`UPDATE ${sql.raw(table)} SET status = 'failed', error = ${String(err)} WHERE repo_id = ${body.repoId} AND branch = ${body.branch}`
-            ).catch(() => {})
-          );
+          const body = message.body as { type: string; repoId?: string; branch?: string };
+          // Best-effort: only semantic/graph index messages have a status row to mark.
+          if (body.type === "index_files" || body.type === "full_reindex" || body.type === "graph_index_files" || body.type === "graph_full_reindex") {
+            const table = body.type.startsWith("graph_") ? "code_graph_index" : "semantic_index";
+            ctx.waitUntil(
+              db.execute(
+                sql`UPDATE ${sql.raw(table)} SET status = 'failed', error = ${String(err)} WHERE repo_id = ${body.repoId} AND branch = ${body.branch}`
+              ).catch(() => {})
+            );
+          }
           message.ack();
         } else {
           message.retry();
@@ -114,6 +131,43 @@ export default {
     }
   },
 };
+
+/**
+ * GC sweep: drop blobs that no repo references anymore. The 7-day grace
+ * window protects against the fork-then-immediately-delete-parent pattern
+ * and gives ops a recovery window if a delete was a mistake.
+ *
+ * Per-run cap so a 1M-blob sweep doesn't run for hours; cron fires every
+ * 6 hours so the queue drains without intervention.
+ */
+const GC_SWEEP_PER_RUN = 1000;
+const GC_DELETE_BATCH = 100;
+
+async function sweepOrphanBlobs(
+  db: ReturnType<typeof createDb>,
+  bucket: R2Bucket,
+): Promise<void> {
+  const orphans = (await db.execute(sql`
+    SELECT b.sha
+    FROM blob b
+    LEFT JOIN blob_repo br ON br.sha = b.sha
+    WHERE br.sha IS NULL AND b.first_seen_at < now() - interval '7 days'
+    LIMIT ${GC_SWEEP_PER_RUN}
+  `)) as unknown as { sha: string }[];
+
+  if (orphans.length === 0) return;
+
+  let deleted = 0;
+  for (let i = 0; i < orphans.length; i += GC_DELETE_BATCH) {
+    const batch = orphans.slice(i, i + GC_DELETE_BATCH);
+    const r2Keys = batch.map((o) => `_blobs/${o.sha.slice(0, 2)}/${o.sha.slice(2)}`);
+    await bucket.delete(r2Keys);
+    const shas = batch.map((o) => o.sha);
+    await db.execute(sql`DELETE FROM blob WHERE sha = ANY(${shas}::text[])`);
+    deleted += batch.length;
+  }
+  console.log(`[cron/gc] swept ${deleted} orphan blobs`);
+}
 
 async function packOneRepoIfNeeded(
   bucket: R2Bucket,

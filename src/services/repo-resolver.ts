@@ -7,7 +7,7 @@
  */
 
 import { eq, and, isNull } from "drizzle-orm";
-import { repo, organization } from "../db/schema";
+import { repo, organization, forkSnapshot } from "../db/schema";
 import { GitR2Storage } from "../git/storage";
 import type { Database } from "../db";
 import type { Repo } from "../db/schema";
@@ -87,6 +87,12 @@ export async function resolveRepo(
       const storage = new GitR2Storage(bucket, orgId, storageSuffix);
       storage.setRefCacheKv(_refCacheKvRef);
       storage.setObjCacheKv(_objCacheKvRef);
+      storage.setBlobRepoContext(db, cached.id, orgId);
+      // Instant fork: load fork_snapshot lazily — it's cheap (one PK lookup)
+      // and populates ref/HEAD fallback for forks that haven't pushed yet.
+      if (cached.forkMode === "instant" && cached.forkedFromRepoId) {
+        await loadForkSnapshot(db, storage, cached.id);
+      }
       attachRepoHotDO(storage, orgId, storageSuffix, cached.id);
       const scopeKey = cached.namespace ? `${cached.namespace}/${cached.slug}` : cached.slug;
       return { repo: cached, storage, scopeKey, storageSuffix };
@@ -114,10 +120,36 @@ export async function resolveRepo(
   const storage = new GitR2Storage(bucket, orgId, storageSuffix);
   storage.setRefCacheKv(_refCacheKvRef);
   storage.setObjCacheKv(_objCacheKvRef);
+  storage.setBlobRepoContext(db, found.id, orgId);
+  if (found.forkMode === "instant" && found.forkedFromRepoId) {
+    await loadForkSnapshot(db, storage, found.id);
+  }
   attachRepoHotDO(storage, orgId, storageSuffix, found.id);
   const scopeKey = namespace ? `${namespace}/${slug}` : slug;
 
   return { repo: found, storage, scopeKey, storageSuffix };
+}
+
+/**
+ * Load fork_snapshot row (if any) and attach to storage. Failure to load is
+ * non-fatal — the fork still serves blobs by SHA, only ref-fallback is missing.
+ */
+async function loadForkSnapshot(db: Database, storage: GitR2Storage, repoId: string): Promise<void> {
+  try {
+    const [row] = await db
+      .select({ parentRefs: forkSnapshot.parentRefs, parentHead: forkSnapshot.parentHead })
+      .from(forkSnapshot)
+      .where(eq(forkSnapshot.repoId, repoId))
+      .limit(1);
+    if (row) {
+      storage.setForkSnapshot({
+        parentRefs: row.parentRefs as Record<string, string>,
+        parentHead: row.parentHead,
+      });
+    }
+  } catch (e) {
+    console.error("loadForkSnapshot failed:", e);
+  }
 }
 
 /**

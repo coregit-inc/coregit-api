@@ -19,7 +19,7 @@ import { encryptSecret } from "../services/secret-manager";
 import { webhook } from "../db/schema";
 import type { Env, Variables } from "../types";
 
-const VALID_EVENTS = ["push", "repo.created", "repo.deleted", "branch.created", "branch.deleted", "*"];
+const VALID_EVENTS = ["push", "repo.created", "repo.deleted", "repo.forked", "branch.created", "branch.deleted", "*"];
 
 const webhooks = new Hono<{ Bindings: Env; Variables: Variables }>();
 

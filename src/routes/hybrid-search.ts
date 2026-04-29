@@ -20,6 +20,7 @@ import { sql } from "drizzle-orm";
 import { apiKeyAuth } from "../auth/middleware";
 import { hasRepoAccess } from "../auth/scopes";
 import { resolveRepo } from "../services/repo-resolver";
+import { resolveSearchTargets } from "../services/fork-resolver";
 import { extractRepoParams } from "./helpers";
 import { resolveRef, getTreeBlobShas, hashCacheKey } from "../services/tree-resolver";
 import { embedCode, rerankCode } from "../services/voyage";
@@ -222,21 +223,18 @@ const hybridSearchHandler = async (c: any) => {
   const treeBlobMap = await treeBlobMapPromise;
   const blobShasSet = new Set(treeBlobMap.keys());
 
-  // Semantic retrieval (only if weight > 0 and configured)
-  // For forks: query both fork namespace AND parent namespace
-  const forkNs = `${orgId}/${resolved.repo.id}`;
-  const parentNs = resolved.repo.forkedFromRepoId && resolved.repo.forkedFromOrgId
-    ? `${resolved.repo.forkedFromOrgId}/${resolved.repo.forkedFromRepoId}`
-    : null;
+  // Semantic retrieval (only if weight > 0 and configured).
+  // For instant forks: query fork + parent namespaces, fork wins on dedup.
+  const targets = resolveSearchTargets(resolved.repo);
 
   const semanticPromise = weights.semantic > 0 && c.env.PINECONE_API_KEY && c.env.VOYAGE_API_KEY && c.env.PINECONE_INDEX_HOST
     ? (async () => {
         const embedResult = await embedCode([body.q], "query", c.env.VOYAGE_API_KEY!);
         const queryVector = embedResult[0];
         const [forkMatches, parentMatches] = await Promise.all([
-          queryVectors(c.env.PINECONE_INDEX_HOST!, c.env.PINECONE_API_KEY!, forkNs, queryVector, 50),
-          parentNs
-            ? queryVectors(c.env.PINECONE_INDEX_HOST!, c.env.PINECONE_API_KEY!, parentNs, queryVector, 50).catch(() => [])
+          queryVectors(c.env.PINECONE_INDEX_HOST!, c.env.PINECONE_API_KEY!, targets.selfNs, queryVector, 50),
+          targets.parentNs
+            ? queryVectors(c.env.PINECONE_INDEX_HOST!, c.env.PINECONE_API_KEY!, targets.parentNs, queryVector, 50).catch(() => [])
             : Promise.resolve([]),
         ]);
         // Merge: fork results take priority, dedup by ID

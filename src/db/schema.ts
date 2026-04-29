@@ -33,6 +33,10 @@ export const repo = pgTable(
     forkedFromRepoId: text("forked_from_repo_id"),
     forkedFromOrgId: text("forked_from_org_id"),
     forkedAt: timestamp("forked_at"),
+    forkRoot: text("fork_root"),
+    forkDepth: integer("fork_depth").notNull().default(0),
+    forkChain: text("fork_chain").array().notNull().default([]),
+    forkMode: text("fork_mode").notNull().default("instant"), // 'instant' | 'deep' | 'copied'
     createdAt: timestamp("created_at").defaultNow().notNull(),
     wikiConfig: jsonb("wiki_config"),               // null = regular repo, non-null = LLM Wiki
     updatedAt: timestamp("updated_at")
@@ -44,6 +48,8 @@ export const repo = pgTable(
     index("repo_org_idx").on(table.orgId),
     index("repo_namespace_idx").on(table.orgId, table.namespace),
     index("repo_template_idx").on(table.orgId, table.isTemplate),
+    index("repo_forked_from_idx").on(table.forkedFromRepoId),
+    index("repo_fork_root_idx").on(table.forkRoot),
     // Uniqueness enforced via partial indexes in migration SQL:
     //   (org_id, slug) WHERE namespace IS NULL
     //   (org_id, namespace, slug) WHERE namespace IS NOT NULL
@@ -495,3 +501,60 @@ export const codeGraphIndex = pgTable(
 );
 
 export type CodeGraphIndex = typeof codeGraphIndex.$inferSelect;
+
+// ============================================================
+// Instant Fork: content-addressed blob store + refcount
+// ============================================================
+
+// Global blob registry — one row per unique git object SHA across all repos.
+export const blob = pgTable(
+  "blob",
+  {
+    sha: text("sha").primaryKey(),
+    sizeBytes: bigint("size_bytes", { mode: "number" }).notNull(),
+    type: text("type").notNull(),                // 'blob' | 'tree' | 'commit' | 'tag'
+    firstSeenAt: timestamp("first_seen_at").defaultNow().notNull(),
+  }
+);
+
+export type Blob = typeof blob.$inferSelect;
+export type NewBlob = typeof blob.$inferInsert;
+
+// Refcount edge: which repo owns which blob. Drives dedup billing and GC.
+// On fork creation, blob_repo rows are materialized for all blobs reachable
+// from the parent's HEAD — that's how DELETE parent stays safe.
+export const blobRepo = pgTable(
+  "blob_repo",
+  {
+    sha: text("sha").notNull(),
+    repoId: text("repo_id").notNull(),
+    orgId: text("org_id").notNull(),
+    firstReferencedAt: timestamp("first_referenced_at").defaultNow().notNull(),
+  },
+  (table) => [
+    index("blob_repo_repo_idx").on(table.repoId),
+    index("blob_repo_org_idx").on(table.orgId, table.sha),
+    index("blob_repo_sha_idx").on(table.sha),
+    // Composite primary key (sha, repo_id) is created in migration SQL.
+  ]
+);
+
+export type BlobRepo = typeof blobRepo.$inferSelect;
+export type NewBlobRepo = typeof blobRepo.$inferInsert;
+
+// Immutable snapshot of parent refs at fork creation time.
+// `getRef` falls back here when an instant-fork has no own ref of that name.
+// Forks do NOT track parent refs live — that would silently rewrite history.
+export const forkSnapshot = pgTable(
+  "fork_snapshot",
+  {
+    repoId: text("repo_id").primaryKey(),
+    parentRepoId: text("parent_repo_id").notNull(),
+    parentRefs: jsonb("parent_refs").notNull(),    // { "refs/heads/main": "<sha>", ... }
+    parentHead: text("parent_head").notNull(),
+    snapshotAt: timestamp("snapshot_at").defaultNow().notNull(),
+  }
+);
+
+export type ForkSnapshot = typeof forkSnapshot.$inferSelect;
+export type NewForkSnapshot = typeof forkSnapshot.$inferInsert;
