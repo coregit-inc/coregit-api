@@ -137,10 +137,15 @@ jobs:
           # Neon clone so postgres-js can connect from inside workerd.
           CLOUDFLARE_HYPERDRIVE_LOCAL_CONNECTION_STRING_HYPERDRIVE: ${{ steps.neon.outputs.db_url_pooled }}
           COREGIT_API_KEY: ${{ secrets.COREGIT_API_KEY_DEV }}
+          COREGIT_TEST_REPO_SLUG: ${{ vars.COREGIT_TEST_REPO_SLUG }}
         run: |
           set -euo pipefail
           if [ -z "${COREGIT_API_KEY:-}" ]; then
             echo "::warning::COREGIT_API_KEY_DEV secret not set; skipping smoke test"
+            exit 0
+          fi
+          if [ -z "${COREGIT_TEST_REPO_SLUG:-}" ]; then
+            echo "::warning::COREGIT_TEST_REPO_SLUG repo var not set; skipping smoke test"
             exit 0
           fi
 
@@ -176,16 +181,13 @@ jobs:
           echo "── GET / (no DB required) ──"
           curl -fsS "$BASE/" | jq .
 
-          # The repo-scoped routes resolve the repo before validating the
-          # body, so shape rejection requires an existing repo in the
-          # preview Neon clone. The CoW only captures prod at branch
-          # creation time, so we create a fresh ephemeral repo per run.
-          REPO_SLUG="ci-smoke-$(date +%s)-$$"
-          echo "── ephemeral repo: $REPO_SLUG ──"
-          curl -fsS -X POST "$BASE/v1/repos" \
-            -H "x-api-key: $COREGIT_API_KEY" \
-            -H "Content-Type: application/json" \
-            -d "{\"slug\":\"$REPO_SLUG\",\"init\":true,\"visibility\":\"private\"}" | jq -c '{slug, default_branch}'
+          # The repo-scoped routes resolve the repo before validating
+          # the body, so shape rejection requires an existing repo. We
+          # use the static prod test repo (seeded once with README +
+          # src/a.ts + src/b.ts); the preceding "Reset preview Neon
+          # branch" step ensures the CoW clone reflects current prod,
+          # so this repo is always present.
+          REPO_SLUG="$COREGIT_TEST_REPO_SLUG"
 
           echo "── M3: POST /v1/session honors custom ttl_seconds ──"
           SESSION_RES=$(curl -fsS -X POST "$BASE/v1/session" \
@@ -235,11 +237,6 @@ jobs:
             -d "$BIG_GLOBS")
           [ "$STATUS" = "400" ] || { echo "::error::expected 400 on >32 globs, got $STATUS"; exit 1; }
           echo "ok: >32 globs rejected"
-
-          echo "── cleanup: drop $REPO_SLUG ──"
-          curl -fsS -X DELETE "$BASE/v1/repos/$REPO_SLUG" \
-            -H "x-api-key: $COREGIT_API_KEY" > /dev/null || \
-            echo "::warning::could not delete ephemeral $REPO_SLUG (preview branch will be GC'd anyway)"
 
           echo "All smoke checks passed."
 
