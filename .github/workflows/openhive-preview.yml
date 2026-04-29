@@ -181,14 +181,17 @@ jobs:
           echo "── GET / (no DB required) ──"
           curl -fsS "$BASE/" | jq .
 
-          # The repo-scoped routes (blobs/batch, prefetch, watch) all
-          # resolve the repo *before* validating the body, so shape
-          # tests against them require an existing repo for the auth-
-          # scoped orgId. The CoW preview clone is sometimes lagging
-          # by a few seconds after the Neon-branch reset, which makes
-          # this flaky. The session route is the simplest end-to-end
-          # check that covers our biggest config change (M3 ttl), so
-          # we lean on that.
+          # Repo-scoped routes (blobs/batch, prefetch, watch) hit refs
+          # and blobs in R2. `wrangler dev` (without --remote) emulates
+          # R2 locally — the per-branch Neon clone has the repo *row*
+          # but the bucket is empty, so resolveRef → null → 404 before
+          # any of our new validation gates fire. Real coverage for
+          # those routes lives in the post-merge prod smoke that hits
+          # api.coregit.dev (where R2 is populated).
+          #
+          # What we *can* validate locally is the session-DO life cycle
+          # (the biggest behaviour change in this PR — per-session TTL
+          # + idle-extend gate).
           echo "── M3: POST /v1/session honors custom ttl_seconds ──"
           SESSION_RES=$(curl -fsS -X POST "$BASE/v1/session" \
             -H "x-api-key: $COREGIT_API_KEY" \
@@ -199,36 +202,34 @@ jobs:
             { echo "::error::ttl_seconds did not honor request"; exit 1; }
           [ "$(echo "$SESSION_RES" | jq -r '.idle_extend')" = "true" ] || \
             { echo "::error::idle_extend missing in response"; exit 1; }
+          SESSION_ID=$(echo "$SESSION_RES" | jq -r '.session_id')
+          [[ "$SESSION_ID" =~ ^ses_ ]] || \
+            { echo "::error::session_id missing or malformed: $SESSION_ID"; exit 1; }
+          echo "ok: session opened with custom ttl=3600s"
 
-          # Repo-scoped shape tests are best-effort. They become real
-          # gates as soon as the smoke step lands a CoW clone with the
-          # static test repo present (current behavior is intermittent).
-          REPO_SLUG="$COREGIT_TEST_REPO_SLUG"
-          REPO_STATUS=$(curl -sS -o /dev/null -w "%{http_code}" \
-            "$BASE/v1/repos/$REPO_SLUG" \
+          echo "── M3: GET /v1/session/<id>/status ──"
+          STATUS_RES=$(curl -fsS "$BASE/v1/session/$SESSION_ID/status" \
             -H "x-api-key: $COREGIT_API_KEY")
-          if [ "$REPO_STATUS" = "200" ]; then
-            echo "── M1: blobs/batch rejects >100 paths ──"
-            BIG=$(python3 -c "import json; print(json.dumps({'paths':['x']*101}))")
-            STATUS=$(curl -sS -o /dev/null -w "%{http_code}" -X POST \
-              "$BASE/v1/repos/$REPO_SLUG/blobs/batch" \
-              -H "x-api-key: $COREGIT_API_KEY" \
-              -H "Content-Type: application/json" \
-              -d "$BIG")
-            [ "$STATUS" = "400" ] || { echo "::error::expected 400 on >100 paths, got $STATUS"; exit 1; }
-            echo "ok: oversize batch rejected with 400"
+          echo "$STATUS_RES" | jq .
+          [ "$(echo "$STATUS_RES" | jq -r '.closed')" = "false" ] || \
+            { echo "::error::session reports closed already"; exit 1; }
 
-            echo "── S4: prefetch rejects empty globs ──"
-            STATUS=$(curl -sS -o /dev/null -w "%{http_code}" -X POST \
-              "$BASE/v1/repos/$REPO_SLUG/prefetch" \
-              -H "x-api-key: $COREGIT_API_KEY" \
-              -H "Content-Type: application/json" \
-              -d '{"globs":[]}')
-            [ "$STATUS" = "400" ] || { echo "::error::expected 400 on empty globs, got $STATUS"; exit 1; }
-            echo "ok: empty globs rejected"
-          else
-            echo "::warning::test repo '$REPO_SLUG' not in CoW clone (status $REPO_STATUS); skipping repo-scoped shape checks"
-          fi
+          echo "── M3: DELETE /v1/session/<id> ──"
+          curl -fsS -X DELETE "$BASE/v1/session/$SESSION_ID" \
+            -H "x-api-key: $COREGIT_API_KEY" | jq .
+
+          echo "── M3: rejects oversize ttl_seconds (free tier cap = 1h) ──"
+          # Per routes/session.ts: caller-requested ttl is min'd against
+          # tier cap (8h paid / 1h free). Asking for 99h on a free key
+          # should silently downgrade rather than 4xx.
+          BIG_TTL_RES=$(curl -fsS -X POST "$BASE/v1/session" \
+            -H "x-api-key: $COREGIT_API_KEY" \
+            -H "Content-Type: application/json" \
+            -d '{"ttl_seconds":356400}')
+          GOT_TTL=$(echo "$BIG_TTL_RES" | jq -r '.ttl_seconds')
+          [ "$GOT_TTL" -le 28800 ] || \
+            { echo "::error::ttl was not capped, got $GOT_TTL"; exit 1; }
+          echo "ok: oversize ttl capped to $GOT_TTL"
 
           echo "All smoke checks passed."
 
