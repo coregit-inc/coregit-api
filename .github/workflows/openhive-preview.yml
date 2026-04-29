@@ -115,7 +115,6 @@ jobs:
       # smoke step needs an authed key to hit /v1/* — health alone is
       # not enough to validate the new mount endpoints).
       - name: Smoke test mount endpoints
-        if: ${{ secrets.COREGIT_API_KEY_DEV != '' }}
         env:
           DATABASE_URL: ${{ steps.neon.outputs.db_url_pooled }}
           COREGIT_API_KEY: ${{ secrets.COREGIT_API_KEY_DEV }}
@@ -124,6 +123,10 @@ jobs:
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: |
           set -euo pipefail
+          if [ -z "${COREGIT_API_KEY:-}" ]; then
+            echo "::warning::COREGIT_API_KEY_DEV secret not set; skipping smoke test"
+            exit 0
+          fi
           if [ -z "${COREGIT_TEST_REPO_SLUG:-}" ]; then
             echo "::warning::COREGIT_TEST_REPO_SLUG repo var not set; skipping smoke test"
             exit 0
