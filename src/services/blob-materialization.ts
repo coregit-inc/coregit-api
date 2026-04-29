@@ -16,10 +16,11 @@
  * Either way, INSERTs go through `unnest($1::text[])` so a 1M-blob walk is
  * a few SQL round-trips, not a million.
  */
-import { sql } from "drizzle-orm";
 import type { Database } from "../db";
+import { blob, blobRepo } from "../db/schema";
 import { GitR2Storage } from "../git/storage";
 import { walkReachable } from "./blob-walker";
+import type { GitObjectType } from "../git/objects";
 
 /** Reachable-object count above which we punt the work to the queue. */
 export const SYNC_THRESHOLD = 5000;
@@ -54,27 +55,19 @@ export async function materializeSync(
   let buf: { sha: string; type: string; size: number }[] = [];
   let total = 0;
 
+  // Drizzle's bulk-VALUES path sidesteps array-parameter quirks in postgres-js
+  // and serialises cleanly through Hyperdrive. Two INSERTs per flush — both
+  // ON CONFLICT DO NOTHING so re-runs idempotently no-op on already-known rows.
   const flush = async () => {
     if (buf.length === 0) return;
-    const shas = buf.map((b) => b.sha);
-    const sizes = buf.map((b) => b.size);
-    const types = buf.map((b) => b.type);
-    await ctx.db.execute(sql`
-      WITH inserted AS (
-        INSERT INTO blob (sha, size_bytes, type)
-        SELECT s, sz::bigint, t
-        FROM unnest(
-          ${shas}::text[],
-          ${sizes}::bigint[],
-          ${types}::text[]
-        ) AS x(s, sz, t)
-        ON CONFLICT (sha) DO NOTHING
-      )
-      INSERT INTO blob_repo (sha, repo_id, org_id)
-      SELECT s, ${ctx.repoId}, ${ctx.orgId}
-      FROM unnest(${shas}::text[]) AS x(s)
-      ON CONFLICT (sha, repo_id) DO NOTHING
-    `);
+    await ctx.db
+      .insert(blob)
+      .values(buf.map((b) => ({ sha: b.sha, sizeBytes: b.size, type: b.type as GitObjectType })))
+      .onConflictDoNothing();
+    await ctx.db
+      .insert(blobRepo)
+      .values(buf.map((b) => ({ sha: b.sha, repoId: ctx.repoId, orgId: ctx.orgId })))
+      .onConflictDoNothing();
     buf = [];
   };
 
