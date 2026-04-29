@@ -3,6 +3,14 @@ main = "src/index.ts"
 compatibility_date = "2025-10-13"
 compatibility_flags = ["nodejs_compat"]
 
+# Per-version preview URLs (workers.dev). Required so `wrangler versions
+# upload --preview-alias <slug>` actually publishes a reachable
+# {slug}-coregit-api.<account>.workers.dev URL for the openhive preview
+# pipeline. Prod traffic still goes through the api.coregit.dev route below;
+# this flag only enables version-scoped URLs, not workers.dev for the
+# active production version.
+preview_urls = true
+
 [[routes]]
 pattern = "api.coregit.dev/*"
 zone_name = "coregit.dev"
