@@ -30,7 +30,7 @@
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20250519.0",
     "@types/pako": "^2.0.4",
-    "dependency-cruiser": "^16.10.5",
+    "dependency-cruiser": "^17.3.10",
     "drizzle-kit": "^0.31.8",
     "typescript": "^5.8.3",
     "vitest": "^4.1.2",

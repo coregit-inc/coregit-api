@@ -15,7 +15,7 @@ module.exports = {
       severity: 'error',
       comment:
         'AGPL boundary violation: coregit-api/src/ must not import from sibling proprietary repos (coregit-api-wiki, coregit-app). Such an import would taint coregit-api under AGPL-3.0 and break the commercial licensing model. See CONTRIBUTING.md#agpl-boundary.',
-      from: { path: '^src/' },
+      from: { path: '^(src|test/agpl-boundary/fixtures)/' },
       to: { path: '(^|/)(coregit-api-wiki|coregit-app)(/|$)' },
     },
     {
@@ -23,10 +23,9 @@ module.exports = {
       severity: 'error',
       comment:
         'AGPL boundary violation: bare-module imports of proprietary packages (coregit-api-wiki, coregit-app, @coregit/wiki, @coregit/app) are forbidden in coregit-api/src/.',
-      from: { path: '^src/' },
+      from: { path: '^(src|test/agpl-boundary/fixtures)/' },
       to: {
         path: '^(coregit-api-wiki|coregit-app|@coregit/(wiki|app))($|/)',
-        dependencyTypes: ['npm', 'npm-dev', 'npm-optional', 'npm-peer', 'npm-bundled', 'npm-no-pkg', 'unknown'],
       },
     },
   ],
