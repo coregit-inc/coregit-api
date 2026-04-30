@@ -108,3 +108,25 @@ refactor: extract git object parsing
 ## License
 
 By contributing, you agree that your contributions will be licensed under the [AGPL-3.0](LICENSE).
+
+## AGPL boundary
+
+`coregit-api` is licensed under **AGPL-3.0**. Two sibling repositories — `coregit-api-wiki` and `coregit-app` — are **proprietary** and live in separate worktrees on disk. They are not part of this codebase.
+
+Any import from those repositories into `coregit-api/src/` would taint the entire api under AGPL-3.0 (because AGPL is viral across linked code) and would also force us to release the proprietary wiki and app. **Both consequences are unacceptable.** This is a hard licensing invariant.
+
+To make accidental imports impossible, CI runs the [`agpl-boundary` workflow](.github/workflows/agpl-boundary.yml) on every PR. It uses [dependency-cruiser](https://github.com/sverweij/dependency-cruiser) with the rules in [`.dependency-cruiser.cjs`](.dependency-cruiser.cjs):
+
+- `no-proprietary-relative-imports` — blocks paths that resolve into `coregit-api-wiki/` or `coregit-app/` (e.g. `../../coregit-api-wiki/src/wiki`).
+- `no-proprietary-bare-imports` — blocks bare-module imports of `coregit-api-wiki`, `coregit-app`, `@coregit/wiki`, `@coregit/app`.
+
+The workflow also runs the rules against [`test/agpl-boundary/fixtures`](test/agpl-boundary/fixtures) and **expects them to fail** — if those fixtures lint clean, the guard itself is broken and CI fails loudly.
+
+Run the same checks locally:
+
+```bash
+npm run lint:agpl              # must pass on src/
+npm run lint:agpl:fixture      # must fail (proves the rule still bites)
+```
+
+If you genuinely need to share code between `coregit-api` and a proprietary repo, the only acceptable path is to extract the shared code into a separately-licensed package (MIT or Apache-2.0). Open an issue and tag the maintainers before doing this — there is no other workaround.

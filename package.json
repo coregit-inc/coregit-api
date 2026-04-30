@@ -8,7 +8,9 @@
     "test": "vitest run",
     "test:bench": "vitest bench",
     "db:generate": "drizzle-kit generate",
-    "db:push": "drizzle-kit push"
+    "db:push": "drizzle-kit push",
+    "lint:agpl": "depcruise --config .dependency-cruiser.cjs --output-type err src",
+    "lint:agpl:fixture": "depcruise --config .dependency-cruiser.cjs --output-type err test/agpl-boundary/fixtures"
   },
   "dependencies": {
     "@better-auth/api-key": "^1.2.0",
@@ -28,6 +30,7 @@
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20250519.0",
     "@types/pako": "^2.0.4",
+    "dependency-cruiser": "^17.3.10",
     "drizzle-kit": "^0.31.8",
     "typescript": "^5.8.3",
     "vitest": "^4.1.2",
