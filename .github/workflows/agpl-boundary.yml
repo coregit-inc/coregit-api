@@ -1,0 +1,50 @@
+name: AGPL boundary
+
+# Blocks any change that lets src/ import from sibling proprietary repos
+# (coregit-api-wiki, coregit-app). The whole api would otherwise be tainted
+# under AGPL-3.0 and break the commercial wiki licensing model. See
+# CONTRIBUTING.md#agpl-boundary for the policy and .dependency-cruiser.cjs
+# for the rules.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: agpl-boundary-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - run: npm ci
+
+      - name: Lint src/ for AGPL boundary violations (must pass)
+        run: npm run lint:agpl
+
+      - name: Verify guard catches forbidden fixtures (must fail)
+        run: |
+          set +e
+          npm run lint:agpl:fixture
+          status=$?
+          set -e
+          if [ "$status" -eq 0 ]; then
+            echo "::error::AGPL guard fixtures linted clean — the boundary rule is broken." >&2
+            echo "Expected non-zero exit from depcruise on test/agpl-boundary/fixtures." >&2
+            exit 1
+          fi
+          echo "ok: forbidden fixtures correctly rejected (exit ${status})"

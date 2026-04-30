@@ -234,3 +234,5 @@ We welcome contributions! See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 This project is licensed under the [GNU Affero General Public License v3.0](LICENSE) — see the LICENSE file for details.
 
 AGPL-3.0 means: you can self-host, modify, and use Coregit freely. If you modify the code and provide it as a network service, you must open-source your modifications.
+
+> **Note for contributors:** `src/` must never import code from sibling proprietary repositories (`coregit-api-wiki`, `coregit-app`). CI enforces this via [`.github/workflows/agpl-boundary.yml`](.github/workflows/agpl-boundary.yml). See [CONTRIBUTING.md → AGPL boundary](CONTRIBUTING.md#agpl-boundary).
