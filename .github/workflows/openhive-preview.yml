@@ -236,7 +236,7 @@ jobs:
           # runs before any R2/createApiCommit work, so this is testable in pure
           # workerd-local mode regardless of R2 emptiness.
           BIG_BRANCH="ci-blob-${{ github.run_id }}-${{ github.run_attempt }}"
-          node -e '
+          BIG_BRANCH="$BIG_BRANCH" node -e '
             const content = "a".repeat(11 * 1024 * 1024);
             process.stdout.write(JSON.stringify({
               branch: process.env.BIG_BRANCH,
@@ -245,7 +245,7 @@ jobs:
               changes: [{ action: "create", path: "big.bin", content, encoding: "base64" }]
             }));
           ' > /tmp/big-body.json
-          BIG_RES=$(BIG_BRANCH="$BIG_BRANCH" curl -sS -w "\n%{http_code}" -X POST \
+          BIG_RES=$(curl -sS -w "\n%{http_code}" -X POST \
             "$BASE/v1/repos/$COREGIT_TEST_REPO_SLUG/commits" \
             -H "x-api-key: $COREGIT_API_KEY" \
             -H "Content-Type: application/json" \
