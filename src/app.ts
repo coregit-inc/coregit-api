@@ -52,7 +52,10 @@ import { session } from "./routes/session";
 import { admin } from "./routes/admin";
 import { domains } from "./routes/domains";
 import { setRepoCacheRef, setRepoHotDORef, setRefCacheKvRef, setObjCacheKvRef } from "./services/repo-resolver";
+import { errorResponse } from "./services/errors";
 import type { Env, Variables } from "./types";
+
+const V1_BODY_LIMIT_BYTES = 25 * 1024 * 1024; // 25 MB total request — fits 10 MB-per-file commits with overhead
 
 export const app = new Hono<{ Bindings: Env; Variables: Variables }>();
 
@@ -176,7 +179,19 @@ app.use(
   })
 );
 
-app.use("/v1/*", bodyLimit({ maxSize: 5 * 1024 * 1024 }));
+app.use(
+  "/v1/*",
+  bodyLimit({
+    maxSize: V1_BODY_LIMIT_BYTES,
+    onError: (c) =>
+      errorResponse(
+        c,
+        413,
+        "PAYLOAD_TOO_LARGE",
+        `Request body exceeds ${V1_BODY_LIMIT_BYTES} bytes`
+      ),
+  })
+);
 
 app.get("/", (c) => {
   if (c.get("customDomain")) {

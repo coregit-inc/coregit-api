@@ -231,6 +231,45 @@ jobs:
             { echo "::error::ttl was not capped, got $GOT_TTL"; exit 1; }
           echo "ok: oversize ttl capped to $GOT_TTL"
 
+          echo "── M4: POST /v1/repos/.../commits returns structured 413 on >10 MB file ──"
+          # Per-file MAX_FILE_SIZE = 10 MB. The size check (routes/commits.ts:98)
+          # runs before any R2/createApiCommit work, so this is testable in pure
+          # workerd-local mode regardless of R2 emptiness.
+          BIG_BRANCH="ci-blob-${{ github.run_id }}-${{ github.run_attempt }}"
+          BIG_BRANCH="$BIG_BRANCH" node -e '
+            const content = "a".repeat(11 * 1024 * 1024);
+            process.stdout.write(JSON.stringify({
+              branch: process.env.BIG_BRANCH,
+              message: "ci 413 shape probe",
+              author: { name: "ci", email: "ci@coregit.dev" },
+              changes: [{ action: "create", path: "big.bin", content, encoding: "base64" }]
+            }));
+          ' > /tmp/big-body.json
+          BIG_RES=$(curl -sS -w "\n%{http_code}" -X POST \
+            "$BASE/v1/repos/$COREGIT_TEST_REPO_SLUG/commits" \
+            -H "x-api-key: $COREGIT_API_KEY" \
+            -H "Content-Type: application/json" \
+            --data @/tmp/big-body.json)
+          rm -f /tmp/big-body.json
+          BIG_BODY=$(printf '%s' "$BIG_RES" | sed '$d')
+          BIG_CODE=$(printf '%s' "$BIG_RES" | tail -n 1)
+          if [ "$BIG_CODE" != "413" ]; then
+            echo "::error::expected 413 for 11 MB file, got $BIG_CODE"
+            echo "Body: $BIG_BODY"
+            exit 1
+          fi
+          echo "$BIG_BODY" | jq -e '
+            .code == "PAYLOAD_TOO_LARGE"
+            and .limit_bytes == 10485760
+            and .path == "big.bin"
+            and (.actual_bytes >= 11534336)
+          ' > /dev/null || {
+            echo "::error::413 body shape wrong"
+            echo "Body: $BIG_BODY"
+            exit 1
+          }
+          echo "ok: 11 MB file returns structured 413 with code/limit_bytes/actual_bytes/path"
+
           echo "All smoke checks passed."
 
       - name: Dump wrangler dev log on failure
