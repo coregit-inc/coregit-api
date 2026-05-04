@@ -29,6 +29,12 @@ const decoder = new TextDecoder();
 
 export const PACK_THRESHOLD = 256; // pack loose objects when count exceeds this
 
+// Cloudflare DO legacy storage API caps each value at 131_072 bytes. We bypass
+// the DO hot-cache for any compressed object larger than this and write straight
+// to R2. 8 KB headroom keeps us safely under the hard cap accounting for any
+// internal overhead.
+export const MAX_DO_VALUE_BYTES = 120 * 1024;
+
 export class GitR2Storage {
   private bucket: R2Bucket;
   private basePath: string;
@@ -384,7 +390,11 @@ export class GitR2Storage {
 
   /**
    * Store a git object by SHA
-   * Compresses the object data before storing
+   * Compresses the object data before storing.
+   *
+   * Blobs whose compressed size exceeds MAX_DO_VALUE_BYTES bypass the DO
+   * hot-cache and write straight to R2. The HTTP layer caps content at 10 MB
+   * per file (413 PAYLOAD_TOO_LARGE).
    */
   async putObject(sha: string, type: GitObjectType, content: Uint8Array): Promise<void> {
     // Skip write if already in memory cache (content-addressed = idempotent)
@@ -392,6 +402,19 @@ export class GitR2Storage {
 
     const fullObject = createGitObjectRaw(type, content);
     const compressed = zlibSync(fullObject);
+
+    // Large objects exceed the legacy DO storage per-value cap (131_072 bytes).
+    // Skip both hot-cache layers and write directly to R2.
+    if (compressed.byteLength > MAX_DO_VALUE_BYTES) {
+      const r2Key = this.objectKey(sha);
+      await this.bucket.put(r2Key, compressed, {
+        httpMetadata: { contentType: "application/x-git-object" },
+      });
+      this._addToCache(sha, fullObject);
+      this._putObjCache(sha, compressed); // KV helper enforces its own 25 KB cap
+      this._recordBlob(sha, type, fullObject.byteLength);
+      return;
+    }
 
     // Session (Level 2): write to DO only, flushed on session close
     if (this._sessionStub) {
@@ -405,6 +428,21 @@ export class GitR2Storage {
         this._recordBlob(sha, type, fullObject.byteLength);
         return;
       }
+      // Session refused (e.g. 507 oversize-guard) — fall through to direct R2 write
+      if (res.status === 507) {
+        const key = this.objectKey(sha);
+        await this.bucket.put(key, compressed, {
+          httpMetadata: { contentType: "application/x-git-object" },
+        });
+        this._addToCache(sha, fullObject);
+        this._putObjCache(sha, compressed);
+        this._recordBlob(sha, type, fullObject.byteLength);
+        return;
+      }
+      // Any other status (410 closed, 4xx validation, 5xx) is a real session
+      // failure — surface it instead of silently falling through to RepoDO/R2.
+      const body = await res.text().catch(() => "");
+      throw new Error(`SessionDO put-object failed: ${res.status} ${body}`);
     }
 
     // Level 1 (RepoDO): write to DO (fast ack) + R2 (fire-and-forget durability).

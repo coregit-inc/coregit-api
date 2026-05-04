@@ -12,7 +12,7 @@ import { hasRepoAccess } from "../auth/scopes";
 import { resolveRepo } from "../services/repo-resolver";
 import { extractRepoParams } from "./helpers";
 import { repo } from "../db/schema";
-import { GitR2Storage } from "../git/storage";
+import { GitR2Storage, MAX_DO_VALUE_BYTES } from "../git/storage";
 import { parseGitObject, parseCommit } from "../git/objects";
 import { createApiCommit, ConflictError, EditConflictError, InvalidBase64Error, setTreeCacheRef, type FileChange, type CommitAuthor } from "../services/commit-builder";
 import { MorphError } from "../services/morph";
@@ -96,7 +96,16 @@ const createCommitHandler = async (c: any) => {
   let lazyEditCount = 0;
   for (const change of changes) {
     if (change.content && change.content.length > MAX_FILE_SIZE) {
-      return c.json({ error: `File content exceeds 10 MB limit: ${change.path}` }, 400);
+      return c.json(
+        {
+          error: `File content exceeds 10 MB limit: ${change.path}`,
+          code: "PAYLOAD_TOO_LARGE",
+          limit_bytes: MAX_FILE_SIZE,
+          actual_bytes: change.content.length,
+          path: change.path,
+        },
+        413
+      );
     }
     // Validate file paths: no traversal, null bytes, or empty segments
     const pathError = validateFilePath(change.path);
@@ -250,6 +259,19 @@ const createCommitHandler = async (c: any) => {
     }
     if (error instanceof MorphError) {
       return c.json({ error: `Lazy merge failed: ${error.message}` }, 502);
+    }
+    // Defensive: if a blob slips past the bypass guard and lands on the legacy DO
+    // storage, the runtime throws a RangeError. Convert to a structured 413 so
+    // clients don't see the raw "Values cannot be larger than 131072 bytes" leak.
+    if (error instanceof RangeError && /Values cannot be larger/.test(error.message)) {
+      return c.json(
+        {
+          error: "Blob content exceeds storage limit",
+          code: "PAYLOAD_TOO_LARGE",
+          limit_bytes: MAX_DO_VALUE_BYTES,
+        },
+        413
+      );
     }
     console.error("Failed to create commit:", error);
     return c.json({ error: "Failed to create commit" }, 500);

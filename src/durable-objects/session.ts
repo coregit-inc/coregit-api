@@ -9,6 +9,8 @@
  * X-Session-Id header validate against DO (<1ms warm) — no DB/KV auth.
  */
 
+import { MAX_DO_VALUE_BYTES } from "../git/storage";
+
 interface SessionMeta {
   orgId: string;
   apiKeyId: string;
@@ -162,6 +164,10 @@ export class SessionDO implements DurableObject {
     if (!sha || !repoKey) return Response.json({ error: "sha and repoKey required" }, { status: 400 });
 
     const data = new Uint8Array(await request.arrayBuffer());
+    if (data.byteLength > MAX_DO_VALUE_BYTES) {
+      // Oversized for legacy DO storage — caller writes straight to R2.
+      return new Response(null, { status: 507 });
+    }
     const storageKey = `obj:${repoKey}:${sha}`;
 
     // Check if already exists (dedup)

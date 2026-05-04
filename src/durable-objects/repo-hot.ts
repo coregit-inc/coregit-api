@@ -9,6 +9,8 @@
  * No opt-in needed — all clients get faster writes for free.
  */
 
+import { MAX_DO_VALUE_BYTES } from "../git/storage";
+
 const FLUSH_INTERVAL_MS = 30_000; // flush to R2 every 30 seconds
 const MAX_PENDING_OBJECTS = 2000;
 const FLUSH_BATCH_SIZE = 20;
@@ -92,6 +94,10 @@ export class RepoHotDO implements DurableObject {
     }
 
     const data = new Uint8Array(await request.arrayBuffer());
+    if (data.byteLength > MAX_DO_VALUE_BYTES) {
+      // Oversized for legacy DO storage — caller writes straight to R2.
+      return new Response(null, { status: 507 });
+    }
     const storageKey = `obj:${sha}`;
 
     // Dedup — content-addressed
