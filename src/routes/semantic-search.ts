@@ -262,6 +262,9 @@ const semanticSearchHandler = async (c: any) => {
     const start = Math.max(0, match.metadata.start_line - 1);
     const end = Math.min(lines.length, match.metadata.end_line);
     const snippet = lines.slice(start, end).join("\n");
+    // Voyage rerank rejects empty strings; can happen when chunk metadata
+    // (start_line/end_line) drifts out of bounds vs. the current blob.
+    if (snippet.trim().length === 0) continue;
 
     matchTexts.push(snippet);
     // Use file path from tree (authoritative for this version)
