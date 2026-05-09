@@ -165,7 +165,17 @@ export async function rerankCode(
   topK: number,
   apiKey: string
 ): Promise<Array<{ index: number; score: number }>> {
-  if (documents.length === 0) return [];
+  // Voyage rerank rejects empty strings inside `documents` with a 400.
+  // Filter defensively and remap returned indices back to the caller's space.
+  const indexMap: number[] = [];
+  const cleanDocs: string[] = [];
+  for (let i = 0; i < documents.length; i++) {
+    if (documents[i].length > 0) {
+      indexMap.push(i);
+      cleanDocs.push(documents[i]);
+    }
+  }
+  if (cleanDocs.length === 0) return [];
 
   const res = await fetch(`${VOYAGE_API_URL}/rerank`, {
     method: "POST",
@@ -175,9 +185,9 @@ export async function rerankCode(
     },
     body: JSON.stringify({
       query,
-      documents,
+      documents: cleanDocs,
       model: RERANK_MODEL,
-      top_k: topK,
+      top_k: Math.min(topK, cleanDocs.length),
     }),
   });
 
@@ -190,5 +200,5 @@ export async function rerankCode(
     data: Array<{ index: number; relevance_score: number }>;
   };
 
-  return data.data.map((d) => ({ index: d.index, score: d.relevance_score }));
+  return data.data.map((d) => ({ index: indexMap[d.index], score: d.relevance_score }));
 }
