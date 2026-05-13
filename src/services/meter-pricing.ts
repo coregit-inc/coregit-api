@@ -50,12 +50,15 @@ export function toDodoMeterEvent(
  * path (live path lets Dodo do the math).
  */
 export const METER_PRICES_USD: Record<MeterEventKey, number> = {
-  // $0.0001 per API call (10000 calls per credit)
-  api_call: 0.0001,
-  // $0.001 per MB transferred (1000 MB per credit)
-  git_transfer_bytes: 0.001,
-  // $0.001 per MB stored per snapshot (1000 MB per credit)
-  storage_bytes: 0.001,
+  // Source of truth: Dodo meter `meter_units_per_credit` on the API Access
+  // subscription. Mirror these in `coregit-app/lib/billing/plans.ts` and on
+  // the landing pricing page.
+  // 2000 calls per $1 credit → $0.0005 / call ($0.50 / 1k)
+  api_call: 1 / 2000,
+  // 10240 MB per $1 credit → ~$0.0000977 / MB ($0.10 / GB)
+  git_transfer_bytes: 1 / 10240,
+  // 10240 MB per $1 credit → ~$0.0000977 / MB ($0.10 / GB)
+  storage_bytes: 1 / 10240,
   // $1.32 per 1M output tokens (10% markup over Morph $1.20/MTok)
   lazy_edit_tokens: 1.32 / 1_000_000,
   // $1.32 per 1M output tokens (matches lazy_edit pricing)
