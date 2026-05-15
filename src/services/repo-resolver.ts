@@ -90,8 +90,17 @@ export async function resolveRepo(
       storage.setBlobRepoContext(db, cached.id, orgId);
       // Instant fork: load fork_snapshot lazily — it's cheap (one PK lookup)
       // and populates ref/HEAD fallback for forks that haven't pushed yet.
+      // Also attach parent's storage as object read-fallback so blob/tree
+      // reads can resolve through the chain when objects aren't in the
+      // global `_blobs/` keyspace (parent's legacy paths, packfiles, DO).
       if (cached.forkMode === "instant" && cached.forkedFromRepoId) {
         await loadForkSnapshot(db, storage, cached.id);
+        if (cached.forkedFromOrgId) {
+          const parentStorage = await loadParentStorageChain(
+            db, bucket, cached.forkedFromRepoId, cached.forkedFromOrgId, 0,
+          );
+          if (parentStorage) storage.setForkParentStorage(parentStorage);
+        }
       }
       attachRepoHotDO(storage, orgId, storageSuffix, cached.id);
       const scopeKey = cached.namespace ? `${cached.namespace}/${cached.slug}` : cached.slug;
@@ -123,11 +132,81 @@ export async function resolveRepo(
   storage.setBlobRepoContext(db, found.id, orgId);
   if (found.forkMode === "instant" && found.forkedFromRepoId) {
     await loadForkSnapshot(db, storage, found.id);
+    if (found.forkedFromOrgId) {
+      const parentStorage = await loadParentStorageChain(
+        db, bucket, found.forkedFromRepoId, found.forkedFromOrgId, 0,
+      );
+      if (parentStorage) storage.setForkParentStorage(parentStorage);
+    }
   }
   attachRepoHotDO(storage, orgId, storageSuffix, found.id);
   const scopeKey = namespace ? `${namespace}/${slug}` : slug;
 
   return { repo: found, storage, scopeKey, storageSuffix };
+}
+
+/** Safety cap matching MAX_FORK_DEPTH in routes/forks.ts. Auto-flatten on
+ * fork creation already prevents chains longer than this; the cap here is
+ * belt-and-suspenders against malformed rows. */
+const MAX_PARENT_CHAIN = 16;
+
+/**
+ * Build the read-only parent storage for an instant fork. Recurses up the
+ * fork chain so a depth-N fork can resolve objects that live anywhere along
+ * its ancestor line (legacy `{base}/objects/`, packfiles, hot DO).
+ *
+ * Returns null if the chain is missing/broken — getObject still works against
+ * the global `_blobs/` keyspace, only legacy-path/DO fallback is lost.
+ */
+async function loadParentStorageChain(
+  db: Database,
+  bucket: R2Bucket,
+  parentRepoId: string,
+  parentOrgId: string,
+  depth: number,
+): Promise<GitR2Storage | null> {
+  if (depth >= MAX_PARENT_CHAIN) return null;
+  try {
+    const [parentRepo] = await db
+      .select()
+      .from(repo)
+      .where(eq(repo.id, parentRepoId))
+      .limit(1);
+    if (!parentRepo) return null;
+
+    const parentSuffix = parentRepo.namespace
+      ? `${parentRepo.namespace}/${parentRepo.slug}`
+      : parentRepo.slug;
+    const parentStorage = new GitR2Storage(bucket, parentOrgId, parentSuffix);
+    parentStorage.setRefCacheKv(_refCacheKvRef);
+    parentStorage.setObjCacheKv(_objCacheKvRef);
+    // Intentionally NO setBlobRepoContext on the parent — reads don't write
+    // blob_repo edges, and we don't want the fork's read path to record
+    // refcount rows on the parent's behalf.
+
+    if (parentRepo.forkMode === "instant" && parentRepo.forkedFromRepoId) {
+      await loadForkSnapshot(db, parentStorage, parentRepo.id);
+      if (parentRepo.forkedFromOrgId) {
+        const grandparent = await loadParentStorageChain(
+          db,
+          bucket,
+          parentRepo.forkedFromRepoId,
+          parentRepo.forkedFromOrgId,
+          depth + 1,
+        );
+        if (grandparent) parentStorage.setForkParentStorage(grandparent);
+      }
+    }
+
+    // Attach parent's hot DO so the fork can read very-recent commits that
+    // the parent hasn't flushed to R2 yet.
+    attachRepoHotDO(parentStorage, parentOrgId, parentSuffix, parentRepo.id);
+
+    return parentStorage;
+  } catch (e) {
+    console.error("loadParentStorageChain failed:", e);
+    return null;
+  }
 }
 
 /**

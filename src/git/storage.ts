@@ -127,6 +127,16 @@ export class GitR2Storage {
     this._forkSnapshot = snapshot;
   }
 
+  /** Parent storage for chain read-fallback on instant forks. Lets getObject
+   * walk into the parent's legacy `{base}/objects/` path, packfiles, and hot
+   * DO when the blob is not in the global `_blobs/` keyspace yet (or never
+   * landed there for legacy parents). Recursive: parent may have its own
+   * grandparent attached. */
+  private _forkParentStorage: GitR2Storage | undefined;
+  setForkParentStorage(parent: GitR2Storage | undefined) {
+    this._forkParentStorage = parent;
+  }
+
   /** Fire-and-forget upsert of (blob, blob_repo) rows. Idempotent via ON CONFLICT.
    * Idempotent because the blob's content addresses both the R2 key and the
    * primary key of `blob`, so re-writes converge on the same row. */
@@ -260,6 +270,21 @@ export class GitR2Storage {
         const compressed = new Uint8Array(await hotRes.arrayBuffer());
         const result = this._decompressAndCache(sha, compressed);
         return result;
+      }
+    }
+
+    // 7. Fork-chain fallback (instant fork): try parent's storage. Covers
+    //    parent's legacy `{base}/objects/` keys, parent's packfiles, and
+    //    parent's hot RepoDO — none of which the fork's own basePath/DO can
+    //    reach. Recursive: parent may itself be an instant fork with its own
+    //    grandparent attached.
+    if (this._forkParentStorage) {
+      const inherited = await this._forkParentStorage.getObject(sha);
+      if (inherited) {
+        this._addToCache(sha, inherited);
+        // Don't write-through to KV/edge here — parent's read path already
+        // promoted to the global `_blobs/`-keyed caches if applicable.
+        return inherited;
       }
     }
 
@@ -498,7 +523,12 @@ export class GitR2Storage {
     const head = await this.bucket.head(this.objectKey(sha));
     if (head) return true;
     const legacy = await this.bucket.head(this.legacyObjectKey(sha));
-    return legacy !== null;
+    if (legacy) return true;
+    // Fork-chain: parent may hold the object in its legacy/pack/DO layers.
+    if (this._forkParentStorage) {
+      return this._forkParentStorage.hasObject(sha);
+    }
+    return false;
   }
 
   /**
