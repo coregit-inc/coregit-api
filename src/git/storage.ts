@@ -811,9 +811,23 @@ export class GitR2Storage {
     // R2 fallback
     const key = `${this.basePath}/${name}`;
     const obj = await this.bucket.get(key);
-    if (!obj) return null;
-    const sha = (await obj.text()).trim();
-    return { sha, etag: obj.etag, treeSha: obj.customMetadata?.treeSha };
+    if (obj) {
+      const sha = (await obj.text()).trim();
+      return { sha, etag: obj.etag, treeSha: obj.customMetadata?.treeSha };
+    }
+
+    // Fork-snapshot fallback — mirrors the read-fallback in getRef. Without
+    // this, the first commit on a fresh instant fork sees currentSha=null
+    // and builds an orphan tree containing only the new changes (i.e. it
+    // appears to "delete" every inherited file). Returns a sentinel etag
+    // so setRefConditional knows to use create-if-not-exists semantics
+    // against R2 instead of an etag CAS.
+    if (this._forkSnapshot) {
+      const inherited = this._forkSnapshot.parentRefs[name];
+      if (inherited) return { sha: inherited, etag: "snapshot" };
+    }
+
+    return null;
   }
 
   /**
@@ -822,6 +836,25 @@ export class GitR2Storage {
    * Returns true if the write succeeded, false if CAS failed (concurrent update).
    */
   async setRefConditional(name: string, sha: string, expectedEtag: string, treeSha?: string): Promise<boolean> {
+    // Fork-snapshot first commit: sentinel etag from getRefWithEtag means R2
+    // has no shadow for this ref yet — only the parent's frozen snapshot
+    // value. Semantics: create-if-not-exists. Head-check then put; if another
+    // writer beat us between the two, caller retries (single-flight is
+    // acceptable for first push on a fresh fork; ConflictError surfaces it).
+    if (expectedEtag === "snapshot") {
+      const head = await this.bucket.head(`${this.basePath}/${name}`);
+      if (head) return false; // someone already shadowed the snapshot → retry
+      const result = await this.bucket.put(`${this.basePath}/${name}`, sha + "\n", {
+        httpMetadata: { contentType: "text/plain" },
+        customMetadata: treeSha ? { treeSha } : undefined,
+      });
+      const ok = result !== null;
+      if (ok && this._refCacheKv) {
+        this._refCacheKv.put(this.refCacheKey(name), sha, { expirationTtl: GitR2Storage.REF_CACHE_TTL }).catch(() => {});
+      }
+      return ok;
+    }
+
     // DO-based CAS: etag = "do:{version}" from getRefWithEtag DO path
     if (expectedEtag.startsWith("do:") && this._repoDOStub) {
       const expectedVersion = parseInt(expectedEtag.slice(3), 10);
